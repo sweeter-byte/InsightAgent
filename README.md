@@ -3,7 +3,9 @@
 A minimal, hand-rolled **Research Agent** built directly on the OpenAI-compatible
 Chat Completions API. Chapter 1 verifies the smallest thing that deserves to be
 called an agent loop — LLM decides → runtime executes a tool → result is
-written back into messages → LLM decides again.
+written back into messages → LLM decides again. Chapter 2 wraps that loop in an
+`InsightAgent` façade fronted by an **Intent Router** that picks the execution
+path for every query.
 
 No LangChain, no LangGraph, no OpenAI Agents SDK, no other agent framework.
 
@@ -49,12 +51,16 @@ python -m insight_agent
 This opens an interactive REPL:
 
 ```text
->> 请读取 examples/result.txt,并告诉我准确率最高的方法。
+>> 什么是 Agent Loop？
 ```
 
-The agent will call `read_file`, receive the file contents as a tool message,
-ask the LLM again, and print the final answer. Type `exit` or press Ctrl-D to
-quit.
+You never pick a mode by hand — the Intent Router classifies each query and
+decides whether it is answered directly or handed to the ResearchAgent. For a
+general-knowledge question the router chooses `direct` and the answer comes
+from a single LLM call; for a file-reading request like the Chapter 1 example
+below, it chooses `analyze`/`research` and the `ResearchAgent` calls
+`read_file`, receives the file contents as a tool message, asks the LLM again,
+and prints the final answer. Type `exit` or press Ctrl-D to quit.
 
 A one-shot form is also supported:
 
@@ -92,6 +98,50 @@ answer. This is the fastest way to sanity-check that your `LLM_BASE_URL` and
   tools, malformed JSON arguments, and tool-side exceptions.
 - `python -m insight_agent` CLI (REPL + one-shot).
 
+## What Chapter 2 adds
+
+Chapter 2 introduces an **Intent Router** and a single application façade,
+`InsightAgent`, that the CLI now builds via `_build_app()` (composing
+`LLMClient` + `ToolRegistry` + `ResearchAgent` + `IntentRouter` + `InsightAgent`
+over one shared `LLMClient`). The control flow is:
+
+```text
+User
+  ↓
+Intent Router
+  ├─ direct   → single LLM call   (no tools, no agent loop)
+  ├─ analyze  → ResearchAgent
+  └─ research → ResearchAgent
+```
+
+Details:
+
+- `Intent`: a three-value enum (`direct` / `analyze` / `research`), priority
+  `research > analyze > direct`.
+- `IntentRouter`: one LLM call with a classification prompt, string→enum parse,
+  and a safe fallback to `research` on empty/invalid output. No structured
+  output, no keyword heuristics, no confidence score, no hybrid routing.
+- `InsightAgent`: intent dispatch only. `direct` answers with a plain chat
+  completion (never enters the agent loop, so it cannot raise
+  `AgentStepsExceeded`); `analyze` and `research` delegate to `ResearchAgent`.
+- `analyze` and `research` **currently share the same `ResearchAgent` on
+  purpose** — this is the Chapter 2 design, not a bug. The intent label is kept
+  so later chapters can fork them into a Document / Multimodal Analysis Pipeline
+  and a Research Workflow respectively.
+- The CLI (`python -m insight_agent`) keeps both modes unchanged; the router
+  decides the path automatically and the intent is not printed to normal output.
+
+## What Chapter 2 does NOT implement
+
+Still deliberately out of scope until later chapters:
+
+- Document / Multimodal Analysis Pipeline and Research Workflow as separate
+  handlers (the intents exist but share one handler)
+- RAG, embeddings, vector databases, PDF parsing, vision
+- Web search, Research Planner, Workflow orchestration, LangGraph
+- Memory, MCP
+- Router confidence scores, hybrid routing, intent-evaluation benchmarks
+
 ## What Chapter 1 does NOT implement
 
 Deliberately out of scope until later chapters:
@@ -99,7 +149,7 @@ Deliberately out of scope until later chapters:
 - RAG, embeddings, vector databases
 - Web search / browsing
 - Vision / multimodal input
-- Planner, intent router, multi-agent orchestration
+- Planner, multi-agent orchestration
 - Long-term memory, context compaction
 - MCP, hooks, permission system, workspace sandbox
 - Path-traversal protection, file size limits, binary files
