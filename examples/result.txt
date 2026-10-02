@@ -1,0 +1,3 @@
+Method A: 81.3%
+Method B: 87.6%
+Method C: 84.1%
