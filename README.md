@@ -5,7 +5,9 @@ Chat Completions API. Chapter 1 verifies the smallest thing that deserves to be
 called an agent loop — LLM decides → runtime executes a tool → result is
 written back into messages → LLM decides again. Chapter 2 wraps that loop in an
 `InsightAgent` façade fronted by an **Intent Router** that picks the execution
-path for every query.
+path for every query. Chapter 3 stands up an independent **Multimodal
+Ingestion** layer that turns Text / Markdown / PDF / URL / Image inputs into a
+unified `list[Document]`.
 
 No LangChain, no LangGraph, no OpenAI Agents SDK, no other agent framework.
 
@@ -137,10 +139,79 @@ Still deliberately out of scope until later chapters:
 
 - Document / Multimodal Analysis Pipeline and Research Workflow as separate
   handlers (the intents exist but share one handler)
-- RAG, embeddings, vector databases, PDF parsing, vision
+- PDF parsing and vision were added in **Chapter 3** (Multimodal Ingestion); see
+  "What Chapter 3 adds" below. RAG, embeddings, and vector databases remain out
+  of scope through Chapter 3.
 - Web search, Research Planner, Workflow orchestration, LangGraph
 - Memory, MCP
 - Router confidence scores, hybrid routing, intent-evaluation benchmarks
+
+## What Chapter 3 adds
+
+Chapter 3 introduces an **independent Multimodal Ingestion layer**
+(`insight_agent/ingestion/`). It is a data-processing layer, *not* part of the
+agent's decision loop. Three concept layers stay cleanly separated:
+
+```text
+Intent Router        → decides which high-level path a request takes
+Multimodal Ingestion → decides how material becomes a unified Document
+Agent Loop / Tools   → decides which external capability to call next
+```
+
+Five input formats normalize into one shape — `list[Document]`:
+
+| Input | Entry | Documents produced |
+|---------|---------------------------------------|--------------------------------------------------|
+| Text | `ingest("text", inline_text)` | 1 — inline text as content |
+| Markdown | `ingest_file("x.md")` | 1 — raw markdown preserved |
+| PDF | `ingest_file("x.pdf")` | 1 per non-empty page (`metadata.page`/`page_count`) |
+| URL | `ingest("url", "https://…")` | 1 — cleaned visible text (`metadata.title`/`final_url`/`content_type`) |
+| Image | `ingest_file("x.png")` | 1 — VLM description as content; original path kept in `source` |
+
+- `Document`: a plain dataclass with `content` / `source` / `source_type` /
+  `metadata` (see `ingestion.models`).
+- Public API — import from `insight_agent.ingestion`, never from
+  `ingestion.loaders.*`: `ingest`, `ingest_file`, `ingest_text_file`,
+  `infer_file_type`, `safe_ingest`, plus per-format `load_*` escape hatches.
+- Local files are dispatched **by the program** from their extension
+  (`infer_file_type`); the LLM never picks a loader and loaders are **not**
+  registered as Agent tools.
+- Single error type `IngestionError` (a `RuntimeError`); `safe_ingest` wraps any
+  lower-level or third-party exception into it while preserving `__cause__`.
+
+Vision config (images only) reuses the project's single env-var mechanism:
+`VISION_API_KEY`, `VISION_BASE_URL`, `VISION_MODEL` (see `.env.example`). Text /
+Markdown / PDF ingestion needs no API; URL ingestion needs network but no key.
+
+Try it (defaults to an offline `.txt` input):
+
+```bash
+python examples/try_ingestion.py              # ingests examples/result.txt
+python examples/try_ingestion.py paper.pdf    # one Document per non-empty page
+python examples/try_ingestion.py chart.png    # requires VISION_* to be configured
+```
+
+### Temporary context adapter (**not** RAG)
+
+`documents_to_context(documents)` (in `ingestion.context`) renders a
+`list[Document]` into a single `[Document N] / source / source_type / metadata /
+<content>` text block, so the current LLM/Agent stack can consume ingested
+material in small integration tests. It is **not RAG** and does nothing beyond
+string formatting: no chunking, embedding, vector store, retrieval, or ranking;
+no token budget and no context compression (content is dumped verbatim). Do not
+push large Document sets into an Agent context through it.
+
+## What Chapter 3 does NOT implement
+
+Still deliberately out of scope until later chapters:
+
+- Chunking / text splitting
+- Embedding and any vector database
+- Retrieval / a RAG pipeline, token budgets, or context compression
+- OCR and scanned-PDF handling
+- SSRF protection, JS rendering, or login/JS-heavy extraction in the URL loader
+- Registering loaders as LLM tools, or letting the model choose a loader
+- Wiring ingestion into the CLI / `InsightAgent` façade (integration is future work)
 
 ## What Chapter 1 does NOT implement
 

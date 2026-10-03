@@ -1,6 +1,6 @@
 # InsightAgent
 
-一个直接构建在 OpenAI 兼容 Chat Completions API 之上的、极简的手写 **Research Agent(研究型智能体)**。第一章验证了「最小可称为 agent loop」的那条链路:LLM 决策 → Runtime 执行工具 → 工具结果写回 messages → 再次调用 LLM。第二章把这条 loop 包进 `InsightAgent` 门面,并在其前方接入 **Intent Router(意图路由)** 为每个 query 决定执行路径。
+一个直接构建在 OpenAI 兼容 Chat Completions API 之上的、极简的手写 **Research Agent(研究型智能体)**。第一章验证了「最小可称为 agent loop」的那条链路:LLM 决策 → Runtime 执行工具 → 工具结果写回 messages → 再次调用 LLM。第二章把这条 loop 包进 `InsightAgent` 门面,并在其前方接入 **Intent Router(意图路由)** 为每个 query 决定执行路径。第三章搭建了一个独立的 **Multimodal Ingestion(多模态摄取)** 层,把 Text / Markdown / PDF / URL / Image 输入统一转换为 `list[Document]`。
 
 不使用 LangChain,不使用 LangGraph,不使用 OpenAI Agents SDK,不使用任何现成的 Agent Framework。
 
@@ -96,12 +96,63 @@ Intent Router
 - `analyze` 与 `research` **当前故意复用同一个 `ResearchAgent`** —— 这是本章的设计,不是 bug。保留意图标签是为了后续章节能把它们分别拆成 Document / Multimodal Analysis Pipeline 与 Research Workflow。
 - CLI(`python -m insight_agent`)两种模式保持不变;路由自动决定路径,正常输出中不会强制打印 Intent。
 
+## 第三章新增
+
+第三章引入**独立的多模态摄取层**(`insight_agent/ingestion/`)。它是一个数据处理层,**不属于** agent 的决策循环。三个概念层保持清晰分离:
+
+```text
+Intent Router        → 决定请求进入哪条高层路径
+Multimodal Ingestion → 决定资料如何转换为统一 Document
+Agent Loop / Tools   → 决定执行过程中下一步调用什么外部能力
+```
+
+五种输入统一归一为一种形态 —— `list[Document]`:
+
+| 输入 | 入口 | 产生的 Document |
+|---|---|---|
+| Text | `ingest("text", inline_text)` | 1 个 —— 内联文本作为 content |
+| Markdown | `ingest_file("x.md")` | 1 个 —— 原样保留 markdown |
+| PDF | `ingest_file("x.pdf")` | 每个非空页 1 个(`metadata.page`/`page_count`) |
+| URL | `ingest("url", "https://…")` | 1 个 —— 清理后的可见文本(`metadata.title`/`final_url`/`content_type`) |
+| Image | `ingest_file("x.png")` | 1 个 —— VLM 描述作为 content;原图路径保留在 `source` |
+
+- `Document`:含 `content` / `source` / `source_type` / `metadata` 的简单 dataclass(见 `ingestion.models`)。
+- 公开 API —— 只从 `insight_agent.ingestion` 导入,不要从 `ingestion.loaders.*` 导入:`ingest`、`ingest_file`、`ingest_text_file`、`infer_file_type`、`safe_ingest`,以及按格式的 `load_*` 逃生舱。
+- 本地文件由**程序**按后缀分发(`infer_file_type`);LLM 不参与选择 loader,loader 也**不会**被注册为 Agent tool。
+- 单一错误类型 `IngestionError`(继承 `RuntimeError`);`safe_ingest` 把任意底层/第三方异常包装为它并保留 `__cause__`。
+
+视觉配置(仅图片)复用项目统一的 env 机制:`VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL`(见 `.env.example`)。Text / Markdown / PDF 摄取无需 API;URL 摄取需要网络但不需要 key。
+
+运行示例(默认走离线 `.txt`):
+
+```bash
+python examples/try_ingestion.py              # 摄取 examples/result.txt
+python examples/try_ingestion.py paper.pdf    # 每个非空页一个 Document
+python examples/try_ingestion.py chart.png    # 需要配置 VISION_*
+```
+
+### 临时 context 适配器(**不是** RAG)
+
+`documents_to_context(documents)`(位于 `ingestion.context`)把 `list[Document]` 渲染成单个 `[Document N] / source / source_type / metadata / <content>` 文本块,便于当前 LLM/Agent 栈在小规模联调中消费摄取结果。它**不是 RAG**,除字符串拼接外不做任何事:无切块、无 embedding、无向量库、无检索、无排序;无 token 预算、无 context 压缩(内容原样转储)。不要借它把大型 Document 集合直接塞进 Agent context。
+
+## 第三章仍未实现
+
+以下能力刻意留到后续章节:
+
+- Chunking / 文本切分
+- Embedding 与任何向量数据库
+- 检索 / RAG pipeline、token 预算、context 压缩
+- OCR 与扫描件 PDF 处理
+- URL loader 的 SSRF 防护、JS 渲染、登录/重 JS 页面抽取
+- 把 loader 注册为 LLM tool、或让模型自行选择 loader
+- 把摄取层接入 CLI / `InsightAgent` 门面(集成为后续工作)
+
 ## 明确未实现（留待后续章节）
 
 以下能力当前不存在，刻意留到后续章节：
 
 - 将 `analyze`/`research` 拆成独立 handler 的 Document / Multimodal Analysis Pipeline 与 Research Workflow
-- RAG、Embedding、向量数据库、PDF 解析、Vision
+- RAG、Embedding、向量数据库（PDF 解析与 Vision 已由第三章多模态摄取层实现；但 Chunking/Embedding/检索/RAG 仍未实现）
 - Web Search、Research Planner、Workflow 编排、LangGraph
 - Memory、MCP
 - Router 置信度、混合路由、Intent 评测基准

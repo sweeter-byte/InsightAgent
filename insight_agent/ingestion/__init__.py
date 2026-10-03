@@ -7,6 +7,7 @@ Public API — this is the only import surface upper-layer code should use:
     ingest_file()                  — local file entry point (type from extension)
     ingest_text_file()             — plain-text file convenience
     infer_file_type()              — extension → SourceType
+    documents_to_context()         — Documents → prompt text (NOT RAG; Ch3 adapter)
     safe_ingest()                  — minimal error boundary around ingest()
     load_text(), load_text_file(), load_markdown(), load_pdf(), load_url(),
     load_image()                   — per-format loaders (escape hatches)
@@ -17,7 +18,7 @@ depending on them directly (e.g. ``ingestion.loaders.pdf_loader``) couples
 callers to a layout that is free to change.
 """
 
-from insight_agent.ingestion.context import infer_file_type
+from insight_agent.ingestion.context import documents_to_context, infer_file_type
 from insight_agent.ingestion.errors import IngestionError
 from insight_agent.ingestion.ingest import ingest, ingest_file, ingest_text_file, safe_ingest
 from insight_agent.ingestion.loaders.image_loader import load_image
@@ -33,6 +34,7 @@ __all__ = [
     "IngestionError",
     "SourceType",
     "describe_image",
+    "documents_to_context",
     "infer_file_type",
     "ingest",
     "ingest_file",
