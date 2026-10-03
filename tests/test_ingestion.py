@@ -1,9 +1,14 @@
 """Tests for the Chapter 3 Multimodal Ingestion layer.
 
-Covers: Document model, Text Loader, Markdown Loader, PDF Loader, URL Loader,
-and the unified ``ingest()`` entry point.
+Covers: Document model, per-format loaders, and the converged public entry
+points (``ingest``, ``ingest_file``, ``ingest_text_file``, ``infer_file_type``,
+``safe_ingest``).
 
-No real network calls, no LLM API — all HTTP interactions are mocked.
+Entry-point tests import from ``insight_agent.ingestion`` on purpose — that is
+the package surface upper-layer code is allowed to depend on.
+
+No real network calls, no LLM/vision API — all HTTP and VLM interactions are
+mocked.
 """
 
 from __future__ import annotations
@@ -14,12 +19,22 @@ from unittest.mock import patch
 
 import pytest
 
-from insight_agent.ingestion.errors import IngestionError
-from insight_agent.ingestion.loaders.markdown_loader import load_markdown
-from insight_agent.ingestion.loaders.pdf_loader import load_pdf
-from insight_agent.ingestion.loaders.text_loader import load_text, load_text_file
-from insight_agent.ingestion.loaders.url_loader import load_url
-from insight_agent.ingestion.models import Document, SourceType
+from insight_agent.ingestion import (
+    Document,
+    IngestionError,
+    SourceType,
+    ingest,
+    ingest_file,
+    ingest_text_file,
+    infer_file_type,
+    load_image,
+    load_markdown,
+    load_pdf,
+    load_text,
+    load_text_file,
+    load_url,
+    safe_ingest,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -294,47 +309,45 @@ def test_load_url_network_error_raises_ingestion_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Unified ingest() dispatch
+# 6. Unified entry point: ingest(source_type, source)
 # ---------------------------------------------------------------------------
 
 
-def test_ingest_text_file(tmp_path: Path) -> None:
-    from insight_agent.ingestion.ingest import ingest
-
-    f = tmp_path / "doc.txt"
-    f.write_text("hello from ingest", encoding="utf-8")
-
-    docs = ingest(str(f))
+def test_ingest_explicit_text_is_inline_content() -> None:
+    """``text`` dispatches to load_text: the payload *is* the content."""
+    docs = ingest(SourceType.TEXT, "InsightAgent chapter three")
     assert len(docs) == 1
-    assert docs[0].content == "hello from ingest"
+    assert docs[0].content == "InsightAgent chapter three"
     assert docs[0].source_type is SourceType.TEXT
 
 
-def test_ingest_markdown_file(tmp_path: Path) -> None:
-    from insight_agent.ingestion.ingest import ingest
+def test_ingest_text_accepts_string_source_type() -> None:
+    docs = ingest("text", "plain string type")
+    assert docs[0].source_type is SourceType.TEXT
+    assert docs[0].content == "plain string type"
 
+
+def test_ingest_explicit_markdown_file(tmp_path: Path) -> None:
     f = tmp_path / "doc.md"
     f.write_text("# Heading\n\nbody text", encoding="utf-8")
 
-    docs = ingest(str(f))
+    docs = ingest(SourceType.MARKDOWN, str(f))
     assert docs[0].source_type is SourceType.MARKDOWN
+    assert docs[0].content.startswith("# Heading")
 
 
-def test_ingest_pdf_file(tmp_path: Path) -> None:
-    from insight_agent.ingestion.ingest import ingest
-
+def test_ingest_explicit_pdf(tmp_path: Path) -> None:
     pdf_path = tmp_path / "doc.pdf"
     _make_pdf(["ingest pdf content"], pdf_path)
 
-    docs = ingest(str(pdf_path))
+    docs = ingest(SourceType.PDF, str(pdf_path))
     assert len(docs) == 1
     assert "ingest pdf content" in docs[0].content
     assert docs[0].source_type is SourceType.PDF
 
 
-def test_ingest_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    from insight_agent.ingestion.ingest import ingest
-
+def test_ingest_explicit_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """URL ingestion stays mocked — no real network traffic."""
     fake_resp = _FakeResponse(
         "<html><head><title>URL</title></head><body>text</body></html>",
         "https://example.org/page",
@@ -344,20 +357,204 @@ def test_ingest_url(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *a, **kw: fake_resp,
     )
 
-    docs = ingest("https://example.org/page")
+    docs = ingest(SourceType.URL, "https://example.org/page")
     assert docs[0].source_type is SourceType.URL
     assert docs[0].metadata["title"] == "URL"
 
 
-def test_ingest_unknown_source_raises(tmp_path: Path) -> None:
-    from insight_agent.ingestion.ingest import ingest
+def test_ingest_explicit_image(tmp_path: Path) -> None:
+    """Image ingestion keeps the VLM call mocked — no real vision API."""
+    png = _make_png(tmp_path)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="a bar chart",
+    ):
+        docs = ingest(SourceType.IMAGE, str(png))
 
-    with pytest.raises(IngestionError, match="Cannot ingest source"):
-        ingest(str(tmp_path / "nonexistent.xyz"))
+    assert docs[0].source_type is SourceType.IMAGE
+    assert docs[0].content == "a bar chart"
+
+
+def test_ingest_unknown_source_type_raises() -> None:
+    with pytest.raises(IngestionError, match="Unknown source_type"):
+        ingest("audio", "some payload")
+
+
+@pytest.mark.parametrize("bad_type", ["", "TEXT", "docx", 42, None])
+def test_ingest_rejects_non_source_type_values(bad_type: Any) -> None:
+    with pytest.raises(IngestionError, match="Unknown source_type"):
+        ingest(bad_type, "payload")
+
+
+def test_ingest_propagates_loader_error(tmp_path: Path) -> None:
+    """A missing file is reported by the loader, unchanged by the dispatcher."""
+    with pytest.raises(IngestionError, match="File not found"):
+        ingest(SourceType.PDF, str(tmp_path / "ghost.pdf"))
 
 
 # ---------------------------------------------------------------------------
-# 7. IngestionError hierarchy
+# 7. File-type inference (extension only — no magic-byte sniffing)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("notes.txt", SourceType.TEXT),
+        ("README.md", SourceType.MARKDOWN),
+        ("README.markdown", SourceType.MARKDOWN),
+        ("paper.pdf", SourceType.PDF),
+        ("chart.png", SourceType.IMAGE),
+        ("photo.jpg", SourceType.IMAGE),
+        ("photo.jpeg", SourceType.IMAGE),
+        ("banner.webp", SourceType.IMAGE),
+    ],
+)
+def test_infer_file_type_by_extension(filename: str, expected: SourceType) -> None:
+    assert infer_file_type(f"/tmp/{filename}") is expected
+
+
+def test_infer_file_type_is_case_insensitive() -> None:
+    assert infer_file_type("PAPER.PDF") is SourceType.PDF
+
+
+def test_infer_file_type_unknown_extension_raises() -> None:
+    with pytest.raises(IngestionError, match="Unrecognized file extension"):
+        infer_file_type("/tmp/data.xyz")
+
+
+def test_infer_file_type_without_extension_raises() -> None:
+    with pytest.raises(IngestionError, match="Unrecognized file extension"):
+        infer_file_type("/tmp/Makefile")
+
+
+# ---------------------------------------------------------------------------
+# 8. ingest_file() — path in, type inferred from the suffix
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_file_txt_reads_file_content(tmp_path: Path) -> None:
+    """A .txt path must go through load_text_file, not be treated as text."""
+    f = tmp_path / "doc.txt"
+    f.write_text("hello from ingest_file", encoding="utf-8")
+
+    docs = ingest_file(str(f))
+    assert len(docs) == 1
+    assert docs[0].content == "hello from ingest_file"
+    assert docs[0].content != str(f)
+    assert docs[0].source_type is SourceType.TEXT
+    assert docs[0].metadata["filename"] == "doc.txt"
+
+
+def test_ingest_file_markdown(tmp_path: Path) -> None:
+    f = tmp_path / "doc.md"
+    f.write_text("# Heading\n\nbody", encoding="utf-8")
+
+    docs = ingest_file(str(f))
+    assert docs[0].source_type is SourceType.MARKDOWN
+    assert docs[0].content.startswith("# Heading")
+
+
+def test_ingest_file_markdown_long_extension(tmp_path: Path) -> None:
+    f = tmp_path / "doc.markdown"
+    f.write_text("long ext", encoding="utf-8")
+
+    assert ingest_file(str(f))[0].source_type is SourceType.MARKDOWN
+
+
+def test_ingest_file_pdf(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "doc.pdf"
+    _make_pdf(["page one", "page two"], pdf_path)
+
+    docs = ingest_file(str(pdf_path))
+    assert len(docs) == 2
+    assert all(d.source_type is SourceType.PDF for d in docs)
+
+
+@pytest.mark.parametrize("name", ["fig.png", "fig.jpg", "fig.jpeg", "fig.webp"])
+def test_ingest_file_image_suffixes(tmp_path: Path, name: str) -> None:
+    f = _make_png(tmp_path, name=name)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="an image",
+    ):
+        docs = ingest_file(str(f))
+
+    assert len(docs) == 1
+    assert docs[0].source_type is SourceType.IMAGE
+    assert docs[0].source == str(f)
+
+
+def test_ingest_file_unknown_extension_raises(tmp_path: Path) -> None:
+    f = tmp_path / "archive.zip"
+    f.write_bytes(b"PK\x03\x04")
+
+    with pytest.raises(IngestionError, match="Unrecognized file extension"):
+        ingest_file(str(f))
+
+
+def test_ingest_file_missing_file_raises(tmp_path: Path) -> None:
+    with pytest.raises(IngestionError, match="File not found"):
+        ingest_file(str(tmp_path / "gone.txt"))
+
+
+def test_ingest_text_file_matches_load_text_file(tmp_path: Path) -> None:
+    f = tmp_path / "plain.txt"
+    f.write_text("text file body", encoding="utf-8")
+
+    docs = ingest_text_file(str(f))
+    assert docs[0].content == "text file body"
+    assert docs[0].source_type is SourceType.TEXT
+
+
+# ---------------------------------------------------------------------------
+# 9. safe_ingest() — minimal error boundary, original cause preserved
+# ---------------------------------------------------------------------------
+
+
+def test_safe_ingest_passes_through_on_success() -> None:
+    docs = safe_ingest(SourceType.TEXT, "unchanged")
+    assert docs[0].content == "unchanged"
+
+
+def test_safe_ingest_wraps_unexpected_error_and_keeps_cause() -> None:
+    boom = TypeError("unexpected loader crash")
+
+    with patch("insight_agent.ingestion.ingest.load_text", side_effect=boom):
+        with pytest.raises(IngestionError, match="Ingestion failed for") as excinfo:
+            safe_ingest(SourceType.TEXT, "payload")
+
+    # exception chaining keeps the original context reachable
+    assert excinfo.value.__cause__ is boom
+
+
+def test_safe_ingest_wraps_third_party_error(tmp_path: Path) -> None:
+    """A raw OSError from below the loader layer still becomes IngestionError."""
+    with patch("insight_agent.ingestion.ingest.load_pdf", side_effect=OSError("disk")):
+        with pytest.raises(IngestionError) as excinfo:
+            safe_ingest(SourceType.PDF, str(tmp_path / "doc.pdf"))
+
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_safe_ingest_does_not_double_wrap_ingestion_error() -> None:
+    with patch(
+        "insight_agent.ingestion.ingest.load_text",
+        side_effect=IngestionError("loader-level failure"),
+    ):
+        with pytest.raises(IngestionError, match="loader-level failure") as excinfo:
+            safe_ingest(SourceType.TEXT, "payload")
+
+    assert "Ingestion failed for" not in str(excinfo.value)
+
+
+def test_safe_ingest_unknown_source_type_raises_ingestion_error() -> None:
+    with pytest.raises(IngestionError, match="Unknown source_type"):
+        safe_ingest("audio", "payload")
+
+
+# ---------------------------------------------------------------------------
+# 10. IngestionError hierarchy
 # ---------------------------------------------------------------------------
 
 
@@ -366,7 +563,7 @@ def test_ingestion_error_is_runtime_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Image Loader (VLM call is always mocked — no real vision API)
+# 11. Image Loader (VLM call is always mocked — no real vision API)
 # ---------------------------------------------------------------------------
 
 
@@ -379,8 +576,6 @@ def _make_png(tmp_path: Path, name: str = "chart.png") -> Path:
 
 
 def test_load_image_returns_document(tmp_path: Path) -> None:
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     png = _make_png(tmp_path)
     with patch(
         "insight_agent.ingestion.loaders.image_loader.describe_image",
@@ -395,8 +590,6 @@ def test_load_image_returns_document(tmp_path: Path) -> None:
 
 
 def test_load_image_source_and_metadata(tmp_path: Path) -> None:
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     png = _make_png(tmp_path, name="fig.jpg")
     with patch(
         "insight_agent.ingestion.loaders.image_loader.describe_image",
@@ -413,8 +606,6 @@ def test_load_image_source_and_metadata(tmp_path: Path) -> None:
 
 def test_load_image_does_not_touch_original(tmp_path: Path) -> None:
     """The description is derived; the original file must survive untouched."""
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     png = _make_png(tmp_path)
     before = png.read_bytes()
     with patch(
@@ -429,8 +620,6 @@ def test_load_image_does_not_touch_original(tmp_path: Path) -> None:
 
 
 def test_load_image_empty_response_does_not_crash(tmp_path: Path) -> None:
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     png = _make_png(tmp_path)
     with patch(
         "insight_agent.ingestion.loaders.image_loader.describe_image",
@@ -444,23 +633,17 @@ def test_load_image_empty_response_does_not_crash(tmp_path: Path) -> None:
 
 
 def test_load_image_missing_file_raises(tmp_path: Path) -> None:
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     with pytest.raises(IngestionError, match="File not found"):
         load_image(str(tmp_path / "absent.png"))
 
 
 def test_load_image_directory_raises(tmp_path: Path) -> None:
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     with pytest.raises(IngestionError, match="Not a regular file"):
         load_image(str(tmp_path))
 
 
 def test_load_image_failure_propagates(tmp_path: Path) -> None:
     """A vision-model failure must bubble up as an IngestionError."""
-    from insight_agent.ingestion.loaders.image_loader import load_image
-
     png = _make_png(tmp_path)
     with patch(
         "insight_agent.ingestion.loaders.image_loader.describe_image",
@@ -470,14 +653,15 @@ def test_load_image_failure_propagates(tmp_path: Path) -> None:
             load_image(str(png))
 
 
-def test_ingest_image_dispatch(tmp_path: Path) -> None:
-    from insight_agent.ingestion.ingest import ingest
-
+def test_safe_ingest_wraps_image_failure(tmp_path: Path) -> None:
+    """Through the error boundary, a VLM crash keeps its original cause."""
     png = _make_png(tmp_path)
+    crash = RuntimeError("vision endpoint unreachable")
     with patch(
         "insight_agent.ingestion.loaders.image_loader.describe_image",
-        return_value="an image",
+        side_effect=crash,
     ):
-        docs = ingest(str(png))
+        with pytest.raises(IngestionError) as excinfo:
+            safe_ingest(SourceType.IMAGE, str(png))
 
-    assert docs[0].source_type is SourceType.IMAGE
+    assert excinfo.value.__cause__ is crash
