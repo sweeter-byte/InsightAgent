@@ -20,19 +20,26 @@ from openai import OpenAI
 load_dotenv()
 
 
+# Single, shared registry of required environment variables and their hints.
+# Both the text LLM client and the vision client read from here so the project
+# keeps ONE config mechanism instead of a second, parallel one.
 _ENV_VAR_HINTS: dict[str, str] = {
     "LLM_API_KEY": "API key for the OpenAI-compatible endpoint.",
     "LLM_BASE_URL": "Base URL of the OpenAI-compatible endpoint, e.g. https://api.openai.com/v1",
     "LLM_MODEL": "Model name to send to the endpoint, e.g. gpt-4o-mini.",
+    "VISION_API_KEY": "API key for the OpenAI-compatible vision endpoint.",
+    "VISION_BASE_URL": "Base URL of the OpenAI-compatible vision endpoint, e.g. https://api.openai.com/v1",
+    "VISION_MODEL": "Vision-language model name, e.g. gpt-4o-mini.",
 }
 
 
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
+        hint = _ENV_VAR_HINTS.get(name, "")
         raise RuntimeError(
             f"Missing required environment variable {name!r}. "
-            f"{_ENV_VAR_HINTS[name]} "
+            f"{hint} "
             f"Please set it in your shell or in a `.env` file "
             f"(see `.env.example` for reference)."
         )

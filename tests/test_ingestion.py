@@ -366,19 +366,118 @@ def test_ingestion_error_is_runtime_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8. Vision and image stubs
+# 8. Image Loader (VLM call is always mocked — no real vision API)
 # ---------------------------------------------------------------------------
 
 
-def test_load_image_raises_not_implemented() -> None:
+def _make_png(tmp_path: Path, name: str = "chart.png") -> Path:
+    """Create a placeholder image file. Content is irrelevant because the VLM
+    call is mocked and MIME inference is extension-based."""
+    f = tmp_path / name
+    f.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    return f
+
+
+def test_load_image_returns_document(tmp_path: Path) -> None:
     from insight_agent.ingestion.loaders.image_loader import load_image
 
-    with pytest.raises(NotImplementedError):
-        load_image("fake.png")
+    png = _make_png(tmp_path)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="A bar chart comparing method A (81.3%) and B (87.6%).",
+    ):
+        docs = load_image(str(png))
+
+    assert len(docs) == 1
+    assert docs[0].source_type is SourceType.IMAGE
+    # describe_image() result lands in Document.content
+    assert "87.6%" in docs[0].content
 
 
-def test_extract_text_from_image_raises_not_implemented() -> None:
-    from insight_agent.ingestion.vision import extract_text_from_image
+def test_load_image_source_and_metadata(tmp_path: Path) -> None:
+    from insight_agent.ingestion.loaders.image_loader import load_image
 
-    with pytest.raises(NotImplementedError):
-        extract_text_from_image("fake.png")
+    png = _make_png(tmp_path, name="fig.jpg")
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="desc",
+    ):
+        docs = load_image(str(png))
+
+    doc = docs[0]
+    # source preserves the original image path for traceability
+    assert doc.source == str(png)
+    assert doc.metadata["filename"] == "fig.jpg"
+    assert doc.metadata["mime_type"] == "image/jpeg"
+
+
+def test_load_image_does_not_touch_original(tmp_path: Path) -> None:
+    """The description is derived; the original file must survive untouched."""
+    from insight_agent.ingestion.loaders.image_loader import load_image
+
+    png = _make_png(tmp_path)
+    before = png.read_bytes()
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="desc",
+    ):
+        docs = load_image(str(png))
+
+    assert png.exists() and png.is_file()
+    assert png.read_bytes() == before
+    assert docs[0].source == str(png)  # still traceable to the real file
+
+
+def test_load_image_empty_response_does_not_crash(tmp_path: Path) -> None:
+    from insight_agent.ingestion.loaders.image_loader import load_image
+
+    png = _make_png(tmp_path)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="",
+    ):
+        docs = load_image(str(png))
+
+    assert len(docs) == 1
+    assert docs[0].content == ""
+    assert docs[0].source_type is SourceType.IMAGE
+
+
+def test_load_image_missing_file_raises(tmp_path: Path) -> None:
+    from insight_agent.ingestion.loaders.image_loader import load_image
+
+    with pytest.raises(IngestionError, match="File not found"):
+        load_image(str(tmp_path / "absent.png"))
+
+
+def test_load_image_directory_raises(tmp_path: Path) -> None:
+    from insight_agent.ingestion.loaders.image_loader import load_image
+
+    with pytest.raises(IngestionError, match="Not a regular file"):
+        load_image(str(tmp_path))
+
+
+def test_load_image_failure_propagates(tmp_path: Path) -> None:
+    """A vision-model failure must bubble up as an IngestionError."""
+    from insight_agent.ingestion.loaders.image_loader import load_image
+
+    png = _make_png(tmp_path)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        side_effect=IngestionError("Vision model call failed"),
+    ):
+        with pytest.raises(IngestionError, match="Vision model call failed"):
+            load_image(str(png))
+
+
+def test_ingest_image_dispatch(tmp_path: Path) -> None:
+    from insight_agent.ingestion.ingest import ingest
+
+    png = _make_png(tmp_path)
+    with patch(
+        "insight_agent.ingestion.loaders.image_loader.describe_image",
+        return_value="an image",
+    ):
+        docs = ingest(str(png))
+
+    assert docs[0].source_type is SourceType.IMAGE
