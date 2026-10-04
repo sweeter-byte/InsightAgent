@@ -64,6 +64,18 @@ class FakeResearchAgent:
         return self.reply_text
 
 
+class FakeResearchCoordinator:
+    """Pretends to plan and then invoke the existing research path."""
+
+    def __init__(self, reply_text: str = "planned research answer") -> None:
+        self.reply_text = reply_text
+        self.calls: list[str] = []
+
+    def run(self, query: str) -> str:
+        self.calls.append(query)
+        return self.reply_text
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -74,16 +86,24 @@ def _build(
     *,
     direct_reply: str = "direct answer",
     research_reply: str = "research answer",
-) -> tuple[InsightAgent, FakeRouter, FakeLLM, FakeResearchAgent]:
+) -> tuple[
+    InsightAgent,
+    FakeRouter,
+    FakeLLM,
+    FakeResearchAgent,
+    FakeResearchCoordinator,
+]:
     router = FakeRouter(intent)
     llm = FakeLLM(direct_reply)
     research = FakeResearchAgent(research_reply)
+    coordinator = FakeResearchCoordinator(research_reply)
     app = InsightAgent(
         router=router,  # type: ignore[arg-type]
         llm=llm,  # type: ignore[arg-type]
         research_agent=research,  # type: ignore[arg-type]
+        research_coordinator=coordinator,  # type: ignore[arg-type]
     )
-    return app, router, llm, research
+    return app, router, llm, research, coordinator
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +112,9 @@ def _build(
 
 
 def test_direct_intent_uses_llm_not_research_agent() -> None:
-    app, router, llm, research = _build(Intent.DIRECT, direct_reply="hello there")
+    app, router, llm, research, coordinator = _build(
+        Intent.DIRECT, direct_reply="hello there"
+    )
 
     answer = app.run("what is 2+2")
 
@@ -102,12 +124,13 @@ def test_direct_intent_uses_llm_not_research_agent() -> None:
     assert len(llm.calls) == 1
     # ResearchAgent was NOT invoked
     assert research.calls == []
+    assert coordinator.calls == []
     # the returned text is the direct LLM reply
     assert answer == "hello there"
 
 
 def test_direct_call_passes_no_tools() -> None:
-    app, _, llm, _ = _build(Intent.DIRECT)
+    app, _, llm, _, _ = _build(Intent.DIRECT)
 
     app.run("anything")
 
@@ -115,7 +138,7 @@ def test_direct_call_passes_no_tools() -> None:
 
 
 def test_direct_call_sends_system_and_user_messages() -> None:
-    app, _, llm, _ = _build(Intent.DIRECT)
+    app, _, llm, _, _ = _build(Intent.DIRECT)
 
     app.run("tell me a joke")
 
@@ -136,14 +159,17 @@ def test_direct_returns_empty_string_when_llm_has_no_choices() -> None:
 
     router = FakeRouter(Intent.DIRECT)
     research = FakeResearchAgent()
+    coordinator = FakeResearchCoordinator()
     app = InsightAgent(
         router=router,  # type: ignore[arg-type]
         llm=EmptyLLM(),  # type: ignore[arg-type]
         research_agent=research,  # type: ignore[arg-type]
+        research_coordinator=coordinator,  # type: ignore[arg-type]
     )
 
     assert app.run("boom") == ""
     assert research.calls == []
+    assert coordinator.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +178,7 @@ def test_direct_returns_empty_string_when_llm_has_no_choices() -> None:
 
 
 def test_analyze_intent_delegates_to_research_agent() -> None:
-    app, router, llm, research = _build(
+    app, router, llm, research, coordinator = _build(
         Intent.ANALYZE, research_reply="Method B wins"
     )
 
@@ -160,36 +186,34 @@ def test_analyze_intent_delegates_to_research_agent() -> None:
 
     assert router.calls == ["read notes.txt and summarize"]
     assert research.calls == ["read notes.txt and summarize"]
+    assert coordinator.calls == []
     # the direct-answer LLM must not be invoked on the analyze path
     assert llm.calls == []
     assert answer == "Method B wins"
 
 
 # ---------------------------------------------------------------------------
-# 3. RESEARCH path — same handler as analyze, but intent stays separate
+# 3. RESEARCH path — planner/coordinator only
 # ---------------------------------------------------------------------------
 
 
-def test_research_intent_delegates_to_research_agent() -> None:
-    app, router, llm, research = _build(
+def test_research_intent_delegates_to_research_coordinator() -> None:
+    app, router, llm, research, coordinator = _build(
         Intent.RESEARCH, research_reply="survey complete"
     )
 
     answer = app.run("investigate recent Agent Memory papers")
 
     assert router.calls == ["investigate recent Agent Memory papers"]
-    assert research.calls == ["investigate recent Agent Memory papers"]
+    assert research.calls == []
+    assert coordinator.calls == ["investigate recent Agent Memory papers"]
     assert llm.calls == []
     assert answer == "survey complete"
 
 
-def test_analyze_and_research_share_handler_but_keep_distinct_intents() -> None:
-    """Both intents route into ResearchAgent, but the router is asked separately.
-
-    This guards against a future refactor that collapses the two intents.
-    """
-    app_a, router_a, _, research_a = _build(Intent.ANALYZE)
-    app_r, router_r, _, research_r = _build(Intent.RESEARCH)
+def test_analyze_and_research_use_distinct_execution_paths() -> None:
+    app_a, router_a, _, research_a, coordinator_a = _build(Intent.ANALYZE)
+    app_r, router_r, _, research_r, coordinator_r = _build(Intent.RESEARCH)
 
     app_a.run("q-analyze")
     app_r.run("q-research")
@@ -197,7 +221,9 @@ def test_analyze_and_research_share_handler_but_keep_distinct_intents() -> None:
     assert router_a._intent is Intent.ANALYZE
     assert router_r._intent is Intent.RESEARCH
     assert research_a.calls == ["q-analyze"]
-    assert research_r.calls == ["q-research"]
+    assert coordinator_a.calls == []
+    assert research_r.calls == []
+    assert coordinator_r.calls == ["q-research"]
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +239,7 @@ def test_run_does_not_construct_real_objects(monkeypatch: pytest.MonkeyPatch) ->
     for var in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
         monkeypatch.delenv(var, raising=False)
 
-    app, _, _, _ = _build(Intent.DIRECT, direct_reply="ok")
+    app, _, _, _, _ = _build(Intent.DIRECT, direct_reply="ok")
     assert app.run("hi") == "ok"
 
 
@@ -226,10 +252,12 @@ def test_custom_direct_prompt_is_used() -> None:
     router = FakeRouter(Intent.DIRECT)
     llm = FakeLLM("resp")
     research = FakeResearchAgent()
+    coordinator = FakeResearchCoordinator()
     app = InsightAgent(
         router=router,  # type: ignore[arg-type]
         llm=llm,  # type: ignore[arg-type]
         research_agent=research,  # type: ignore[arg-type]
+        research_coordinator=coordinator,  # type: ignore[arg-type]
         direct_system_prompt="custom prompt",
     )
 
@@ -243,7 +271,7 @@ def test_custom_direct_prompt_is_used() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_router_fallback_still_executes_via_research_agent() -> None:
+def test_router_fallback_still_executes_via_research_coordinator() -> None:
     """A real ``IntentRouter`` fed garbage falls back to RESEARCH, and the app
     still dispatches to ResearchAgent — no crash, empty answer never returned.
     """
@@ -252,11 +280,13 @@ def test_router_fallback_still_executes_via_research_agent() -> None:
     router = IntentRouter(llm=routing_llm)  # type: ignore[arg-type]
     answering_llm = FakeLLM("unused direct answer")
     research = FakeResearchAgent(reply_text="handled after fallback")
+    coordinator = FakeResearchCoordinator(reply_text="handled after fallback")
 
     app = InsightAgent(
         router=router,
         llm=answering_llm,  # type: ignore[arg-type]
         research_agent=research,  # type: ignore[arg-type]
+        research_coordinator=coordinator,  # type: ignore[arg-type]
     )
 
     answer = app.run("some ambiguous query")
@@ -264,8 +294,9 @@ def test_router_fallback_still_executes_via_research_agent() -> None:
     # the router consumed the fallback LLM (one classification call, no tools)
     assert len(routing_llm.calls) == 1
     assert routing_llm.calls[0]["tools"] is None
-    # fallback intent is RESEARCH → ResearchAgent handled it
-    assert research.calls == ["some ambiguous query"]
+    # fallback intent is RESEARCH → planner/coordinator path handled it
+    assert research.calls == []
+    assert coordinator.calls == ["some ambiguous query"]
     # the direct-answer LLM was never used
     assert answering_llm.calls == []
     assert answer == "handled after fallback"

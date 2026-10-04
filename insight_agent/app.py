@@ -10,15 +10,14 @@ Flow::
     IntentRouter.route(query) → Intent
         ↓
     ┌──────────────┬───────────────────┬────────────────────┐
-    │ DIRECT       │ ANALYZE           │ RESEARCH           │
-    │  one plain   │  ResearchAgent    │  ResearchAgent     │
-    │  chat call,  │  .run(query)      │  .run(query)       │
-    │  no tools,   │                   │                    │
-    │  no loop     │                   │                    │
+    │ DIRECT       │ ANALYZE           │ RESEARCH              │
+    │  one plain   │  ResearchAgent    │  ResearchCoordinator  │
+    │  chat call,  │  .run(query)      │  .run(query)          │
+    │  no tools,   │                   │  plan → same Agent    │
+    │  no loop     │                   │                       │
 
-`analyze` and `research` currently share the same downstream handler on
-purpose — the intent label is preserved so future chapters can split them
-without touching this dispatch site.
+Only `research` enters planning. `analyze` continues to call the existing
+ResearchAgent directly.
 
 This module intentionally does NOT introduce handler registries, middleware,
 DAGs, workflow engines, plug-in systems, DI frameworks, or LangGraph. It is
@@ -31,6 +30,7 @@ from typing import Any
 
 from insight_agent.agent import ResearchAgent
 from insight_agent.llm import LLMClient
+from insight_agent.planning.coordinator import ResearchCoordinator
 from insight_agent.router import Intent, IntentRouter
 
 
@@ -53,11 +53,13 @@ class InsightAgent:
         router: IntentRouter,
         llm: LLMClient,
         research_agent: ResearchAgent,
+        research_coordinator: ResearchCoordinator,
         direct_system_prompt: str = DIRECT_SYSTEM_PROMPT,
     ) -> None:
         self.router = router
         self.llm = llm
         self.research_agent = research_agent
+        self.research_coordinator = research_coordinator
         self.direct_system_prompt = direct_system_prompt
 
     # ------------------------------------------------------------------ public
@@ -69,10 +71,10 @@ class InsightAgent:
         if intent is Intent.DIRECT:
             return self._answer_direct(query)
 
-        # ANALYZE and RESEARCH both delegate to ResearchAgent for now; the two
-        # intents remain separate so later chapters can fork them without
-        # rewriting this dispatch site.
-        return self.research_agent.run(query)
+        if intent is Intent.ANALYZE:
+            return self.research_agent.run(query)
+
+        return self.research_coordinator.run(query)
 
     # ----------------------------------------------------------------- private
 

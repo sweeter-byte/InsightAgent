@@ -18,6 +18,7 @@ from typing import Optional
 from insight_agent.agent import AgentStepsExceeded, ResearchAgent
 from insight_agent.app import InsightAgent
 from insight_agent.llm import LLMClient
+from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
 from insight_agent.router import IntentRouter
 from insight_agent.tools.registry import build_default_registry, default_tool_schemas
 
@@ -40,11 +41,17 @@ def _build_app() -> InsightAgent:
         registry=build_default_registry(),
         tool_schemas=default_tool_schemas(),
     )
+    planner = ResearchPlanner(llm=llm)
+    research_coordinator = ResearchCoordinator(
+        planner=planner,
+        research_agent=research_agent,
+    )
     router = IntentRouter(llm=llm)
     return InsightAgent(
         router=router,
         llm=llm,
         research_agent=research_agent,
+        research_coordinator=research_coordinator,
     )
 
 
@@ -58,6 +65,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         answer = app.run(query)
     except AgentStepsExceeded as exc:
         print(f"[agent stopped] {exc}", file=sys.stderr)
+        return 1
+    except PlanningError as exc:
+        print(f"[planning error] {exc}", file=sys.stderr)
         return 1
     _print_answer(answer)
     return None

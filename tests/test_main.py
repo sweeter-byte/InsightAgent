@@ -22,6 +22,7 @@ from insight_agent import __main__ as cli
 from insight_agent.agent import AgentStepsExceeded, ResearchAgent
 from insight_agent.app import InsightAgent
 from insight_agent.llm import LLMClient
+from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
 from insight_agent.router import IntentRouter
 
 
@@ -74,6 +75,9 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(app, InsightAgent)
     assert isinstance(app.router, IntentRouter)
     assert isinstance(app.research_agent, ResearchAgent)
+    assert isinstance(app.research_coordinator, ResearchCoordinator)
+    assert isinstance(app.research_coordinator.planner, ResearchPlanner)
+    assert app.research_coordinator.research_agent is app.research_agent
     assert isinstance(app.llm, LLMClient)
 
 
@@ -92,7 +96,12 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
 
     app = cli._build_app()
 
-    assert app.llm is app.router.llm is app.research_agent.llm
+    assert (
+        app.llm
+        is app.router.llm
+        is app.research_agent.llm
+        is app.research_coordinator.planner.llm
+    )
 
 
 def test_build_app_registers_knowledge_search_without_opening_qdrant(
@@ -179,6 +188,20 @@ def test_main_one_shot_agent_steps_exceeded_returns_1(
     captured = capsys.readouterr()
     assert "[agent stopped]" in captured.err
     assert "exceeded 10 steps" in captured.err
+
+
+def test_main_one_shot_planning_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureManager
+) -> None:
+    fake = FakeApp(raise_exc=PlanningError("planner returned invalid JSON"))
+    monkeypatch.setattr(cli, "_build_app", lambda: fake)
+
+    rc = cli.main(["research", "topic"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[planning error]" in captured.err
+    assert "invalid JSON" in captured.err
 
 
 # ---------------------------------------------------------------------------
