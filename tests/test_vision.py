@@ -65,9 +65,10 @@ def test_guess_mime_type_supported(filename: str, expected: str) -> None:
     assert guess_mime_type(f"/tmp/{filename}") == expected
 
 
-def test_guess_mime_type_unknown_raises() -> None:
+@pytest.mark.parametrize("extension", ["gif", "bmp", "svg"])
+def test_guess_mime_type_unsupported_image_format_raises(extension: str) -> None:
     with pytest.raises(IngestionError, match="Unsupported or unrecognized image format"):
-        guess_mime_type("/tmp/document.xyz123")
+        guess_mime_type(f"/tmp/image.{extension}")
 
 
 # ---------------------------------------------------------------------------
@@ -176,9 +177,14 @@ def test_describe_image_empty_file_raises(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize("missing", ["VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL"])
-def test_describe_image_missing_env_raises(missing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_describe_image_missing_env_raises_ingestion_error_with_cause(
+    missing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _set_vision_env(monkeypatch)
     monkeypatch.delenv(missing)
     img = _write_image(tmp_path)
-    with pytest.raises(RuntimeError, match=missing):
+    with pytest.raises(IngestionError, match=f"Vision configuration error:.*{missing}") as excinfo:
         describe_image(str(img))
+
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert missing in str(excinfo.value.__cause__)

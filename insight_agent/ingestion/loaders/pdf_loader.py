@@ -24,8 +24,8 @@ def load_pdf(path: str) -> list[Document]:
         ``list[Document]`` with ``source_type=PDF``.
 
     Raises:
-        IngestionError: if the file does not exist, cannot be opened, or is
-            not a valid PDF.
+        IngestionError: if the file does not exist, cannot be opened, or fails
+            during page access or text extraction.
     """
     import pymupdf  # noqa: PLC0415 — deferred to avoid import cost for non-PDF users
 
@@ -40,10 +40,9 @@ def load_pdf(path: str) -> list[Document]:
     except Exception as exc:
         raise IngestionError(f"Failed to open PDF {path}: {exc}") from exc
 
-    documents: list[Document] = []
-    page_count = doc.page_count
-
     try:
+        documents: list[Document] = []
+        page_count = doc.page_count
         for page_idx in range(page_count):
             page = doc[page_idx]
             text: str = page.get_text("text", sort=True)
@@ -61,6 +60,8 @@ def load_pdf(path: str) -> list[Document]:
                     },
                 )
             )
+    except Exception as exc:
+        raise IngestionError(f"Failed to parse PDF {path}: {exc}") from exc
     finally:
         doc.close()
 

@@ -30,8 +30,6 @@ _EXT_MAP: dict[str, SourceType] = {
     ".jpg": SourceType.IMAGE,
     ".jpeg": SourceType.IMAGE,
     ".webp": SourceType.IMAGE,
-    ".bmp": SourceType.IMAGE,
-    ".gif": SourceType.IMAGE,
 }
 
 

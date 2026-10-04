@@ -25,7 +25,6 @@ text model on purpose — they may come from different providers later:
 from __future__ import annotations
 
 import base64
-import mimetypes
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +35,6 @@ from insight_agent.llm import _require_env
 
 # Explicit MIME map for the formats this stage targets. Kept minimal on purpose
 # — we do NOT pull in a heavyweight imaging library just to sniff rare formats.
-# Any other extension falls back to ``mimetypes.guess_type`` (stdlib, no dep).
 _MIME_BY_EXT: dict[str, str] = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -73,8 +71,8 @@ VISION_SYSTEM_PROMPT = (
 def guess_mime_type(path: str) -> str:
     """Infer an image MIME type from its file extension.
 
-    Uses an explicit map for the targeted formats (png/jpeg/webp) and falls
-    back to ``mimetypes.guess_type`` for anything else.
+    Only the explicitly supported PNG, JPG, JPEG, and WEBP extensions are
+    accepted.
 
     Args:
         path: filesystem path to an image.
@@ -88,9 +86,6 @@ def guess_mime_type(path: str) -> str:
     suffix = Path(path).suffix.lower()
     mime = _MIME_BY_EXT.get(suffix)
     if mime is None:
-        guessed, _encoding = mimetypes.guess_type(path)
-        mime = guessed
-    if not mime or not mime.startswith("image/"):
         raise IngestionError(f"Unsupported or unrecognized image format: {path!r}")
     return mime
 
@@ -136,9 +131,8 @@ def describe_image(path: str) -> str:
 
     Raises:
         IngestionError: if the file is missing, unreadable, has an unsupported
-            format, is empty, or the vision model call fails.
-        RuntimeError: if a required ``VISION_*`` environment variable is unset
-            (raised by the shared ``_require_env`` config helper).
+            format, is empty, lacks required vision configuration, or the
+            vision model call fails.
     """
     p = Path(path)
     if not p.exists():
@@ -149,9 +143,12 @@ def describe_image(path: str) -> str:
     mime = guess_mime_type(path)
     data_url = _encode_data_url(p, mime)
 
-    api_key = _require_env("VISION_API_KEY")
-    base_url = _require_env("VISION_BASE_URL")
-    model = _require_env("VISION_MODEL")
+    try:
+        api_key = _require_env("VISION_API_KEY")
+        base_url = _require_env("VISION_BASE_URL")
+        model = _require_env("VISION_MODEL")
+    except RuntimeError as exc:
+        raise IngestionError(f"Vision configuration error: {exc}") from exc
 
     client = OpenAI(api_key=api_key, base_url=base_url)
 

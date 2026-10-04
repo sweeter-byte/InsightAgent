@@ -64,7 +64,7 @@ def test_route_returns_direct() -> None:
 
 def test_route_returns_analyze() -> None:
     router, _ = _build_router("analyze")
-    assert router.route("读取 examples/result.txt，告诉我准确率最高的方法") == Intent.ANALYZE
+    assert router.route("读取 notes.txt，告诉我准确率最高的方法") == Intent.ANALYZE
 
 
 def test_route_returns_research() -> None:

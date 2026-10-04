@@ -104,10 +104,10 @@ def test_main_one_shot_prints_answer(
     fake = FakeApp(reply="one-shot result")
     monkeypatch.setattr(cli, "_build_app", lambda: fake)
 
-    rc = cli.main(["读取", "examples/result.txt"])
+    rc = cli.main(["读取", "notes.txt"])
 
     assert rc == 0
-    assert fake.calls == ["读取 examples/result.txt"]
+    assert fake.calls == ["读取 notes.txt"]
     assert "one-shot result" in capsys.readouterr().out
 
 

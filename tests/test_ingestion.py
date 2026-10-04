@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -213,6 +213,25 @@ def test_load_pdf_source_type(tmp_path: Path) -> None:
 
     docs = load_pdf(str(pdf_path))
     assert docs[0].source_type is SourceType.PDF
+
+
+def test_load_pdf_page_text_failure_is_wrapped_and_document_closed(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "page-error.pdf"
+    pdf_path.write_bytes(b"placeholder")
+    original_error = RuntimeError("page text extraction failed")
+
+    page = MagicMock()
+    page.get_text.side_effect = original_error
+    pdf_document = MagicMock()
+    pdf_document.page_count = 1
+    pdf_document.__getitem__.return_value = page
+
+    with patch("pymupdf.open", return_value=pdf_document):
+        with pytest.raises(IngestionError, match="Failed to parse PDF") as excinfo:
+            load_pdf(str(pdf_path))
+
+    assert excinfo.value.__cause__ is original_error
+    pdf_document.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +447,12 @@ def test_infer_file_type_without_extension_raises() -> None:
         infer_file_type("/tmp/Makefile")
 
 
+@pytest.mark.parametrize("extension", ["gif", "bmp", "svg"])
+def test_infer_file_type_rejects_unsupported_image_formats(extension: str) -> None:
+    with pytest.raises(IngestionError, match="Unrecognized file extension"):
+        infer_file_type(f"/tmp/image.{extension}")
+
+
 # ---------------------------------------------------------------------------
 # 8. ingest_file() — path in, type inferred from the suffix
 # ---------------------------------------------------------------------------
@@ -483,6 +508,19 @@ def test_ingest_file_image_suffixes(tmp_path: Path, name: str) -> None:
     assert len(docs) == 1
     assert docs[0].source_type is SourceType.IMAGE
     assert docs[0].source == str(f)
+
+
+def test_ingest_file_missing_vision_config_raises_ingestion_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for name in ("VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    image = _make_png(tmp_path)
+
+    with pytest.raises(IngestionError, match="Vision configuration error") as excinfo:
+        ingest_file(str(image))
+
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
 
 
 def test_ingest_file_unknown_extension_raises(tmp_path: Path) -> None:

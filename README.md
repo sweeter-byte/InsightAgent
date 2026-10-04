@@ -67,7 +67,7 @@ and prints the final answer. Type `exit` or press Ctrl-D to quit.
 A one-shot form is also supported:
 
 ```bash
-python -m insight_agent "读取 examples/result.txt,准确率最高的方法是什么?"
+python -m insight_agent "读取 README.md，并概括项目当前实现范围"
 ```
 
 ## Run the tests
@@ -166,7 +166,7 @@ Five input formats normalize into one shape — `list[Document]`:
 | Markdown | `ingest_file("x.md")` | 1 — raw markdown preserved |
 | PDF | `ingest_file("x.pdf")` | 1 per non-empty page (`metadata.page`/`page_count`) |
 | URL | `ingest("url", "https://…")` | 1 — cleaned visible text (`metadata.title`/`final_url`/`content_type`) |
-| Image | `ingest_file("x.png")` | 1 — VLM description as content; original path kept in `source` |
+| Image (PNG / JPG / JPEG / WEBP) | `ingest_file("x.png")` | 1 — VLM description as content; original path kept in `source` |
 
 - `Document`: a plain dataclass with `content` / `source` / `source_type` /
   `metadata` (see `ingestion.models`).
@@ -183,13 +183,26 @@ Vision config (images only) reuses the project's single env-var mechanism:
 `VISION_API_KEY`, `VISION_BASE_URL`, `VISION_MODEL` (see `.env.example`). Text /
 Markdown / PDF ingestion needs no API; URL ingestion needs network but no key.
 
-Try it (defaults to an offline `.txt` input):
+Basic file ingestion:
 
-```bash
-python examples/try_ingestion.py              # ingests examples/result.txt
-python examples/try_ingestion.py paper.pdf    # one Document per non-empty page
-python examples/try_ingestion.py chart.png    # requires VISION_* to be configured
+```python
+from insight_agent.ingestion import documents_to_context, ingest_file
+
+documents = ingest_file("path/to/paper.pdf")
+
+for document in documents:
+    print("source_type:", document.source_type.value)
+    print("source:", document.source)
+    print("metadata:", document.metadata)
+    print("content preview:", document.content[:200])
+
+context = documents_to_context(documents)
+print(context[:500])
 ```
+
+Text, Markdown, and PDF files work without API configuration. Image ingestion,
+for example `ingest_file("path/to/chart.png")`, requires `VISION_API_KEY`,
+`VISION_BASE_URL`, and `VISION_MODEL`.
 
 ### Temporary context adapter (**not** RAG)
 

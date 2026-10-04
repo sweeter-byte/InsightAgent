@@ -26,7 +26,7 @@ def load_image(path: str) -> list[Document]:
     """Load an image and return its visual description as a single Document.
 
     Args:
-        path: filesystem path to an image file (png/jpg/jpeg/webp, …).
+        path: filesystem path to a PNG, JPG, JPEG, or WEBP image file.
 
     Returns:
         ``[Document]`` with ``source_type=IMAGE``. ``content`` holds the VLM

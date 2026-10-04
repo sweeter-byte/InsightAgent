@@ -51,7 +51,7 @@ python -m insight_agent
 也支持一次性执行:
 
 ```bash
-python -m insight_agent "读取 examples/result.txt,准确率最高的方法是什么?"
+python -m insight_agent "读取 README.md，并概括项目当前实现范围"
 ```
 
 ## 运行测试
@@ -114,7 +114,7 @@ Agent Loop / Tools   → 决定执行过程中下一步调用什么外部能力
 | Markdown | `ingest_file("x.md")` | 1 个 —— 原样保留 markdown |
 | PDF | `ingest_file("x.pdf")` | 每个非空页 1 个(`metadata.page`/`page_count`) |
 | URL | `ingest("url", "https://…")` | 1 个 —— 清理后的可见文本(`metadata.title`/`final_url`/`content_type`) |
-| Image | `ingest_file("x.png")` | 1 个 —— VLM 描述作为 content;原图路径保留在 `source` |
+| Image（PNG / JPG / JPEG / WEBP） | `ingest_file("x.png")` | 1 个 —— VLM 描述作为 content;原图路径保留在 `source` |
 
 - `Document`:含 `content` / `source` / `source_type` / `metadata` 的简单 dataclass(见 `ingestion.models`)。
 - 公开 API —— 只从 `insight_agent.ingestion` 导入,不要从 `ingestion.loaders.*` 导入:`ingest`、`ingest_file`、`ingest_text_file`、`infer_file_type`、`safe_ingest`,以及按格式的 `load_*` 逃生舱。
@@ -123,13 +123,26 @@ Agent Loop / Tools   → 决定执行过程中下一步调用什么外部能力
 
 视觉配置(仅图片)复用项目统一的 env 机制:`VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL`(见 `.env.example`)。Text / Markdown / PDF 摄取无需 API;URL 摄取需要网络但不需要 key。
 
-运行示例(默认走离线 `.txt`):
+基本文件摄取示例:
 
-```bash
-python examples/try_ingestion.py              # 摄取 examples/result.txt
-python examples/try_ingestion.py paper.pdf    # 每个非空页一个 Document
-python examples/try_ingestion.py chart.png    # 需要配置 VISION_*
+```python
+from insight_agent.ingestion import documents_to_context, ingest_file
+
+documents = ingest_file("path/to/paper.pdf")
+
+for document in documents:
+    print("source_type:", document.source_type.value)
+    print("source:", document.source)
+    print("metadata:", document.metadata)
+    print("content preview:", document.content[:200])
+
+context = documents_to_context(documents)
+print(context[:500])
 ```
+
+Text、Markdown 和 PDF 文件无需 API 配置。摄取图片时，例如
+`ingest_file("path/to/chart.png")`，需要配置 `VISION_API_KEY`、
+`VISION_BASE_URL` 和 `VISION_MODEL`。
 
 ### 临时 context 适配器(**不是** RAG)
 

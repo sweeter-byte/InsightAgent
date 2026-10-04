@@ -156,10 +156,10 @@ def test_analyze_intent_delegates_to_research_agent() -> None:
         Intent.ANALYZE, research_reply="Method B wins"
     )
 
-    answer = app.run("read examples/result.txt and summarize")
+    answer = app.run("read notes.txt and summarize")
 
-    assert router.calls == ["read examples/result.txt and summarize"]
-    assert research.calls == ["read examples/result.txt and summarize"]
+    assert router.calls == ["read notes.txt and summarize"]
+    assert research.calls == ["read notes.txt and summarize"]
     # the direct-answer LLM must not be invoked on the analyze path
     assert llm.calls == []
     assert answer == "Method B wins"
