@@ -4,6 +4,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from insight_agent.routing.models import RetrievalSource, RouteDecision
 
 
 MAX_RESEARCH_TASKS = 6
@@ -34,10 +39,15 @@ class ResearchPlan:
 
 @dataclass(slots=True)
 class ResearchState:
-    """Current Chapter 7 state: the original query and its structured plan."""
+    """Canonical state shared by planning and the research workflow."""
 
     query: str
     plan: ResearchPlan | None = None
+    available_sources: set[RetrievalSource] = field(default_factory=set)
+    task_index: int = 0
+    current_task: ResearchTask | None = None
+    current_route: RouteDecision | None = None
+    route_decisions: list[RouteDecision] = field(default_factory=list)
 
 
 def validate_research_plan(plan: ResearchPlan) -> None:

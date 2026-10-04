@@ -6,8 +6,8 @@ Behavior:
 
 Nothing here is required by the agent itself; the CLI is just a thin wrapper
 that assembles the app — a shared ``LLMClient``, a default registry,
-``ResearchAgent``, ``IntentRouter`` and the ``InsightAgent`` façade — and reads
-a line of user input.
+``ResearchAgent``, both routers, the research workflow, and the ``InsightAgent``
+façade — and reads a line of user input.
 """
 
 from __future__ import annotations
@@ -19,7 +19,10 @@ from insight_agent.agent import AgentStepsExceeded, ResearchAgent
 from insight_agent.app import InsightAgent
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
+from insight_agent.research import ResearchRoutingWorkflow
 from insight_agent.router import IntentRouter
+from insight_agent.routing import RetrievalSource, RoutingError
+from insight_agent.routing.router import RetrievalRouter
 from insight_agent.tools.registry import build_default_registry, default_tool_schemas
 
 
@@ -31,9 +34,9 @@ _BANNER = (
 def _build_app() -> InsightAgent:
     """Compose the full application object.
 
-    A single ``LLMClient`` instance is shared by the router, the direct-answer
-    path and the ResearchAgent — there is no reason to build three clients, and
-    we deliberately avoid a factory / DI layer for this.
+    A single ``LLMClient`` instance is shared by both routers, the planner, the
+    direct-answer path, and the ResearchAgent. We deliberately avoid a factory
+    or DI framework for this small object graph.
     """
     llm = LLMClient()
     research_agent = ResearchAgent(
@@ -42,9 +45,15 @@ def _build_app() -> InsightAgent:
         tool_schemas=default_tool_schemas(),
     )
     planner = ResearchPlanner(llm=llm)
+    retrieval_router = RetrievalRouter(llm=llm)
+    research_workflow = ResearchRoutingWorkflow(router=retrieval_router)
     research_coordinator = ResearchCoordinator(
         planner=planner,
+        workflow=research_workflow,
         research_agent=research_agent,
+        # All three are valid routing targets in Chapter 8. Web and vision
+        # entry nodes record decisions only; they do not execute retrieval.
+        available_sources=set(RetrievalSource),
     )
     router = IntentRouter(llm=llm)
     return InsightAgent(
@@ -68,6 +77,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         return 1
     except PlanningError as exc:
         print(f"[planning error] {exc}", file=sys.stderr)
+        return 1
+    except RoutingError as exc:
+        print(f"[routing error] {exc}", file=sys.stderr)
         return 1
     _print_answer(answer)
     return None

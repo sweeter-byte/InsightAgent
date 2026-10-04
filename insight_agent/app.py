@@ -10,18 +10,19 @@ Flow::
     IntentRouter.route(query) → Intent
         ↓
     ┌──────────────┬───────────────────┬────────────────────┐
-    │ DIRECT       │ ANALYZE           │ RESEARCH              │
-    │  one plain   │  ResearchAgent    │  ResearchCoordinator  │
-    │  chat call,  │  .run(query)      │  .run(query)          │
-    │  no tools,   │                   │  plan → same Agent    │
-    │  no loop     │                   │                       │
+    │ DIRECT       │ ANALYZE           │ RESEARCH                    │
+    │  one plain   │  ResearchAgent    │  ResearchCoordinator        │
+    │  chat call,  │  .run(query)      │  .run(query)                │
+    │  no tools,   │                   │  plan → route → same Agent  │
+    │  no loop     │                   │                             │
 
 Only `research` enters planning. `analyze` continues to call the existing
 ResearchAgent directly.
 
 This module intentionally does NOT introduce handler registries, middleware,
-DAGs, workflow engines, plug-in systems, DI frameworks, or LangGraph. It is
-just a small composition object.
+DAGs, workflow engines, plug-in systems, DI frameworks, or LangGraph nodes. The
+injected coordinator owns research orchestration; this remains a small dispatch
+object.
 """
 
 from __future__ import annotations
