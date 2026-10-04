@@ -29,7 +29,8 @@ pip install -e ".[dev]"
 
 ## Configure `.env`
 
-Copy the template and fill in the three required variables:
+Copy the template and fill in the required variables. In addition to the chat
+endpoint, Hybrid Retrieval requires an explicit cross-encoder model:
 
 ```bash
 cp .env.example .env
@@ -39,10 +40,12 @@ cp .env.example .env
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-`LLMClient` reads these at construction time and raises a clear `RuntimeError`
-if any is missing.
+`LLMClient` reads the first three at construction time. The knowledge-search
+builder reads `RERANKER_MODEL`; either component raises a clear `RuntimeError`
+when its required configuration is missing.
 
 ## Run the CLI
 
@@ -274,3 +277,48 @@ conda run --no-capture-output -n insight-agent \
 The first sentence-transformer use may download the configured model. Chapter 5
 does not add sparse/hybrid retrieval, reranking, query rewriting, citations,
 web fallback, LangChain, or LangGraph.
+
+## What Chapter 6 adds
+
+Chapter 6 upgrades the same `search_knowledge_base` Tool to Hybrid Retrieval:
+
+```text
+query
+├── dense retrieval ─┐
+└── BM25 retrieval ──┴→ RRF → candidate cutoff → cross-encoder → final top-k
+```
+
+- Qdrant remains the source of truth. At first Tool use, its Chunk payloads are
+  loaded once to build an in-memory BM25 snapshot; queries reuse that snapshot.
+- `HybridRetriever.refresh()` explicitly rebuilds BM25 from Qdrant after
+  indexing. It builds the replacement first and swaps it under a short lock, so
+  a failed refresh leaves the old snapshot usable.
+- BM25 uses the same `jieba`-aware tokenizer for corpus and query text while
+  preserving technical identifiers such as `DEEPSEEK_API_KEY` and file paths.
+  Its positive `log(1 + RSJ)` IDF keeps unique terms useful in very small
+  corpora; Chunks with no searchable tokens remain available to Dense retrieval.
+- RRF uses ranks only and deduplicates by stable `chunk_id`; raw dense and BM25
+  scores are never added together.
+- Only the fused `HYBRID_RERANK_K` candidates reach the configured cross-encoder.
+  `RERANKER_MODEL` is required and has no code fallback. A recommended bilingual
+  choice is `BAAI/bge-reranker-v2-m3`.
+- Stage depths are configured with `HYBRID_DENSE_K`, `HYBRID_SPARSE_K`,
+  `HYBRID_RERANK_K`, `HYBRID_FINAL_TOP_K`, and `HYBRID_RRF_K`. Internal recall
+  depths may exceed eight; only the final Agent-facing Tool argument remains
+  bounded to `1 <= top_k <= 8`. An explicit Tool argument overrides
+  `HYBRID_FINAL_TOP_K`.
+- DEBUG logging and an optional trace callback expose dense, sparse, fused,
+  reranked, and final rankings without adding internal scores to the Agent
+  observation.
+
+The Tool name/schema, Registry, Intent Router, and Agent Loop remain unchanged.
+Query rewriting, citations, web fallback, automatic index-change detection,
+LangChain, and LangGraph remain out of scope.
+
+To manually inspect the dense, sparse, fused, reranked, and final rankings for
+the exact-identifier and semantic example queries:
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python examples/try_hybrid_rag.py notes/config.md notes/chunking.md
+```

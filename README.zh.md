@@ -20,7 +20,8 @@ pip install -e ".[dev]"
 
 ## 配置 `.env`
 
-复制模板并填写下面三个必填变量:
+复制模板并填写必填变量。除聊天 endpoint 外，Hybrid Retrieval 还要求显式配置
+Cross-Encoder 模型：
 
 ```bash
 cp .env.example .env
@@ -30,9 +31,11 @@ cp .env.example .env
 LLM_API_KEY=your-api-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-`LLMClient` 在构造时读取这些环境变量;若任一缺失,会抛出携带明确提示的 `RuntimeError`。
+`LLMClient` 在构造时读取前三个环境变量；知识库搜索构建器读取
+`RERANKER_MODEL`。缺少各自必填配置时都会抛出提示清晰的 `RuntimeError`。
 
 ## 运行 CLI
 
@@ -205,3 +208,43 @@ conda run --no-capture-output -n insight-agent \
 
 Sentence Transformer 首次使用时可能下载配置的模型。本章不包含稀疏/混合检索、
 重排、查询改写、Citation、Web fallback、LangChain 或 LangGraph。
+
+## 第六章新增：混合检索与重排序
+
+第六章在保持 `search_knowledge_base` Tool 不变的前提下，将检索链路升级为：
+
+```text
+query
+├── Dense Retrieval ─┐
+└── BM25 Retrieval ──┴→ RRF → Candidate Cutoff → Cross-Encoder → Final Top-K
+```
+
+- Qdrant 仍是 Chunk 的事实来源。Tool 第一次使用时从 Qdrant payload 一次性构建
+  内存 BM25 快照，之后的查询复用该快照。
+- 资料重新索引后显式调用 `HybridRetriever.refresh()`。刷新先完整构建替代快照，
+  再在短锁内交换引用；刷新失败时旧快照继续可用。
+- BM25 构建语料和处理 query 共用同一个支持 `jieba` 的 tokenizer，并保留
+  `DEEPSEEK_API_KEY`、异常类名和文件路径等技术标识符。正值
+  `log(1 + RSJ)` IDF 让极小语料中的唯一词仍具有区分度；没有可检索 token 的
+  Chunk 仍可由 Dense Retrieval 召回。
+- RRF 只使用排名，按稳定 `chunk_id` 去重；不会直接相加 Dense 与 BM25 原始分数。
+- 只有融合后的前 `HYBRID_RERANK_K` 个候选会进入 Cross-Encoder。
+  `RERANKER_MODEL` 是必填配置，业务代码没有静默 fallback；推荐中英双语模型为
+  `BAAI/bge-reranker-v2-m3`。
+- 阶段深度分别由 `HYBRID_DENSE_K`、`HYBRID_SPARSE_K`、
+  `HYBRID_RERANK_K`、`HYBRID_FINAL_TOP_K` 与 `HYBRID_RRF_K` 配置。内部召回深度
+  可以大于 8；只有 Agent 可见的最终 Tool 参数保持 `1 <= top_k <= 8`。显式 Tool
+  参数优先于 `HYBRID_FINAL_TOP_K`。
+- DEBUG 日志与可选 trace callback 可观察 Dense、Sparse、RRF、Cross-Encoder 和
+  Final 排名，但不会把新增内部评分塞进 Agent Observation。
+
+Tool 名称与 Schema、Registry、Intent Router 和 Agent Loop 均保持不变。本章不实现
+Query Rewrite、Citation、Web fallback、自动索引变更检测、LangChain 或 LangGraph。
+
+可通过下面的手动集成示例查看精确标识符与语义查询对应的 Dense、Sparse、RRF、
+Cross-Encoder 和 Final 排名：
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python examples/try_hybrid_rag.py notes/config.md notes/chunking.md
+```

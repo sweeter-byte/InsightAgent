@@ -15,7 +15,11 @@ from insight_agent.retrieval import (
     VectorRetriever,
     format_results,
 )
-from insight_agent.retrieval.tool import SEARCH_KNOWLEDGE_BASE_SCHEMA
+from insight_agent.retrieval.hybrid import HybridRetriever
+from insight_agent.retrieval.tool import (
+    SEARCH_KNOWLEDGE_BASE_SCHEMA,
+    build_default_knowledge_search_tool,
+)
 
 
 def _payload(**overrides: Any) -> dict[str, Any]:
@@ -89,6 +93,15 @@ def test_retriever_embeds_one_query_and_restores_complete_result() -> None:
     ]
 
 
+def test_retriever_allows_internal_recall_above_tool_limit() -> None:
+    embedder = FakeEmbedder()
+    store = FakeVectorStore(points=[])
+    retriever = VectorRetriever(embedder=embedder, vector_store=store)
+
+    assert retriever.retrieve("broad recall", top_k=20) == []
+    assert store.calls == [{"vector": [0.1, 0.2, 0.3], "limit": 20}]
+
+
 @pytest.mark.parametrize("query", ["", "   ", "\n\t"])
 def test_retriever_rejects_empty_query(query: str) -> None:
     retriever = VectorRetriever(FakeEmbedder(), FakeVectorStore())
@@ -97,11 +110,11 @@ def test_retriever_rejects_empty_query(query: str) -> None:
         retriever.retrieve(query)
 
 
-@pytest.mark.parametrize("top_k", [0, -1, 9, True])
-def test_retriever_rejects_top_k_outside_tool_contract(top_k: int) -> None:
+@pytest.mark.parametrize("top_k", [0, -1, True])
+def test_retriever_rejects_non_positive_top_k(top_k: int) -> None:
     retriever = VectorRetriever(FakeEmbedder(), FakeVectorStore())
 
-    with pytest.raises(ValueError, match="top_k must be an integer between 1 and 8"):
+    with pytest.raises(ValueError, match="top_k must be a positive integer"):
         retriever.retrieve("query", top_k=top_k)
 
 
@@ -244,6 +257,37 @@ def test_knowledge_search_tool_delegates_and_formats_observation() -> None:
     assert "Grounded evidence" in observation
 
 
+def test_knowledge_search_tool_uses_injected_default_top_k() -> None:
+    class FakeRetriever:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            self.calls.append((query, top_k))
+            return []
+
+    retriever = FakeRetriever()
+    tool = KnowledgeSearchTool(retriever, default_top_k=7)
+
+    tool(query="configured default")
+
+    assert retriever.calls == [("configured default", 7)]
+
+
+@pytest.mark.parametrize("top_k", [0, -1, 9, True])
+def test_knowledge_search_tool_rejects_final_top_k_outside_contract(
+    top_k: int,
+) -> None:
+    class FakeRetriever:
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            raise AssertionError("invalid final top_k must not reach retriever")
+
+    tool = KnowledgeSearchTool(FakeRetriever())
+
+    with pytest.raises(ValueError, match="top_k must be an integer between 1 and 8"):
+        tool(query="query", top_k=top_k)
+
+
 def test_knowledge_search_schema_describes_query_and_bounded_top_k() -> None:
     function = SEARCH_KNOWLEDGE_BASE_SCHEMA["function"]
     parameters = function["parameters"]
@@ -258,3 +302,41 @@ def test_knowledge_search_schema_describes_query_and_bounded_top_k() -> None:
         "default": 5,
         "description": "Number of the most relevant chunks to return.",
     }
+
+
+def test_default_knowledge_tool_reads_configured_final_top_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RERANKER_MODEL", "configured/reranker")
+    monkeypatch.setenv("HYBRID_FINAL_TOP_K", "7")
+
+    tool = build_default_knowledge_search_tool()
+
+    assert tool._default_top_k == 7
+
+
+def test_default_knowledge_tool_factory_builds_hybrid_without_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import insight_agent.indexing as indexing
+
+    class FakeStore:
+        def load_chunks(self):  # noqa: ANN201
+            return []
+
+        def search(self, vector, limit=5):  # noqa: ANN001, ANN201, ARG002
+            return []
+
+    class FakeEmbedder:
+        def embed_documents(self, texts):  # noqa: ANN001, ANN201, ARG002
+            return [[1.0]]
+
+    monkeypatch.setenv("RERANKER_MODEL", "configured/reranker")
+    monkeypatch.setattr(indexing, "QdrantVectorStore", FakeStore)
+    monkeypatch.setattr(indexing, "SentenceTransformerEmbedder", FakeEmbedder)
+
+    retriever = build_default_knowledge_search_tool()._get_retriever()
+
+    assert isinstance(retriever, HybridRetriever)
+    assert retriever.reranker.model_name == "configured/reranker"
+    assert retriever.reranker._model is None

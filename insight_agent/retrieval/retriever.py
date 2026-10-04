@@ -33,12 +33,8 @@ class VectorRetriever:
         """Embed one non-empty query and return up to ``top_k`` domain results."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must not be empty")
-        if (
-            isinstance(top_k, bool)
-            or not isinstance(top_k, int)
-            or not 1 <= top_k <= 8
-        ):
-            raise ValueError("top_k must be an integer between 1 and 8")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
 
         vectors = self.embedder.embed_documents([query])
         if len(vectors) != 1 or not vectors[0]:

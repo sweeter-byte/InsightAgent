@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from insight_agent.ingestion import Document, SourceType
 from insight_agent.indexing import QdrantVectorStore, TextChunker
@@ -184,5 +184,67 @@ def test_search_returns_ranked_payloads_without_stored_vectors(tmp_path: Path) -
         assert points[0].score == pytest.approx(1.0)
         assert all(point.payload is not None for point in points)
         assert all(point.vector is None for point in points)
+    finally:
+        store.close()
+
+
+def test_load_chunks_scrolls_all_pages_and_restores_domain_models(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    documents = [
+        Document(
+            content=f"Chunk payload {index}",
+            source=f"notes-{index}.txt",
+            source_type=SourceType.TEXT,
+            metadata={"index": index},
+        )
+        for index in range(3)
+    ]
+    chunks = TextChunker(chunk_size=100, chunk_overlap=10).split_documents(documents)
+    try:
+        store.ensure_collection(vector_size=2)
+        store.upsert(chunks, [[1.0, 0.0], [0.0, 1.0], [0.6, 0.8]])
+
+        restored = store.load_chunks(batch_size=1)
+
+        assert {chunk.id: chunk for chunk in restored} == {
+            chunk.id: chunk for chunk in chunks
+        }
+    finally:
+        store.close()
+
+
+def test_load_chunks_rejects_malformed_payload(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        store.ensure_collection(vector_size=2)
+        store.client.upsert(
+            collection_name="test_documents",
+            points=[
+                PointStruct(
+                    id="7c789742-8e02-49c6-9d6d-850827f27a4d",
+                    vector=[1.0, 0.0],
+                    payload={"content": "missing provenance"},
+                )
+            ],
+            wait=True,
+        )
+
+        with pytest.raises(ValueError, match="document_id"):
+            store.load_chunks()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True])
+def test_load_chunks_rejects_invalid_batch_size(
+    batch_size: int,
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+            store.load_chunks(batch_size=batch_size)
     finally:
         store.close()

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, ScoredPoint, VectorParams
 
 from insight_agent.indexing.models import Chunk
+from insight_agent.ingestion import SourceType
 
 
 DEFAULT_QDRANT_PATH = ".data/qdrant"
@@ -127,6 +129,30 @@ class QdrantVectorStore:
         )
         return list(response.points)
 
+    def load_chunks(self, batch_size: int = 100) -> list[Chunk]:
+        """Restore every stored point as a project-owned ``Chunk``."""
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+        ):
+            raise ValueError("batch_size must be a positive integer")
+
+        chunks: list[Chunk] = []
+        offset: Any | None = None
+        while True:
+            points, next_offset = self.client.scroll(
+                collection_name=self.collection_name,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            chunks.extend(self._chunk_from_point(point) for point in points)
+            if next_offset is None:
+                return chunks
+            offset = next_offset
+
     def close(self) -> None:
         """Release local storage resources held by the Qdrant client."""
         self.client.close()
@@ -143,3 +169,65 @@ class QdrantVectorStore:
             "end_char": chunk.end_char,
             "metadata": chunk.metadata,
         }
+
+    @staticmethod
+    def _chunk_from_point(point: Any) -> Chunk:
+        point_id = getattr(point, "id", None)
+        payload = getattr(point, "payload", None)
+        if point_id is None:
+            raise ValueError("stored point is missing chunk id")
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"stored point {point_id!r} is missing a payload")
+
+        required = (
+            "content",
+            "document_id",
+            "source",
+            "source_type",
+            "chunk_index",
+            "start_char",
+            "end_char",
+            "metadata",
+        )
+        missing = [
+            name for name in required if name not in payload or payload[name] is None
+        ]
+        if missing:
+            raise ValueError(
+                f"stored point {point_id!r} is missing required payload field(s): "
+                f"{', '.join(missing)}"
+            )
+
+        for name in ("content", "document_id", "source", "source_type"):
+            if not isinstance(payload[name], str):
+                raise ValueError(
+                    f"stored point {point_id!r} has invalid payload field {name!r}"
+                )
+        for name in ("chunk_index", "start_char", "end_char"):
+            if isinstance(payload[name], bool) or not isinstance(payload[name], int):
+                raise ValueError(
+                    f"stored point {point_id!r} has invalid payload field {name!r}"
+                )
+        if not isinstance(payload["metadata"], Mapping):
+            raise ValueError(
+                f"stored point {point_id!r} has invalid payload field 'metadata'"
+            )
+        try:
+            source_type = SourceType(payload["source_type"])
+        except ValueError as exc:
+            raise ValueError(
+                f"stored point {point_id!r} has unknown source_type "
+                f"{payload['source_type']!r}"
+            ) from exc
+
+        return Chunk(
+            id=str(point_id),
+            document_id=payload["document_id"],
+            content=payload["content"],
+            source=payload["source"],
+            source_type=source_type,
+            chunk_index=payload["chunk_index"],
+            start_char=payload["start_char"],
+            end_char=payload["end_char"],
+            metadata=dict(payload["metadata"]),
+        )
