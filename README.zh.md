@@ -165,7 +165,6 @@ Text、Markdown 和 PDF 文件无需 API 配置。摄取图片时，例如
 以下能力当前不存在，刻意留到后续章节：
 
 - 将 `analyze`/`research` 拆成独立 handler 的 Document / Multimodal Analysis Pipeline 与 Research Workflow
-- RAG、Embedding、向量数据库（PDF 解析与 Vision 已由第三章多模态摄取层实现；但 Chunking/Embedding/检索/RAG 仍未实现）
 - Web Search、Research Planner、Workflow 编排、LangGraph
 - Memory、MCP
 - Router 置信度、混合路由、Intent 评测基准
@@ -176,3 +175,33 @@ Text、Markdown 和 PDF 文件无需 API 配置。摄取图片时，例如
 - Retry / Timeout / Checkpoint
 - FastAPI 或其他服务端组件
 - LangChain、OpenAI Agents SDK
+
+## 第五章新增：本地 Vector RAG
+
+第五章在第四章持久化索引之上补齐最小查询链路，同时严格分离索引与检索生命周期：
+
+```text
+query → embed_documents([query]) → Qdrant Top-K 搜索
+      → RetrievalResult → 结构化 Observation → search_knowledge_base
+      → 现有 ResearchAgent Loop
+```
+
+- `insight_agent.retrieval.VectorRetriever` 复用索引阶段相同的
+  `SentenceTransformerEmbedder` 与 `QdrantVectorStore` 配置。
+- `RetrievalResult` 是带当前查询 `score` 的检索模型；索引模型 `Chunk` 不变。
+- Qdrant 查询返回 payload、不返回已保存的 vectors；关键来源字段缺失时明确失败。
+- 原有扁平 `ToolRegistry` 注册 `search_knowledge_base(query, top_k=5)`，其中
+  `1 <= top_k <= 8`，Observation 同时保留正文、来源和 metadata。
+- Intent Router 仍只选择 `direct` / `analyze` / `research`，不知道 embedding、
+  Qdrant 或 Top-K；进入 Agent Loop 后由模型选择具体工具。
+
+正式查询路径只读取已有 collection，不会在每次提问时重新摄取或建立索引。
+可用独立示例验证一次完整的“摄取 → 索引 → 检索”：
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python examples/try_vector_rag.py notes/rag.md "为什么分块需要 overlap？" --top-k 5
+```
+
+Sentence Transformer 首次使用时可能下载配置的模型。本章不包含稀疏/混合检索、
+重排、查询改写、Citation、Web fallback、LangChain 或 LangGraph。

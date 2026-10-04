@@ -14,6 +14,10 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
+from insight_agent.retrieval.tool import (
+    SEARCH_KNOWLEDGE_BASE_SCHEMA,
+    build_default_knowledge_search_tool,
+)
 from insight_agent.tools.file_tools import READ_FILE_SCHEMA, read_file
 
 
@@ -61,10 +65,19 @@ class ToolRegistry:
         return sorted(self._tools)
 
 
-def build_default_registry() -> ToolRegistry:
+def build_default_registry(
+    *,
+    knowledge_search_tool: Callable[..., str] | None = None,
+) -> ToolRegistry:
     """Return a registry pre-populated with the tools this chapter provides."""
     registry = ToolRegistry()
     registry.register("read_file", read_file)
+    registry.register(
+        "search_knowledge_base",
+        knowledge_search_tool
+        if knowledge_search_tool is not None
+        else build_default_knowledge_search_tool(),
+    )
     return registry
 
 
@@ -75,4 +88,4 @@ def default_tool_schemas() -> list[dict[str, Any]]:
     function — makes the coupling explicit: whoever adds a tool must add both
     the callable here and its schema in ``default_tool_schemas()``.
     """
-    return [READ_FILE_SCHEMA]
+    return [READ_FILE_SCHEMA, SEARCH_KNOWLEDGE_BASE_SCHEMA]

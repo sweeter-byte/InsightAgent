@@ -138,3 +138,51 @@ def test_upsert_rejects_chunk_vector_count_mismatch(tmp_path: Path) -> None:
             store.upsert([_chunk()], [])
     finally:
         store.close()
+
+
+def test_search_returns_ranked_payloads_without_stored_vectors(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    documents = [
+        Document(
+            content="Project Helios Alpha scored 31.7.",
+            source="helios.txt",
+            source_type=SourceType.TEXT,
+            metadata={"method": "Alpha"},
+        ),
+        Document(
+            content="Project Helios Beta scored 48.9.",
+            source="helios.txt",
+            source_type=SourceType.TEXT,
+            metadata={"method": "Beta"},
+        ),
+        Document(
+            content="Project Helios Gamma scored 42.3.",
+            source="helios.txt",
+            source_type=SourceType.TEXT,
+            metadata={"method": "Gamma"},
+        ),
+    ]
+    chunks = TextChunker(chunk_size=100, chunk_overlap=10).split_documents(documents)
+    vectors = [[0.0, 1.0], [1.0, 0.0], [0.6, 0.8]]
+    try:
+        store.ensure_collection(vector_size=2)
+        store.upsert(chunks, vectors)
+
+        points = store.search([1.0, 0.0], limit=2)
+
+        assert len(points) == 2
+        assert points[0].payload == {
+            "content": "Project Helios Beta scored 48.9.",
+            "document_id": chunks[1].document_id,
+            "source": "helios.txt",
+            "source_type": "text",
+            "chunk_index": 0,
+            "start_char": 0,
+            "end_char": len("Project Helios Beta scored 48.9."),
+            "metadata": chunks[1].metadata,
+        }
+        assert points[0].score == pytest.approx(1.0)
+        assert all(point.payload is not None for point in points)
+        assert all(point.vector is None for point in points)
+    finally:
+        store.close()

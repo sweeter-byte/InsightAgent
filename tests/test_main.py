@@ -93,6 +93,26 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
     assert app.llm is app.router.llm is app.research_agent.llm
 
 
+def test_build_app_registers_knowledge_search_without_opening_qdrant(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    qdrant_path = tmp_path / "qdrant-not-opened"
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("QDRANT_PATH", str(qdrant_path))
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+
+    app = cli._build_app()
+
+    assert "search_knowledge_base" in app.research_agent.registry.names()
+    assert not qdrant_path.exists()
+
+
 # ---------------------------------------------------------------------------
 # 2. one-shot mode
 # ---------------------------------------------------------------------------

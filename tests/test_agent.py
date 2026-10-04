@@ -13,9 +13,15 @@ from typing import Any, Iterable
 
 import pytest
 
-from insight_agent.agent import AgentStepsExceeded, ResearchAgent
+from insight_agent.agent import AgentStepsExceeded, DEFAULT_SYSTEM_PROMPT, ResearchAgent
+from insight_agent.ingestion import SourceType
+from insight_agent.retrieval import KnowledgeSearchTool, RetrievalResult
 from insight_agent.tools.file_tools import READ_FILE_SCHEMA
-from insight_agent.tools.registry import ToolRegistry, build_default_registry
+from insight_agent.tools.registry import (
+    ToolRegistry,
+    build_default_registry,
+    default_tool_schemas,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -249,3 +255,67 @@ def test_max_steps_must_be_positive() -> None:
                       registry=build_default_registry(),
                       tool_schemas=[READ_FILE_SCHEMA],
                       max_steps=0)
+
+
+def test_agent_dispatches_knowledge_search_as_an_ordinary_tool_observation() -> None:
+    class FixtureRetriever:
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            assert (query, top_k) == ("Project Helios highest score", 2)
+            return [
+                RetrievalResult(
+                    chunk_id="helios-beta",
+                    score=0.99,
+                    content="Project Helios Beta scored 48.9.",
+                    document_id="helios-document",
+                    source="helios.txt",
+                    source_type=SourceType.TEXT,
+                    chunk_index=0,
+                    start_char=0,
+                    end_char=32,
+                    metadata={"method": "Beta"},
+                )
+            ]
+
+    llm = FakeLLMClient(
+        [
+            _make_tool_call_response(
+                [
+                    (
+                        "search_1",
+                        "search_knowledge_base",
+                        {"query": "Project Helios highest score", "top_k": 2},
+                    )
+                ]
+            ),
+            _make_text_response("Beta has the highest score: 48.9."),
+        ]
+    )
+    registry = build_default_registry(
+        knowledge_search_tool=KnowledgeSearchTool(FixtureRetriever())
+    )
+    agent = ResearchAgent(
+        llm=llm,  # type: ignore[arg-type]
+        registry=registry,
+        tool_schemas=default_tool_schemas(),
+    )
+
+    agent.run("Which Project Helios method scored highest?")
+
+    assert len(llm.calls) == 2
+    tool_message = next(
+        message for message in llm.calls[1]["messages"] if message["role"] == "tool"
+    )
+    assert tool_message["tool_call_id"] == "search_1"
+    assert "source: helios.txt" in tool_message["content"]
+    assert "Beta scored 48.9" in tool_message["content"]
+    schema_names = {
+        schema["function"]["name"] for schema in llm.calls[0]["tools"]
+    }
+    assert schema_names == {"read_file", "search_knowledge_base"}
+
+
+def test_agent_prompt_requires_grounded_local_knowledge_answers() -> None:
+    assert "search_knowledge_base" in DEFAULT_SYSTEM_PROMPT
+    assert "local knowledge" in DEFAULT_SYSTEM_PROMPT.lower()
+    assert "insufficient" in DEFAULT_SYSTEM_PROMPT.lower()
+    assert "not present" in DEFAULT_SYSTEM_PROMPT.lower()

@@ -240,3 +240,37 @@ Deliberately out of scope until later chapters:
 - Retry / timeout / fallback / checkpoint
 - FastAPI or any server component
 - LangGraph, LangChain, OpenAI Agents SDK
+
+## What Chapter 5 adds
+
+Chapter 5 turns the persisted Chapter 4 index into a minimal local Vector RAG
+capability while keeping indexing and querying separate:
+
+```text
+query → embed_documents([query]) → Qdrant top-k search
+      → RetrievalResult → formatted observation → search_knowledge_base
+      → existing ResearchAgent loop
+```
+
+- `insight_agent.retrieval.VectorRetriever` reuses the same configured
+  `SentenceTransformerEmbedder` and `QdrantVectorStore` as indexing.
+- `RetrievalResult` is a query-time model with `score`; the index-time `Chunk`
+  model is unchanged.
+- Qdrant searches request payloads but not stored vectors. Invalid/missing
+  provenance payloads fail explicitly rather than producing partial results.
+- `search_knowledge_base(query, top_k=5)` is registered in the original flat
+  `ToolRegistry` (`1 <= top_k <= 8`) and returns source-aware observations.
+- The Intent Router remains unaware of embeddings and retrieval. It still only
+  selects `direct` / `analyze` / `research`; the ResearchAgent chooses the tool.
+
+The normal query path searches the existing collection and never ingests or
+indexes documents. For a standalone ingestion → indexing → retrieval demo:
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python examples/try_vector_rag.py notes/rag.md "为什么分块需要 overlap？" --top-k 5
+```
+
+The first sentence-transformer use may download the configured model. Chapter 5
+does not add sparse/hybrid retrieval, reranking, query rewriting, citations,
+web fallback, LangChain, or LangGraph.

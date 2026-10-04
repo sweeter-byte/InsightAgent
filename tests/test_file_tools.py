@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from insight_agent.retrieval import KnowledgeSearchTool, RetrievalResult
 from insight_agent.tools.file_tools import READ_FILE_SCHEMA, read_file
 from insight_agent.tools.registry import (
     ToolRegistry,
@@ -78,10 +79,28 @@ def test_read_file_schema_shape() -> None:
 # ---------- Tool registry -----------------------------------------------------
 
 
-def test_default_registry_exposes_read_file() -> None:
+def test_default_registry_exposes_read_file_and_knowledge_search() -> None:
     registry = build_default_registry()
-    assert "read_file" in registry.names()
+    assert registry.names() == ["read_file", "search_knowledge_base"]
     assert registry.get("read_file") is read_file
+
+
+def test_default_registry_accepts_injected_knowledge_search_tool() -> None:
+    class FalseyKnowledgeSearchTool(KnowledgeSearchTool):
+        def __bool__(self) -> bool:
+            return False
+
+    class EmptyRetriever:
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            return []
+
+    tool = FalseyKnowledgeSearchTool(EmptyRetriever())
+    registry = build_default_registry(knowledge_search_tool=tool)
+
+    assert registry.get("search_knowledge_base") is tool
+    assert registry.execute("search_knowledge_base", {"query": "anything"}) == (
+        "知识库中没有找到相关内容。"
+    )
 
 
 def test_default_registry_executes_read_file(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import Distance, PointStruct, ScoredPoint, VectorParams
 
 from insight_agent.indexing.models import Chunk
 
@@ -17,7 +17,7 @@ DEFAULT_QDRANT_COLLECTION = "insight_documents"
 
 
 class VectorStore(Protocol):
-    """Minimal persistence dependency consumed by the indexing pipeline."""
+    """Minimal vector persistence and nearest-neighbor search dependency."""
 
     def ensure_collection(self, vector_size: int) -> None:
         """Create or validate storage for vectors of the requested size."""
@@ -25,6 +25,10 @@ class VectorStore(Protocol):
 
     def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
         """Persist chunks and their positionally corresponding vectors."""
+        ...
+
+    def search(self, vector: list[float], limit: int = 5) -> list[ScoredPoint]:
+        """Return nearest points with payloads, excluding stored vectors."""
         ...
 
 
@@ -106,6 +110,22 @@ class QdrantVectorStore:
             points=points,
             wait=True,
         )
+
+    def search(self, vector: list[float], limit: int = 5) -> list[ScoredPoint]:
+        """Query the existing collection and return payload-bearing hits."""
+        if not vector:
+            raise ValueError("search vector must not be empty")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("search limit must be a positive integer")
+
+        response = self.client.query_points(
+            collection_name=self.collection_name,
+            query=vector,
+            limit=limit,
+            with_payload=True,
+            with_vectors=False,
+        )
+        return list(response.points)
 
     def close(self) -> None:
         """Release local storage resources held by the Qdrant client."""

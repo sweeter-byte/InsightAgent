@@ -26,7 +26,11 @@ from insight_agent.tools.registry import ToolRegistry, UnknownToolError
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are InsightAgent, a research assistant. When you need information "
-    "from a file, call the `read_file` tool. Always reason step by step, and "
+    "from a file, call the `read_file` tool. When a question depends on local "
+    "knowledge, use `search_knowledge_base` first and base the answer on its "
+    "results. If the retrieved evidence is insufficient, say that the local "
+    "knowledge is insufficient. Do not state as fact information that is not "
+    "present in the tool results. Always reason step by step, and "
     "when you have enough information, reply with a plain text answer and do "
     "NOT emit any further tool calls."
 )
