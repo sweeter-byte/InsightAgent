@@ -24,6 +24,12 @@ from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
 from insight_agent.routing.router import RetrievalRouter
 from insight_agent.tools.registry import build_default_registry, default_tool_schemas
+from insight_agent.web_search import (
+    TavilySearchProvider,
+    WebRetriever,
+    WebSearchConfig,
+    WebSearchError,
+)
 
 
 _BANNER = (
@@ -46,14 +52,32 @@ def _build_app() -> InsightAgent:
     )
     planner = ResearchPlanner(llm=llm)
     retrieval_router = RetrievalRouter(llm=llm)
-    research_workflow = ResearchRoutingWorkflow(router=retrieval_router)
+    web_config = WebSearchConfig.from_env()
+    web_retriever: WebRetriever | None = None
+    available_sources = {
+        RetrievalSource.LOCAL,
+        RetrievalSource.VISION,
+    }
+    if web_config is not None:
+        web_retriever = WebRetriever(
+            TavilySearchProvider(
+                api_key=web_config.api_key,
+                timeout=web_config.timeout,
+            ),
+            timeout=web_config.timeout,
+            search_limit=web_config.search_limit,
+            fetch_limit=web_config.fetch_limit,
+        )
+        available_sources.add(RetrievalSource.WEB)
+    research_workflow = ResearchRoutingWorkflow(
+        router=retrieval_router,
+        web_retriever=web_retriever,
+    )
     research_coordinator = ResearchCoordinator(
         planner=planner,
         workflow=research_workflow,
         research_agent=research_agent,
-        # All three are valid routing targets in Chapter 8. Web and vision
-        # entry nodes record decisions only; they do not execute retrieval.
-        available_sources=set(RetrievalSource),
+        available_sources=available_sources,
     )
     router = IntentRouter(llm=llm)
     return InsightAgent(
@@ -80,6 +104,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         return 1
     except RoutingError as exc:
         print(f"[routing error] {exc}", file=sys.stderr)
+        return 1
+    except WebSearchError as exc:
+        print(f"[web search error] {exc}", file=sys.stderr)
         return 1
     _print_answer(answer)
     return None

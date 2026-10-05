@@ -27,6 +27,11 @@ from insight_agent.research import ResearchRoutingWorkflow
 from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
 from insight_agent.routing.router import RetrievalRouter
+from insight_agent.web_search import (
+    TavilySearchProvider,
+    WebRetriever,
+    WebSearchError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +76,7 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
     monkeypatch.setenv("LLM_MODEL", "test-model")
     monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
     monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
 
     app = cli._build_app()
@@ -82,6 +88,11 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(app.research_coordinator.planner, ResearchPlanner)
     assert isinstance(app.research_coordinator.workflow, ResearchRoutingWorkflow)
     assert isinstance(app.research_coordinator.workflow.router, RetrievalRouter)
+    assert isinstance(app.research_coordinator.workflow.web_retriever, WebRetriever)
+    assert isinstance(
+        app.research_coordinator.workflow.web_retriever.provider,
+        TavilySearchProvider,
+    )
     assert app.research_coordinator.available_sources == set(RetrievalSource)
     assert app.research_coordinator.research_agent is app.research_agent
     assert isinstance(app.llm, LLMClient)
@@ -98,6 +109,7 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
     monkeypatch.setenv("LLM_MODEL", "test-model")
     monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
 
     app = cli._build_app()
@@ -109,6 +121,29 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
         is app.research_coordinator.planner.llm
         is app.research_coordinator.workflow.router.llm
     )
+
+
+def test_build_app_omits_web_when_tavily_is_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+
+    app = cli._build_app()
+
+    assert app.research_coordinator.available_sources == {
+        RetrievalSource.LOCAL,
+        RetrievalSource.VISION,
+    }
+    assert app.research_coordinator.workflow.web_retriever is None
 
 
 def test_build_app_registers_knowledge_search_without_opening_qdrant(
@@ -223,6 +258,20 @@ def test_main_one_shot_routing_error_returns_1(
     captured = capsys.readouterr()
     assert "[routing error]" in captured.err
     assert "unknown source" in captured.err
+
+
+def test_main_one_shot_web_search_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureManager
+) -> None:
+    fake = FakeApp(raise_exc=WebSearchError("Tavily unavailable"))
+    monkeypatch.setattr(cli, "_build_app", lambda: fake)
+
+    rc = cli.main(["research", "topic"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[web search error]" in captured.err
+    assert "Tavily unavailable" in captured.err
 
 
 # ---------------------------------------------------------------------------

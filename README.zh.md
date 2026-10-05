@@ -248,3 +248,37 @@ Cross-Encoder 和 Final 排名：
 conda run --no-capture-output -n insight-agent \
   python examples/try_hybrid_rag.py notes/config.md notes/chunking.md
 ```
+
+## 第九章新增：网页搜索
+
+第九章把第八章的 `web_entry` 占位分支补成最小公开网页检索链路：
+
+```text
+Research Task -> Retrieval Router -> WebRetriever
+              -> Tavily Search -> 候选 URL
+              -> 既有 URL Loader -> Document -> ResearchState.web_results
+```
+
+Tavily 只负责发现候选网页；Provider 不请求 Tavily answer、图片或 raw content。
+候选 URL 仍由第三章 URL Loader 获取和清洗。生成的 Document 在保留 `title`、
+`final_url`、`content_type` 等 Loader metadata 的同时，增加 `search_query`、
+`search_rank`、`search_title`、`search_snippet` 和可选 `search_score`。
+
+Web Search 是可选能力。只有配置以下变量后，Runtime 才会把 `web` 放入
+Retrieval Router 的 `available_sources`：
+
+```text
+TAVILY_API_KEY=tvly-...
+WEB_SEARCH_TIMEOUT=30
+WEB_SEARCH_LIMIT=5
+WEB_FETCH_LIMIT=3
+```
+
+未配置 `TAVILY_API_KEY` 时，local 与 vision 的既有路由行为不变，但不会开放
+WEB。Search Provider 整体失败会明确报错；单个候选网页获取失败则写入
+`WebRetrievalResult.failures`，后续候选仍会继续处理。上述结果只是原始检索资料，
+不是 Evidence、Citation、置信度或最终报告。
+
+第九章不实现 Query Rewrite、多 Query/多轮搜索、Tavily answer/extract/crawl/
+research API、浏览器自动化、来源权威性评分、Evidence/Citation、报告生成或
+Vision Retrieval。

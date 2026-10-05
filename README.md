@@ -322,3 +322,41 @@ the exact-identifier and semantic example queries:
 conda run --no-capture-output -n insight-agent \
   python examples/try_hybrid_rag.py notes/config.md notes/chunking.md
 ```
+
+## What Chapter 9 adds
+
+Chapter 9 turns the Chapter 8 `web_entry` destination into a minimal public-Web
+retrieval path:
+
+```text
+Research Task -> Retrieval Router -> WebRetriever
+              -> Tavily Search -> candidate URLs
+              -> existing URL Loader -> Document -> ResearchState.web_results
+```
+
+Tavily is used only to discover candidate pages. The provider explicitly does
+not request Tavily answers, images, or raw page content; selected URLs are
+fetched and cleaned by the existing Chapter 3 URL Loader. Search context is
+added under `search_query`, `search_rank`, `search_title`, `search_snippet`, and
+optional `search_score` without replacing loader metadata such as `title`,
+`final_url`, or `content_type`.
+
+Web Search is optional. Configure it in `.env` to let the runtime advertise
+`web` to the Retrieval Router:
+
+```text
+TAVILY_API_KEY=tvly-...
+WEB_SEARCH_TIMEOUT=30
+WEB_SEARCH_LIMIT=5
+WEB_FETCH_LIMIT=3
+```
+
+Without `TAVILY_API_KEY`, local and vision routing behavior remains available
+but WEB is omitted from `available_sources`. Search-provider failure is an
+explicit error; failure to fetch one candidate page is retained in
+`WebRetrievalResult.failures` while later candidates continue. Results are raw
+retrieval material, not Evidence, Citations, confidence, or a final report.
+
+Chapter 9 does not add query rewriting, multi-query or iterative search,
+Tavily answer/extract/crawl/research APIs, browser automation, source authority
+scoring, Evidence/Citation generation, report generation, or Vision Retrieval.

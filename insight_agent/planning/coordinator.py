@@ -100,9 +100,10 @@ def format_research_context(state: ResearchState) -> str:
         "- Route Decisions are control information, not factual evidence.\n"
         "- For local tasks, use existing local capabilities such as "
         "search_knowledge_base and ground the answer in retrieved evidence.\n"
-        "- Web Search and Vision Retrieval are not implemented in Chapter 8.\n"
-        "- For web or vision tasks, do not use model memory or Local RAG to "
-        "pretend the requested source was executed.\n"
+        "- Web Search results are retrieved material, not verified Evidence.\n"
+        "- Vision Retrieval is not implemented in Chapter 9.\n"
+        "- Do not use model memory or Local RAG to pretend an unavailable "
+        "source was executed.\n"
         "- If the required source cannot be executed, state that the evidence "
         "is insufficient or the required capability is unavailable."
     )

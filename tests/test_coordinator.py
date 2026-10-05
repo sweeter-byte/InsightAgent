@@ -140,7 +140,8 @@ def test_execution_context_preserves_query_and_structured_plan() -> None:
     assert '"source": "local"' in context
     assert '"source": "web"' in context
     assert '"reason": "Route reason for T2"' in context
-    assert "Web Search and Vision Retrieval are not implemented" in context
+    assert "Web Search results are retrieved material, not verified Evidence" in context
+    assert "Vision Retrieval is not implemented" in context
     assert "model memory or Local RAG" in context
     assert "evidence is insufficient or the required capability is unavailable" in context
 
