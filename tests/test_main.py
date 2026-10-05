@@ -111,6 +111,8 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
         RetrievalSource.LOCAL,
         RetrievalSource.WEB,
     }
+    knowledge_tool = app.research_agent.registry.get("search_knowledge_base")
+    assert app.research_coordinator.workflow.local_retriever is knowledge_tool
     assert app.research_coordinator.research_agent is app.research_agent
     assert isinstance(app.llm, LLMClient)
 
@@ -367,6 +369,7 @@ def test_build_app_shares_vision_hybrid_with_knowledge_tool(
     assert workflow.vision_retriever is vision_retriever
     assert RetrievalSource.VISION in app.research_coordinator.available_sources
     knowledge_tool = app.research_agent.registry.get("search_knowledge_base")
+    assert workflow.local_retriever is knowledge_tool
     assert knowledge_tool._retriever is shared_hybrid
 
 

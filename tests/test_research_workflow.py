@@ -6,8 +6,10 @@ from typing import Any
 
 import pytest
 
+from insight_agent.evidence import EvidenceCollector
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
 from insight_agent.research.workflow import ResearchRoutingWorkflow
+from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing import RetrievalSource, RouteDecision, RoutingError
 from insight_agent.ingestion import Document, SourceType
 from insight_agent.web_search import (
@@ -97,6 +99,37 @@ class FakeWebRetriever:
         )
 
 
+class FakeLocalRetriever:
+    def __init__(self, results: list[RetrievalResult] | None = None) -> None:
+        self.results = (
+            [
+                RetrievalResult(
+                    chunk_id="chunk-local",
+                    score=0.8,
+                    content="Local content",
+                    document_id="document-local",
+                    source="notes/local.md",
+                    source_type=SourceType.MARKDOWN,
+                    chunk_index=0,
+                    start_char=0,
+                    end_char=13,
+                    metadata={"section": "local"},
+                )
+            ]
+            if results is None
+            else results
+        )
+        self.calls: list[tuple[str, int | None]] = []
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[RetrievalResult]:
+        self.calls.append((query, top_k))
+        return self.results
+
+
 class FakeVisionRetriever:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -135,10 +168,12 @@ class RecordingWorkflow(ResearchRoutingWorkflow):
         router: FakeRouter,
         web_retriever: FakeWebRetriever | None = None,
         vision_retriever: FakeVisionRetriever | None = None,
+        local_retriever: FakeLocalRetriever | None = None,
     ) -> None:
         self.entries: list[str] = []
         super().__init__(
             router=router,  # type: ignore[arg-type]
+            local_retriever=local_retriever or FakeLocalRetriever(),
             web_retriever=web_retriever,
             vision_retriever=vision_retriever,
         )
@@ -154,6 +189,44 @@ class RecordingWorkflow(ResearchRoutingWorkflow):
     def vision_entry(self, state: ResearchState) -> dict[str, Any]:
         self.entries.append("vision")
         return super().vision_entry(state)
+
+
+class OrderedWorkflow(ResearchRoutingWorkflow):
+    def __init__(
+        self,
+        router: FakeRouter,
+        *,
+        local_retriever: FakeLocalRetriever | None = None,
+        web_retriever: FakeWebRetriever | None = None,
+        vision_retriever: FakeVisionRetriever | None = None,
+    ) -> None:
+        self.events: list[str] = []
+        super().__init__(
+            router=router,  # type: ignore[arg-type]
+            local_retriever=local_retriever,
+            web_retriever=web_retriever,
+            vision_retriever=vision_retriever,
+        )
+
+    def local_entry(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("local")
+        return super().local_entry(state)
+
+    def web_entry(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("web")
+        return super().web_entry(state)
+
+    def vision_entry(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("vision")
+        return super().vision_entry(state)
+
+    def collect_evidence(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("collect_evidence")
+        return super().collect_evidence(state)
+
+    def advance_task(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("advance_task")
+        return super().advance_task(state)
 
 
 def _state(task_count: int = 1) -> ResearchState:
@@ -173,8 +246,10 @@ def test_research_state_keeps_compatible_routing_defaults() -> None:
     assert state.current_task is None
     assert state.current_route is None
     assert state.route_decisions == []
+    assert state.local_results == {}
     assert state.web_results == {}
     assert state.vision_results == {}
+    assert state.evidence_pool == {}
 
 
 def test_select_task_uses_index_and_clears_previous_route() -> None:
@@ -227,6 +302,110 @@ def test_web_branch_writes_task_scoped_result() -> None:
     assert final_state.web_results["T1"].documents[0].content == "Fetched content 1"
 
 
+def test_local_branch_writes_task_scoped_raw_results() -> None:
+    local_retriever = FakeLocalRetriever()
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
+        local_retriever=local_retriever,
+    )
+
+    final_state = workflow.run(_state())
+
+    assert local_retriever.calls == [("Question 1", None)]
+    assert final_state.local_results == {"T1": local_retriever.results}
+    assert final_state.web_results == {}
+    assert final_state.vision_results == {}
+
+
+def test_local_branch_requires_configured_retriever() -> None:
+    workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
+        router=FakeRouter([RetrievalSource.LOCAL])
+    )
+
+    with pytest.raises(RoutingError, match="Local Retrieval is not configured"):
+        workflow.run(_state())
+
+
+@pytest.mark.parametrize("source", list(RetrievalSource))
+def test_each_source_collects_evidence_before_advancing(
+    source: RetrievalSource,
+) -> None:
+    workflow = OrderedWorkflow(
+        FakeRouter([source]),
+        local_retriever=FakeLocalRetriever(),
+        web_retriever=FakeWebRetriever(),
+        vision_retriever=FakeVisionRetriever(),
+    )
+
+    final_state = workflow.run(_state())
+
+    assert workflow.events == [source.value, "collect_evidence", "advance_task"]
+    assert len(final_state.evidence_pool["T1"]) == 1
+    evidence = final_state.evidence_pool["T1"][0]
+    assert evidence.task_id == "T1"
+    assert evidence.retrieval_source is source
+
+
+def test_collect_evidence_deduplicates_an_existing_exact_id() -> None:
+    local_result = FakeLocalRetriever().results[0]
+    existing = EvidenceCollector().collect_local("T1", [local_result])[0]
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.current_route = RouteDecision(
+        task_id="T1",
+        source=RetrievalSource.LOCAL,
+        reason="local",
+    )
+    state.local_results = {"T1": [local_result]}
+    state.evidence_pool = {"T1": [existing]}
+    workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
+        router=FakeRouter([]),
+        local_retriever=FakeLocalRetriever(),
+    )
+
+    update = workflow.collect_evidence(state)
+
+    assert update["evidence_pool"] == {"T1": [existing]}
+
+
+@pytest.mark.parametrize("source", list(RetrievalSource))
+def test_empty_source_result_creates_an_empty_task_evidence_pool(
+    source: RetrievalSource,
+) -> None:
+    class EmptyWebRetriever(FakeWebRetriever):
+        def retrieve(self, query: str) -> WebRetrievalResult:
+            self.calls.append(query)
+            return WebRetrievalResult(
+                query=query,
+                hits=[],
+                documents=[],
+                failures=[],
+            )
+
+    class EmptyVisionRetriever(FakeVisionRetriever):
+        def retrieve(self, **kwargs: Any) -> VisionRetrievalResult:
+            self.calls.append(dict(kwargs))
+            task = kwargs["task"]
+            return VisionRetrievalResult(
+                task_id=task.id,
+                query=task.question,
+                analyses=[],
+                failures=[],
+                no_candidates=True,
+            )
+
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([source]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever([]),
+        web_retriever=EmptyWebRetriever(),
+        vision_retriever=EmptyVisionRetriever(),
+    )
+
+    final_state = workflow.run(_state())
+
+    assert final_state.evidence_pool == {"T1": []}
+
+
 def test_vision_branch_writes_task_scoped_result_with_plan_context() -> None:
     vision_retriever = FakeVisionRetriever()
     workflow = ResearchRoutingWorkflow(
@@ -255,6 +434,7 @@ def test_non_web_branches_do_not_call_web_retriever(
     web_retriever = FakeWebRetriever()
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([source]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
         web_retriever=web_retriever,
         vision_retriever=(
             FakeVisionRetriever() if source is RetrievalSource.VISION else None
@@ -274,6 +454,7 @@ def test_non_vision_branches_do_not_call_vision_retriever(
     vision_retriever = FakeVisionRetriever()
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([source]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
         web_retriever=FakeWebRetriever() if source is RetrievalSource.WEB else None,
         vision_retriever=vision_retriever,
     )
@@ -367,7 +548,10 @@ def test_vision_branch_rejects_result_for_a_different_task(
 
 def test_one_task_produces_exactly_one_decision_and_ends_cleanly() -> None:
     router = FakeRouter([RetrievalSource.LOCAL])
-    workflow = ResearchRoutingWorkflow(router=router)  # type: ignore[arg-type]
+    workflow = ResearchRoutingWorkflow(
+        router=router,  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+    )
 
     final_state = workflow.run(_state())
 

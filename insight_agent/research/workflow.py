@@ -6,7 +6,9 @@ from typing import Any, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from insight_agent.evidence import Evidence, EvidenceCollector
 from insight_agent.planning.models import ResearchPlan, ResearchState, ResearchTask
+from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing.models import (
     RetrievalSource,
     RouteDecision,
@@ -27,6 +29,16 @@ class TaskRouter(Protocol):
         available_sources: set[RetrievalSource],
     ) -> RouteDecision:
         """Choose one available source for ``task`` without retrieving it."""
+        ...
+
+
+class LocalTaskRetriever(Protocol):
+    def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[RetrievalResult]:
+        """Return raw Local retrieval results through the shared retriever."""
         ...
 
 
@@ -58,8 +70,10 @@ class _GraphState(TypedDict):
     current_task: ResearchTask | None
     current_route: RouteDecision | None
     route_decisions: list[RouteDecision]
+    local_results: dict[str, list[RetrievalResult]]
     web_results: dict[str, WebRetrievalResult]
     vision_results: dict[str, VisionRetrievalResult]
+    evidence_pool: dict[str, list[Evidence]]
 
 
 class ResearchRoutingWorkflow:
@@ -70,10 +84,13 @@ class ResearchRoutingWorkflow:
         router: TaskRouter,
         web_retriever: WebTaskRetriever | None = None,
         vision_retriever: VisionTaskRetriever | None = None,
+        local_retriever: LocalTaskRetriever | None = None,
     ) -> None:
         self.router = router
+        self.local_retriever = local_retriever
         self.web_retriever = web_retriever
         self.vision_retriever = vision_retriever
+        self.evidence_collector = EvidenceCollector()
         self.graph = self._build_graph()
 
     def _build_graph(self) -> Any:
@@ -83,6 +100,7 @@ class ResearchRoutingWorkflow:
         builder.add_node("local_entry", self._local_entry_node)
         builder.add_node("web_entry", self._web_entry_node)
         builder.add_node("vision_entry", self._vision_entry_node)
+        builder.add_node("collect_evidence", self._collect_evidence_node)
         builder.add_node("advance_task", self._advance_task_node)
 
         builder.add_edge(START, "select_task")
@@ -97,7 +115,8 @@ class ResearchRoutingWorkflow:
             },
         )
         for entry_node in ("local_entry", "web_entry", "vision_entry"):
-            builder.add_edge(entry_node, "advance_task")
+            builder.add_edge(entry_node, "collect_evidence")
+        builder.add_edge("collect_evidence", "advance_task")
         builder.add_conditional_edges(
             "advance_task",
             self._next_step_edge,
@@ -174,9 +193,32 @@ class ResearchRoutingWorkflow:
             raise RoutingError("cannot choose a source without a route decision")
         return state.current_route.source.value
 
-    def local_entry(self, state: ResearchState) -> dict[str, list[RouteDecision]]:
-        """Record a local route without executing local retrieval."""
-        return self._record_current_route(state, RetrievalSource.LOCAL)
+    def local_entry(self, state: ResearchState) -> dict[str, Any]:
+        """Retrieve Local chunks for the current task and retain raw results."""
+        route_update = self._record_current_route(state, RetrievalSource.LOCAL)
+        if state.current_task is None:
+            raise RoutingError("cannot retrieve local results without a current task")
+        if (
+            state.current_route is None
+            or state.current_route.task_id != state.current_task.id
+        ):
+            raise RoutingError("local route does not correspond to current task")
+        if self.local_retriever is None:
+            raise RoutingError("Local Retrieval is not configured for this workflow")
+        results = self.local_retriever.retrieve(state.current_task.question)
+        if not isinstance(results, list) or any(
+            not isinstance(result, RetrievalResult) for result in results
+        ):
+            raise RoutingError(
+                "local retriever must return a list of RetrievalResult objects"
+            )
+        return {
+            **route_update,
+            "local_results": {
+                **state.local_results,
+                state.current_task.id: results,
+            },
+        }
 
     def web_entry(self, state: ResearchState) -> dict[str, Any]:
         """Retrieve public pages for the current Web-routed task."""
@@ -244,6 +286,49 @@ class ResearchRoutingWorkflow:
             },
         }
 
+    def collect_evidence(self, state: ResearchState) -> dict[str, Any]:
+        """Normalize the current task's routed raw results into Evidence."""
+        task = state.current_task
+        route = state.current_route
+        if task is None:
+            raise RoutingError("cannot collect evidence without a current task")
+        if route is None or route.task_id != task.id:
+            raise RoutingError("cannot collect evidence for a mismatched route")
+
+        if route.source is RetrievalSource.LOCAL:
+            if task.id not in state.local_results:
+                raise RoutingError("current task has no Local retrieval result")
+            incoming = self.evidence_collector.collect_local(
+                task.id,
+                state.local_results[task.id],
+            )
+        elif route.source is RetrievalSource.WEB:
+            if task.id not in state.web_results:
+                raise RoutingError("current task has no Web retrieval result")
+            incoming = self.evidence_collector.collect_web(
+                task.id,
+                state.web_results[task.id],
+            )
+        elif route.source is RetrievalSource.VISION:
+            if task.id not in state.vision_results:
+                raise RoutingError("current task has no Vision retrieval result")
+            incoming = self.evidence_collector.collect_vision(
+                task.id,
+                state.vision_results[task.id],
+            )
+        else:
+            raise RoutingError("cannot collect evidence for an unknown source")
+
+        return {
+            "evidence_pool": {
+                **state.evidence_pool,
+                task.id: self.evidence_collector.merge(
+                    state.evidence_pool.get(task.id, []),
+                    incoming,
+                ),
+            }
+        }
+
     @staticmethod
     def _record_current_route(
         state: ResearchState,
@@ -289,8 +374,16 @@ class ResearchRoutingWorkflow:
             "current_task": state.current_task,
             "current_route": state.current_route,
             "route_decisions": list(state.route_decisions),
+            "local_results": {
+                task_id: list(results)
+                for task_id, results in state.local_results.items()
+            },
             "web_results": dict(state.web_results),
             "vision_results": dict(state.vision_results),
+            "evidence_pool": {
+                task_id: list(evidence)
+                for task_id, evidence in state.evidence_pool.items()
+            },
         }
 
     @staticmethod
@@ -303,8 +396,16 @@ class ResearchRoutingWorkflow:
             current_task=state["current_task"],
             current_route=state["current_route"],
             route_decisions=list(state["route_decisions"]),
+            local_results={
+                task_id: list(results)
+                for task_id, results in state["local_results"].items()
+            },
             web_results=dict(state["web_results"]),
             vision_results=dict(state["vision_results"]),
+            evidence_pool={
+                task_id: list(evidence)
+                for task_id, evidence in state["evidence_pool"].items()
+            },
         )
 
     def _select_task_node(self, state: _GraphState) -> dict[str, Any]:
@@ -316,7 +417,7 @@ class ResearchRoutingWorkflow:
     def _local_entry_node(
         self,
         state: _GraphState,
-    ) -> dict[str, list[RouteDecision]]:
+    ) -> dict[str, Any]:
         return self.local_entry(self._from_graph_state(state))
 
     def _web_entry_node(
@@ -330,6 +431,9 @@ class ResearchRoutingWorkflow:
         state: _GraphState,
     ) -> dict[str, Any]:
         return self.vision_entry(self._from_graph_state(state))
+
+    def _collect_evidence_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.collect_evidence(self._from_graph_state(state))
 
     def _advance_task_node(self, state: _GraphState) -> dict[str, Any]:
         return self.advance_task(self._from_graph_state(state))

@@ -69,11 +69,17 @@ class KnowledgeSearchTool:
         self._default_top_k = default_top_k
 
     def __call__(self, query: str, top_k: int | None = None) -> str:
+        return format_results(self.retrieve(query, top_k=top_k))
+
+    def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+    ) -> list[RetrievalResult]:
+        """Return raw results through the same validated lazy retriever."""
         final_top_k = self._default_top_k if top_k is None else top_k
         _validate_final_top_k(final_top_k)
-        return format_results(
-            self._get_retriever().retrieve(query, top_k=final_top_k)
-        )
+        return self._get_retriever().retrieve(query, top_k=final_top_k)
 
     def _get_retriever(self) -> Retriever:
         if self._retriever is None:

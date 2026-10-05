@@ -420,6 +420,63 @@ def test_knowledge_search_tool_delegates_and_formats_observation() -> None:
     assert "Grounded evidence" in observation
 
 
+def test_knowledge_search_tool_structured_and_formatted_calls_share_lazy_retriever() -> None:
+    expected_results = [
+        RetrievalResult(
+            chunk_id="chunk-structured",
+            score=0.75,
+            content="Grounded evidence",
+            document_id="document-structured",
+            source="knowledge.txt",
+            source_type=SourceType.TEXT,
+            chunk_index=0,
+            start_char=0,
+            end_char=17,
+            metadata={},
+        )
+    ]
+
+    class FakeRetriever:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            self.calls.append((query, top_k))
+            return expected_results
+
+    factory_calls = 0
+    retriever = FakeRetriever()
+
+    def factory() -> FakeRetriever:
+        nonlocal factory_calls
+        factory_calls += 1
+        return retriever
+
+    tool = KnowledgeSearchTool(retriever_factory=factory, default_top_k=6)
+
+    results = tool.retrieve("structured")
+    observation = tool("formatted", top_k=3)
+
+    assert results is expected_results
+    assert factory_calls == 1
+    assert retriever.calls == [("structured", 6), ("formatted", 3)]
+    assert "Grounded evidence" in observation
+
+
+@pytest.mark.parametrize("top_k", [0, -1, 9, True])
+def test_knowledge_search_tool_structured_retrieval_rejects_invalid_top_k(
+    top_k: int,
+) -> None:
+    class FakeRetriever:
+        def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+            raise AssertionError("invalid final top_k must not reach retriever")
+
+    tool = KnowledgeSearchTool(FakeRetriever())
+
+    with pytest.raises(ValueError, match="top_k must be an integer between 1 and 8"):
+        tool.retrieve("query", top_k=top_k)
+
+
 def test_knowledge_search_tool_uses_injected_default_top_k() -> None:
     class FakeRetriever:
         def __init__(self) -> None:

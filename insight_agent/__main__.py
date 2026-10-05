@@ -138,6 +138,7 @@ def _compose_app(
         available_sources.add(RetrievalSource.WEB)
     research_workflow = ResearchRoutingWorkflow(
         router=retrieval_router,
+        local_retriever=knowledge_search_tool,
         web_retriever=web_retriever,
         vision_retriever=vision_retriever,
     )
