@@ -351,8 +351,8 @@ WEB_SEARCH_LIMIT=5
 WEB_FETCH_LIMIT=3
 ```
 
-Without `TAVILY_API_KEY`, local and vision routing behavior remains available
-but WEB is omitted from `available_sources`. Search-provider failure is an
+Without `TAVILY_API_KEY`, local routing remains available but WEB is omitted
+from `available_sources`. Search-provider failure is an
 explicit error; failure to fetch one candidate page is retained in
 `WebRetrievalResult.failures` while later candidates continue. Results are raw
 retrieval material, not Evidence, Citations, confidence, or a final report.
@@ -360,3 +360,46 @@ retrieval material, not Evidence, Citations, confidence, or a final report.
 Chapter 9 does not add query rewriting, multi-query or iterative search,
 Tavily answer/extract/crawl/research APIs, browser automation, source authority
 scoring, Evidence/Citation generation, report generation, or Vision Retrieval.
+
+## What Chapter 10 adds
+
+Chapter 10 turns the existing `vision_entry` into task-conditioned visual
+retrieval:
+
+```text
+Research Task -> Hybrid Retrieval (source_type=image)
+              -> deduplicate original image paths
+              -> reload accessible originals
+              -> task-conditioned VLM analysis
+              -> ResearchState.vision_results[task_id]
+```
+
+The existing image-ingestion path is unchanged: `describe_image(path)` still
+creates the general-purpose description stored in the text index. Vision
+Retrieval searches those descriptions, restores `RetrievalResult.source`, and
+uses a separate prompt containing the plan objective, current task, and user
+constraints. Image text is treated as untrusted data and never as instructions.
+
+`HybridRetriever.retrieve()` now accepts an optional keyword-only
+`source_types` set. Dense retrieval converts it to a Qdrant payload filter, and
+BM25 restricts eligible snapshot chunks before ranking and top-k truncation.
+Omitting the argument preserves the original local-retrieval behavior.
+
+Vision is advertised to the Retrieval Router only when all existing
+`VISION_API_KEY`, `VISION_BASE_URL`, and `VISION_MODEL` settings are present and
+a one-time startup probe finds an indexed image with a readable supported
+original file. The local knowledge tool and Vision Retriever then share the
+same Hybrid Retriever. No per-route knowledge-base scan is performed.
+
+Each task stores a `VisionRetrievalResult` with successful analyses, structured
+per-image failures, and a separate no-candidate state. One missing image or VLM
+failure does not discard successful analyses from other candidates. These
+results are retrieval material, not Evidence or Citations.
+
+A small end-to-end fixture is available at
+[`examples/vision_workflow.png`](examples/vision_workflow.png) (with the
+editable SVG beside it). A representative task is: “Determine whether the
+Local, Web, and Vision paths all converge on the same Advance Task node.”
+
+Chapter 10 does not add CLIP, a second vector store, OCR, crops, bounding boxes,
+a multi-turn Vision Agent, Evidence grading, citations, or report generation.

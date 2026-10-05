@@ -9,10 +9,12 @@ import pytest
 
 from insight_agent.ingestion import SourceType
 from insight_agent.retrieval import (
+    HybridRetrievalConfig,
     KnowledgeSearchTool,
     RetrievalPayloadError,
     RetrievalResult,
     VectorRetriever,
+    build_default_hybrid_retriever,
     format_results,
 )
 from insight_agent.retrieval.hybrid import HybridRetriever
@@ -68,6 +70,136 @@ class FakeVectorStore:
         return self.points
 
 
+class CloseableRetriever:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+        return []
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def _hybrid_config() -> HybridRetrievalConfig:
+    return HybridRetrievalConfig(
+        dense_k=4,
+        sparse_k=4,
+        rerank_k=4,
+        final_top_k=2,
+        rrf_k=60,
+        reranker_model="reranker",
+    )
+
+
+def test_knowledge_tool_closes_constructed_retriever() -> None:
+    retriever = CloseableRetriever()
+    tool = KnowledgeSearchTool(retriever)
+
+    tool.close()
+
+    assert retriever.close_calls == 1
+
+
+def test_default_hybrid_closes_its_owned_store_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def load_chunks(self) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    store = FakeStore()
+    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda: store)
+    monkeypatch.setattr(
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.sparse.BM25Retriever",
+        lambda chunk_loader: object(),
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.reranker.CrossEncoderReranker",
+        lambda model_name: object(),
+    )
+
+    hybrid = build_default_hybrid_retriever(_hybrid_config())
+    hybrid.close()
+    hybrid.close()
+
+    assert store.close_calls == 1
+
+
+def test_default_hybrid_closes_owned_store_when_construction_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def load_chunks(self) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    store = FakeStore()
+    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda: store)
+    monkeypatch.setattr(
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.sparse.BM25Retriever",
+        lambda chunk_loader: object(),
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.reranker.CrossEncoderReranker",
+        lambda model_name: (_ for _ in ()).throw(RuntimeError("reranker failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="reranker failed"):
+        build_default_hybrid_retriever(_hybrid_config())
+
+    assert store.close_calls == 1
+
+
+def test_default_hybrid_does_not_close_injected_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def load_chunks(self) -> list[Any]:
+            return []
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    store = FakeStore()
+    monkeypatch.setattr(
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.sparse.BM25Retriever",
+        lambda chunk_loader: object(),
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.reranker.CrossEncoderReranker",
+        lambda model_name: object(),
+    )
+
+    hybrid = build_default_hybrid_retriever(_hybrid_config(), store)  # type: ignore[arg-type]
+    hybrid.close()
+
+    assert store.close_calls == 0
+
+
 def test_retriever_embeds_one_query_and_restores_complete_result() -> None:
     embedder = FakeEmbedder()
     store = FakeVectorStore()
@@ -100,6 +232,37 @@ def test_retriever_allows_internal_recall_above_tool_limit() -> None:
 
     assert retriever.retrieve("broad recall", top_k=20) == []
     assert store.calls == [{"vector": [0.1, 0.2, 0.3], "limit": 20}]
+
+
+def test_retriever_pushes_source_types_into_vector_store() -> None:
+    class FilterAwareStore(FakeVectorStore):
+        def search(
+            self,
+            vector: list[float],
+            limit: int = 5,
+            *,
+            source_types: set[str] | None = None,
+        ) -> list[Any]:
+            self.calls.append(
+                {
+                    "vector": vector,
+                    "limit": limit,
+                    "source_types": source_types,
+                }
+            )
+            return []
+
+    store = FilterAwareStore()
+    retriever = VectorRetriever(FakeEmbedder(), store)
+
+    assert retriever.retrieve("diagram", top_k=2, source_types={"image"}) == []
+    assert store.calls == [
+        {
+            "vector": [0.1, 0.2, 0.3],
+            "limit": 2,
+            "source_types": {"image"},
+        }
+    ]
 
 
 @pytest.mark.parametrize("query", ["", "   ", "\n\t"])
@@ -326,6 +489,9 @@ def test_default_knowledge_tool_factory_builds_hybrid_without_loading_model(
 
         def search(self, vector, limit=5):  # noqa: ANN001, ANN201, ARG002
             return []
+
+        def close(self) -> None:
+            pass
 
     class FakeEmbedder:
         def embed_documents(self, texts):  # noqa: ANN001, ANN201, ARG002

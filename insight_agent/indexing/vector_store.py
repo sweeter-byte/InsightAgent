@@ -3,15 +3,24 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Protocol
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, ScoredPoint, VectorParams
+from qdrant_client.models import (
+    Distance,
+    FieldCondition,
+    Filter,
+    MatchAny,
+    PointStruct,
+    ScoredPoint,
+    VectorParams,
+)
 
 from insight_agent.indexing.models import Chunk
 from insight_agent.ingestion import SourceType
+from insight_agent.ingestion.models import normalize_source_types
 
 
 DEFAULT_QDRANT_PATH = ".data/qdrant"
@@ -29,7 +38,13 @@ class VectorStore(Protocol):
         """Persist chunks and their positionally corresponding vectors."""
         ...
 
-    def search(self, vector: list[float], limit: int = 5) -> list[ScoredPoint]:
+    def search(
+        self,
+        vector: list[float],
+        limit: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[ScoredPoint]:
         """Return nearest points with payloads, excluding stored vectors."""
         ...
 
@@ -89,6 +104,10 @@ class QdrantVectorStore:
                 f"required={Distance.COSINE.value}. Use a Cosine collection."
             )
 
+    def collection_exists(self) -> bool:
+        """Return whether this store's configured collection already exists."""
+        return self.client.collection_exists(self.collection_name)
+
     def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
         """Upsert one Qdrant point per Chunk without positional truncation."""
         if len(chunks) != len(vectors):
@@ -113,44 +132,72 @@ class QdrantVectorStore:
             wait=True,
         )
 
-    def search(self, vector: list[float], limit: int = 5) -> list[ScoredPoint]:
+    def search(
+        self,
+        vector: list[float],
+        limit: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[ScoredPoint]:
         """Query the existing collection and return payload-bearing hits."""
         if not vector:
             raise ValueError("search vector must not be empty")
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise ValueError("search limit must be a positive integer")
+        normalized_types = normalize_source_types(source_types)
 
         response = self.client.query_points(
             collection_name=self.collection_name,
             query=vector,
+            query_filter=_source_type_filter(normalized_types),
             limit=limit,
             with_payload=True,
             with_vectors=False,
         )
         return list(response.points)
 
-    def load_chunks(self, batch_size: int = 100) -> list[Chunk]:
+    def load_chunks(
+        self,
+        batch_size: int = 100,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[Chunk]:
         """Restore every stored point as a project-owned ``Chunk``."""
+        return list(
+            self.iter_chunks(
+                batch_size=batch_size,
+                source_types=source_types,
+            )
+        )
+
+    def iter_chunks(
+        self,
+        batch_size: int = 100,
+        *,
+        source_types: set[str] | None = None,
+    ) -> Iterator[Chunk]:
+        """Yield stored chunks page by page, optionally filtering at Qdrant."""
         if (
             isinstance(batch_size, bool)
             or not isinstance(batch_size, int)
             or batch_size <= 0
         ):
             raise ValueError("batch_size must be a positive integer")
+        normalized_types = normalize_source_types(source_types)
 
-        chunks: list[Chunk] = []
         offset: Any | None = None
         while True:
             points, next_offset = self.client.scroll(
                 collection_name=self.collection_name,
+                scroll_filter=_source_type_filter(normalized_types),
                 limit=batch_size,
                 offset=offset,
                 with_payload=True,
                 with_vectors=False,
             )
-            chunks.extend(self._chunk_from_point(point) for point in points)
+            yield from (self._chunk_from_point(point) for point in points)
             if next_offset is None:
-                return chunks
+                return
             offset = next_offset
 
     def close(self) -> None:
@@ -231,3 +278,16 @@ class QdrantVectorStore:
             end_char=payload["end_char"],
             metadata=dict(payload["metadata"]),
         )
+
+
+def _source_type_filter(source_types: set[str] | None) -> Filter | None:
+    if source_types is None:
+        return None
+    return Filter(
+        must=[
+            FieldCondition(
+                key="source_type",
+                match=MatchAny(any=sorted(source_types)),
+            )
+        ]
+    )

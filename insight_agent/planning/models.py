@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from insight_agent.routing.models import RetrievalSource, RouteDecision
+    from insight_agent.vision_retrieval.models import VisionRetrievalResult
     from insight_agent.web_search.models import WebRetrievalResult
 
 
@@ -50,6 +51,7 @@ class ResearchState:
     current_route: RouteDecision | None = None
     route_decisions: list[RouteDecision] = field(default_factory=list)
     web_results: dict[str, WebRetrievalResult] = field(default_factory=dict)
+    vision_results: dict[str, VisionRetrievalResult] = field(default_factory=dict)
 
 
 def validate_research_plan(plan: ResearchPlan) -> None:

@@ -274,11 +274,48 @@ WEB_SEARCH_LIMIT=5
 WEB_FETCH_LIMIT=3
 ```
 
-未配置 `TAVILY_API_KEY` 时，local 与 vision 的既有路由行为不变，但不会开放
-WEB。Search Provider 整体失败会明确报错；单个候选网页获取失败则写入
+未配置 `TAVILY_API_KEY` 时，local 路由仍可用，但不会开放 WEB。Search Provider
+整体失败会明确报错；单个候选网页获取失败则写入
 `WebRetrievalResult.failures`，后续候选仍会继续处理。上述结果只是原始检索资料，
 不是 Evidence、Citation、置信度或最终报告。
 
 第九章不实现 Query Rewrite、多 Query/多轮搜索、Tavily answer/extract/crawl/
 research API、浏览器自动化、来源权威性评分、Evidence/Citation、报告生成或
 Vision Retrieval。
+
+## 第十章新增：视觉检索
+
+第十章将已有的 `vision_entry` 补全为面向当前任务的视觉检索：
+
+```text
+Research Task -> Hybrid Retrieval（source_type=image）
+              -> 按原始图片路径去重
+              -> 重新读取仍可访问的原图
+              -> VLM 围绕当前任务分析
+              -> ResearchState.vision_results[task_id]
+```
+
+第三章图片摄取接口保持不变：`describe_image(path)` 仍生成进入文本索引的通用
+描述。视觉检索先搜索这些描述，再从 `RetrievalResult.source` 恢复原图，并使用
+包含研究目标、当前任务和用户约束的独立 Prompt 重新分析。图片中的文字只作为
+不可信资料处理，不能成为可执行指令。
+
+`HybridRetriever.retrieve()` 新增可选的仅限关键字参数 `source_types`。Dense
+Retrieval 将其下推为 Qdrant payload filter；BM25 在排序与 Top-K 截断前限制可选
+Chunk。不传该参数时，本地检索行为保持不变。
+
+只有现有 `VISION_API_KEY`、`VISION_BASE_URL`、`VISION_MODEL` 配置完整，且启动时
+一次性探测到索引中至少一张仍可读取的受支持原图，Runtime 才向 Retrieval Router
+声明 VISION 可用。此时本地知识库工具与 Vision Retriever 共享同一个 Hybrid
+Retriever；每次路由不会重复扫描知识库。
+
+每个任务的 `VisionRetrievalResult` 分别保存成功分析、结构化的逐图失败，以及独立
+的“无候选”状态。一张图片缺失或 VLM 调用失败不会丢弃其他图片的成功结果。这些
+结果只是检索材料，不是 Evidence 或 Citation。
+
+最小端到端样例位于 [`examples/vision_workflow.png`](examples/vision_workflow.png)，
+旁边保留了可编辑的 SVG。可使用任务：“判断图中的本地、网页和视觉三条路径是否
+都会汇合到同一个任务推进节点。”
+
+第十章不实现 CLIP、第二套向量库、OCR、裁剪、检测框、多轮 Vision Agent、
+Evidence 评分、引用或报告生成。

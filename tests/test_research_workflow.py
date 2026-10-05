@@ -15,6 +15,11 @@ from insight_agent.web_search import (
     WebSearchConfigurationError,
     WebSearchHit,
 )
+from insight_agent.vision_retrieval import (
+    VisionAnalysis,
+    VisionRetrievalError,
+    VisionRetrievalResult,
+)
 
 
 def _plan(task_count: int = 1) -> ResearchPlan:
@@ -92,16 +97,50 @@ class FakeWebRetriever:
         )
 
 
+class FakeVisionRetriever:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def retrieve(
+        self,
+        *,
+        task: ResearchTask,
+        objective: str,
+        constraints: list[str],
+    ) -> VisionRetrievalResult:
+        self.calls.append(
+            {
+                "task": task,
+                "objective": objective,
+                "constraints": list(constraints),
+            }
+        )
+        return VisionRetrievalResult(
+            task_id=task.id,
+            query=task.question,
+            analyses=[
+                VisionAnalysis(
+                    source=f"{task.id}.png",
+                    content=f"Visual analysis for {task.id}",
+                    metadata={"task": task.id},
+                )
+            ],
+            failures=[],
+        )
+
+
 class RecordingWorkflow(ResearchRoutingWorkflow):
     def __init__(
         self,
         router: FakeRouter,
         web_retriever: FakeWebRetriever | None = None,
+        vision_retriever: FakeVisionRetriever | None = None,
     ) -> None:
         self.entries: list[str] = []
         super().__init__(
             router=router,  # type: ignore[arg-type]
             web_retriever=web_retriever,
+            vision_retriever=vision_retriever,
         )
 
     def local_entry(self, state: ResearchState) -> dict[str, Any]:
@@ -135,6 +174,7 @@ def test_research_state_keeps_compatible_routing_defaults() -> None:
     assert state.current_route is None
     assert state.route_decisions == []
     assert state.web_results == {}
+    assert state.vision_results == {}
 
 
 def test_select_task_uses_index_and_clears_previous_route() -> None:
@@ -157,7 +197,8 @@ def test_select_task_uses_index_and_clears_previous_route() -> None:
 def test_source_route_enters_matching_branch(source: RetrievalSource) -> None:
     router = FakeRouter([source])
     web_retriever = FakeWebRetriever()
-    workflow = RecordingWorkflow(router, web_retriever)
+    vision_retriever = FakeVisionRetriever()
+    workflow = RecordingWorkflow(router, web_retriever, vision_retriever)
 
     final_state = workflow.run(_state())
 
@@ -166,6 +207,9 @@ def test_source_route_enters_matching_branch(source: RetrievalSource) -> None:
         RouteDecision(task_id="T1", source=source, reason=f"Route T1 to {source.value}")
     ]
     assert web_retriever.calls == (["Question 1"] if source is RetrievalSource.WEB else [])
+    assert len(vision_retriever.calls) == (
+        1 if source is RetrievalSource.VISION else 0
+    )
 
 
 def test_web_branch_writes_task_scoped_result() -> None:
@@ -183,6 +227,24 @@ def test_web_branch_writes_task_scoped_result() -> None:
     assert final_state.web_results["T1"].documents[0].content == "Fetched content 1"
 
 
+def test_vision_branch_writes_task_scoped_result_with_plan_context() -> None:
+    vision_retriever = FakeVisionRetriever()
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.VISION]),  # type: ignore[arg-type]
+        vision_retriever=vision_retriever,
+    )
+
+    final_state = workflow.run(_state())
+
+    assert len(vision_retriever.calls) == 1
+    call = vision_retriever.calls[0]
+    assert call["task"].id == "T1"
+    assert call["objective"] == "Compare memory systems"
+    assert call["constraints"] == ["Prefer primary sources"]
+    assert set(final_state.vision_results) == {"T1"}
+    assert final_state.vision_results["T1"].query == "Question 1"
+
+
 @pytest.mark.parametrize(
     "source",
     [RetrievalSource.LOCAL, RetrievalSource.VISION],
@@ -194,12 +256,32 @@ def test_non_web_branches_do_not_call_web_retriever(
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([source]),  # type: ignore[arg-type]
         web_retriever=web_retriever,
+        vision_retriever=(
+            FakeVisionRetriever() if source is RetrievalSource.VISION else None
+        ),
     )
 
     final_state = workflow.run(_state())
 
     assert web_retriever.calls == []
     assert final_state.web_results == {}
+
+
+@pytest.mark.parametrize("source", [RetrievalSource.LOCAL, RetrievalSource.WEB])
+def test_non_vision_branches_do_not_call_vision_retriever(
+    source: RetrievalSource,
+) -> None:
+    vision_retriever = FakeVisionRetriever()
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([source]),  # type: ignore[arg-type]
+        web_retriever=FakeWebRetriever() if source is RetrievalSource.WEB else None,
+        vision_retriever=vision_retriever,
+    )
+
+    final_state = workflow.run(_state())
+
+    assert vision_retriever.calls == []
+    assert final_state.vision_results == {}
 
 
 def test_multiple_web_tasks_accumulate_results_and_reach_end() -> None:
@@ -219,12 +301,67 @@ def test_multiple_web_tasks_accumulate_results_and_reach_end() -> None:
     assert final_state.current_task is None
 
 
+def test_multiple_vision_tasks_accumulate_results_and_reach_end() -> None:
+    vision_retriever = FakeVisionRetriever()
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.VISION, RetrievalSource.VISION]),  # type: ignore[arg-type]
+        vision_retriever=vision_retriever,
+    )
+
+    final_state = workflow.run(_state(task_count=2))
+
+    assert list(final_state.vision_results) == ["T1", "T2"]
+    assert final_state.vision_results["T1"].query == "Question 1"
+    assert final_state.vision_results["T2"].query == "Question 2"
+    assert final_state.task_index == 2
+
+
 def test_web_branch_requires_configured_retriever() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
         router=FakeRouter([RetrievalSource.WEB])
     )
 
     with pytest.raises(WebSearchConfigurationError, match="not configured"):
+        workflow.run(_state())
+
+
+def test_vision_branch_requires_configured_retriever() -> None:
+    workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
+        router=FakeRouter([RetrievalSource.VISION])
+    )
+
+    with pytest.raises(VisionRetrievalError, match="not configured"):
+        workflow.run(_state())
+
+
+@pytest.mark.parametrize(
+    ("task_id", "query", "message"),
+    [
+        ("T99", "Question 1", "task_id"),
+        ("T1", "Different question", "query"),
+    ],
+)
+def test_vision_branch_rejects_result_for_a_different_task(
+    task_id: str,
+    query: str,
+    message: str,
+) -> None:
+    class MismatchedVisionRetriever(FakeVisionRetriever):
+        def retrieve(self, **kwargs: Any) -> VisionRetrievalResult:
+            return VisionRetrievalResult(
+                task_id=task_id,
+                query=query,
+                analyses=[],
+                failures=[],
+                no_candidates=True,
+            )
+
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.VISION]),  # type: ignore[arg-type]
+        vision_retriever=MismatchedVisionRetriever(),
+    )
+
+    with pytest.raises(RoutingError, match=message):
         workflow.run(_state())
 
 
@@ -248,7 +385,11 @@ def test_multiple_tasks_are_routed_in_plan_order() -> None:
         RetrievalSource.VISION,
     ]
     router = FakeRouter(sources)
-    workflow = RecordingWorkflow(router, FakeWebRetriever())
+    workflow = RecordingWorkflow(
+        router,
+        FakeWebRetriever(),
+        FakeVisionRetriever(),
+    )
     state = _state(task_count=3)
 
     final_state = workflow.run(state)

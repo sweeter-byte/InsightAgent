@@ -15,13 +15,20 @@ from insight_agent.retrieval.models import (
     RetrievalTrace,
 )
 from insight_agent.retrieval.reranker import Reranker
+from insight_agent.ingestion.models import normalize_source_types
 
 
 logger = logging.getLogger(__name__)
 
 
 class Retriever(Protocol):
-    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[RetrievalResult]:
         ...
 
 
@@ -41,17 +48,21 @@ class HybridRetriever:
         *,
         config: HybridRetrievalConfig,
         trace_callback: Callable[[RetrievalTrace], None] | None = None,
+        close_callback: Callable[[], None] | None = None,
     ) -> None:
         self.dense_retriever = dense_retriever
         self.sparse_retriever = sparse_retriever
         self.reranker = reranker
         self.config = config
         self.trace_callback = trace_callback
+        self._close_callback = close_callback
 
     def retrieve(
         self,
         query: str,
         top_k: int | None = None,
+        *,
+        source_types: set[str] | None = None,
     ) -> list[RetrievalResult]:
         """Run the hybrid pipeline and return Agent-compatible results."""
         if not isinstance(query, str) or not query.strip():
@@ -63,9 +74,22 @@ class HybridRetriever:
             or not 1 <= final_top_k <= 8
         ):
             raise ValueError("top_k must be an integer between 1 and 8")
+        normalized_types = normalize_source_types(source_types)
 
-        dense = self.dense_retriever.retrieve(query, top_k=self.config.dense_k)
-        sparse = self.sparse_retriever.retrieve(query, top_k=self.config.sparse_k)
+        if normalized_types is None:
+            dense = self.dense_retriever.retrieve(query, top_k=self.config.dense_k)
+            sparse = self.sparse_retriever.retrieve(query, top_k=self.config.sparse_k)
+        else:
+            dense = self.dense_retriever.retrieve(
+                query,
+                top_k=self.config.dense_k,
+                source_types=normalized_types,
+            )
+            sparse = self.sparse_retriever.retrieve(
+                query,
+                top_k=self.config.sparse_k,
+                source_types=normalized_types,
+            )
         fused = rrf_fuse([dense, sparse], rrf_k=self.config.rrf_k)
         candidates = fused[: self.config.rerank_k]
         reranked = (
@@ -96,6 +120,12 @@ class HybridRetriever:
     def refresh(self) -> None:
         """Explicitly rebuild and atomically replace the sparse snapshot."""
         self.sparse_retriever.refresh()
+
+    def close(self) -> None:
+        """Release an owned backing resource; injected resources stay external."""
+        callback, self._close_callback = self._close_callback, None
+        if callback is not None:
+            callback()
 
 
 def _ranked_trace(

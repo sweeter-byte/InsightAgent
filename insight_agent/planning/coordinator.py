@@ -87,6 +87,14 @@ def format_research_context(state: ResearchState) -> str:
             }
         )
     routes_json = json.dumps(route_rows, ensure_ascii=False, indent=2)
+    vision_json = json.dumps(
+        {
+            task_id: asdict(result)
+            for task_id, result in state.vision_results.items()
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
     return (
         "Original user request:\n"
         f"{state.query}\n\n"
@@ -94,6 +102,8 @@ def format_research_context(state: ResearchState) -> str:
         f"{plan_json}\n\n"
         "Route Decisions (control information, NOT Evidence):\n"
         f"{routes_json}\n\n"
+        "Vision Retrieval Results (retrieved material, NOT Evidence):\n"
+        f"{vision_json}\n\n"
         "Execution instructions:\n"
         "- Follow the research plan and address its tasks in dependency order.\n"
         "- Task descriptions are planning instructions, not factual evidence.\n"
@@ -101,7 +111,8 @@ def format_research_context(state: ResearchState) -> str:
         "- For local tasks, use existing local capabilities such as "
         "search_knowledge_base and ground the answer in retrieved evidence.\n"
         "- Web Search results are retrieved material, not verified Evidence.\n"
-        "- Vision Retrieval is not implemented in Chapter 9.\n"
+        "- Vision Retrieval results are retrieved material, not verified Evidence.\n"
+        "- Use each Vision result only for the task ID that owns it.\n"
         "- Do not use model memory or Local RAG to pretend an unavailable "
         "source was executed.\n"
         "- If the required source cannot be executed, state that the evidence "

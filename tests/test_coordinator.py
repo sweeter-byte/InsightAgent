@@ -10,6 +10,11 @@ from insight_agent.planning import (
     format_research_context,
 )
 from insight_agent.routing import RetrievalSource, RouteDecision
+from insight_agent.vision_retrieval import (
+    VisionAnalysis,
+    VisionFailure,
+    VisionRetrievalResult,
+)
 
 
 class FakePlanner:
@@ -141,7 +146,7 @@ def test_execution_context_preserves_query_and_structured_plan() -> None:
     assert '"source": "web"' in context
     assert '"reason": "Route reason for T2"' in context
     assert "Web Search results are retrieved material, not verified Evidence" in context
-    assert "Vision Retrieval is not implemented" in context
+    assert "Vision Retrieval results are retrieved material, not verified Evidence" in context
     assert "model memory or Local RAG" in context
     assert "evidence is insufficient or the required capability is unavailable" in context
 
@@ -155,6 +160,41 @@ def test_context_formatter_requires_a_completed_plan() -> None:
         assert "plan" in str(exc)
     else:
         raise AssertionError("formatting an unplanned state must fail")
+
+
+def test_execution_context_includes_task_scoped_vision_retrieval_material() -> None:
+    state = ResearchState(
+        query="inspect diagram",
+        plan=_plan(),
+        available_sources={RetrievalSource.VISION},
+        vision_results={
+            "T1": VisionRetrievalResult(
+                task_id="T1",
+                query="What are the main design families?",
+                analyses=[
+                    VisionAnalysis(
+                        source="workflow.png",
+                        content="UNIQUE_VISION_FACT: three arrows converge",
+                        metadata={"kind": "diagram"},
+                    )
+                ],
+                failures=[
+                    VisionFailure(
+                        source="deleted.png",
+                        reason="Original image is not accessible",
+                    )
+                ],
+            )
+        },
+    )
+
+    context = format_research_context(state)
+
+    assert "Vision Retrieval Results (retrieved material, NOT Evidence)" in context
+    assert "UNIQUE_VISION_FACT: three arrows converge" in context
+    assert '"source": "workflow.png"' in context
+    assert '"source": "deleted.png"' in context
+    assert '"no_candidates": false' in context
 
 
 def test_coordinator_calls_existing_research_agent_once_after_workflow() -> None:

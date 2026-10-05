@@ -106,6 +106,26 @@ def _build(
     return app, router, llm, research, coordinator
 
 
+def test_close_releases_callbacks_once_in_reverse_registration_order() -> None:
+    events: list[str] = []
+    router = FakeRouter(Intent.DIRECT)
+    app = InsightAgent(
+        router=router,  # type: ignore[arg-type]
+        llm=FakeLLM(),  # type: ignore[arg-type]
+        research_agent=FakeResearchAgent(),  # type: ignore[arg-type]
+        research_coordinator=FakeResearchCoordinator(),  # type: ignore[arg-type]
+        close_callbacks=[
+            lambda: events.append("first"),
+            lambda: events.append("second"),
+        ],
+    )
+
+    app.close()
+    app.close()
+
+    assert events == ["second", "first"]
+
+
 # ---------------------------------------------------------------------------
 # 1. DIRECT path — plain chat, no tools, no ResearchAgent
 # ---------------------------------------------------------------------------

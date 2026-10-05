@@ -209,6 +209,60 @@ def test_hybrid_refresh_delegates_to_sparse_snapshot() -> None:
     assert sparse.refresh_calls == 1
 
 
+def test_hybrid_close_releases_owned_resource_once() -> None:
+    events: list[str] = []
+    hybrid = HybridRetriever(
+        FakeRetriever("dense", [], events),
+        FakeRetriever("sparse", [], events),
+        FakeReranker(events),
+        config=_config(),
+        close_callback=lambda: events.append("close"),
+    )
+
+    hybrid.close()
+    hybrid.close()
+
+    assert events == ["close"]
+
+
+def test_hybrid_pushes_source_types_to_both_candidate_retrievers() -> None:
+    class FilterAwareRetriever(FakeRetriever):
+        def __init__(self, name: str, events: list[str]) -> None:
+            super().__init__(name, [], events)
+            self.filtered_calls: list[tuple[str, int, set[str] | None]] = []
+
+        def retrieve(
+            self,
+            query: str,
+            top_k: int = 5,
+            *,
+            source_types: set[str] | None = None,
+        ) -> list[RetrievalResult]:
+            self.events.append(self.name)
+            self.filtered_calls.append((query, top_k, source_types))
+            return []
+
+    events: list[str] = []
+    dense = FilterAwareRetriever("dense", events)
+    sparse = FilterAwareRetriever("sparse", events)
+    hybrid = HybridRetriever(dense, sparse, FakeReranker(events), config=_config())
+
+    assert hybrid.retrieve("diagram", source_types={"image"}) == []
+    assert dense.filtered_calls == [("diagram", 4, {"image"})]
+    assert sparse.filtered_calls == [("diagram", 3, {"image"})]
+
+
+def test_hybrid_omitted_source_types_preserves_legacy_retriever_call_shape() -> None:
+    events: list[str] = []
+    dense = FakeRetriever("dense", [], events)
+    sparse = FakeRetriever("sparse", [], events)
+    hybrid = HybridRetriever(dense, sparse, FakeReranker(events), config=_config())
+
+    assert hybrid.retrieve("query") == []
+    assert dense.calls == [("query", 4)]
+    assert sparse.calls == [("query", 3)]
+
+
 @pytest.mark.parametrize("top_k", [0, -1, 9, True])
 def test_hybrid_rejects_final_top_k_outside_agent_contract(top_k: int) -> None:
     events: list[str] = []

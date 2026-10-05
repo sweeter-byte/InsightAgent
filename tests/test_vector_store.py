@@ -188,6 +188,74 @@ def test_search_returns_ranked_payloads_without_stored_vectors(tmp_path: Path) -
         store.close()
 
 
+def test_search_filters_source_types_before_limit(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    documents = [
+        Document(
+            content="A text result with the closest vector.",
+            source="notes.txt",
+            source_type=SourceType.TEXT,
+        ),
+        Document(
+            content="An indexed image description.",
+            source="diagram.png",
+            source_type=SourceType.IMAGE,
+        ),
+    ]
+    chunks = TextChunker(chunk_size=100, chunk_overlap=10).split_documents(documents)
+    try:
+        store.ensure_collection(vector_size=2)
+        store.upsert(chunks, [[1.0, 0.0], [0.8, 0.2]])
+
+        points = store.search(
+            [1.0, 0.0],
+            limit=1,
+            source_types={"image"},
+        )
+
+        assert len(points) == 1
+        assert points[0].payload["source"] == "diagram.png"
+        assert points[0].payload["source_type"] == "image"
+    finally:
+        store.close()
+
+
+def test_load_chunks_can_filter_image_sources(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    documents = [
+        Document("Text", "notes.txt", SourceType.TEXT),
+        Document("Diagram", "diagram.png", SourceType.IMAGE),
+    ]
+    chunks = TextChunker(chunk_size=100, chunk_overlap=10).split_documents(documents)
+    try:
+        store.ensure_collection(vector_size=2)
+        store.upsert(chunks, [[1.0, 0.0], [0.0, 1.0]])
+
+        restored = store.load_chunks(source_types={"image"})
+
+        assert [chunk.source for chunk in restored] == ["diagram.png"]
+    finally:
+        store.close()
+
+
+def test_iter_chunks_can_lazily_filter_image_sources(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    documents = [
+        Document("Text", "notes.txt", SourceType.TEXT),
+        Document("Diagram", "diagram.png", SourceType.IMAGE),
+    ]
+    chunks = TextChunker(chunk_size=100, chunk_overlap=10).split_documents(documents)
+    try:
+        store.ensure_collection(vector_size=2)
+        store.upsert(chunks, [[1.0, 0.0], [0.0, 1.0]])
+
+        restored = list(store.iter_chunks(batch_size=1, source_types={"image"}))
+
+        assert [chunk.source for chunk in restored] == ["diagram.png"]
+    finally:
+        store.close()
+
+
 def test_load_chunks_scrolls_all_pages_and_restores_domain_models(
     tmp_path: Path,
 ) -> None:

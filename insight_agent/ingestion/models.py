@@ -23,6 +23,24 @@ class SourceType(str, Enum):
     IMAGE = "image"
 
 
+def normalize_source_types(source_types: set[str] | None) -> set[str] | None:
+    """Validate an optional set of ``SourceType`` string values."""
+    if source_types is None:
+        return None
+    if not isinstance(source_types, set) or not source_types:
+        raise ValueError("source_types must be a non-empty set of strings")
+    if any(not isinstance(value, str) for value in source_types):
+        raise ValueError("source_types must be a non-empty set of strings")
+    allowed = {source_type.value for source_type in SourceType}
+    unknown = source_types - allowed
+    if unknown:
+        raise ValueError(
+            "source_types contains unknown value(s): "
+            + ", ".join(sorted(repr(value) for value in unknown))
+        )
+    return set(source_types)
+
+
 @dataclass(slots=True)
 class Document:
     """A single unit of ingested content.

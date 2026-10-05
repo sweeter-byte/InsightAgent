@@ -14,6 +14,8 @@ from insight_agent.routing.models import (
 )
 from insight_agent.web_search.errors import WebSearchConfigurationError
 from insight_agent.web_search.models import WebRetrievalResult
+from insight_agent.vision_retrieval.errors import VisionRetrievalError
+from insight_agent.vision_retrieval.models import VisionRetrievalResult
 
 
 class TaskRouter(Protocol):
@@ -34,6 +36,18 @@ class WebTaskRetriever(Protocol):
         ...
 
 
+class VisionTaskRetriever(Protocol):
+    def retrieve(
+        self,
+        *,
+        task: ResearchTask,
+        objective: str,
+        constraints: list[str],
+    ) -> VisionRetrievalResult:
+        """Analyze original images for one already-routed task."""
+        ...
+
+
 class _GraphState(TypedDict):
     """LangGraph-only schema adapted from the canonical dataclass at the boundary."""
 
@@ -45,6 +59,7 @@ class _GraphState(TypedDict):
     current_route: RouteDecision | None
     route_decisions: list[RouteDecision]
     web_results: dict[str, WebRetrievalResult]
+    vision_results: dict[str, VisionRetrievalResult]
 
 
 class ResearchRoutingWorkflow:
@@ -54,9 +69,11 @@ class ResearchRoutingWorkflow:
         self,
         router: TaskRouter,
         web_retriever: WebTaskRetriever | None = None,
+        vision_retriever: VisionTaskRetriever | None = None,
     ) -> None:
         self.router = router
         self.web_retriever = web_retriever
+        self.vision_retriever = vision_retriever
         self.graph = self._build_graph()
 
     def _build_graph(self) -> Any:
@@ -166,7 +183,10 @@ class ResearchRoutingWorkflow:
         route_update = self._record_current_route(state, RetrievalSource.WEB)
         if state.current_task is None:
             raise RoutingError("cannot retrieve web results without a current task")
-        if state.current_route is None or state.current_route.task_id != state.current_task.id:
+        if (
+            state.current_route is None
+            or state.current_route.task_id != state.current_task.id
+        ):
             raise RoutingError("web route does not correspond to current task")
         if self.web_retriever is None:
             raise WebSearchConfigurationError(
@@ -183,9 +203,46 @@ class ResearchRoutingWorkflow:
             },
         }
 
-    def vision_entry(self, state: ResearchState) -> dict[str, list[RouteDecision]]:
-        """Record a vision route without executing vision retrieval."""
-        return self._record_current_route(state, RetrievalSource.VISION)
+    def vision_entry(self, state: ResearchState) -> dict[str, Any]:
+        """Analyze original images for the current Vision-routed task."""
+        route_update = self._record_current_route(state, RetrievalSource.VISION)
+        if state.plan is None:
+            raise RoutingError("cannot retrieve vision results without a plan")
+        if state.current_task is None:
+            raise RoutingError("cannot retrieve vision results without a current task")
+        if (
+            state.current_route is None
+            or state.current_route.task_id != state.current_task.id
+        ):
+            raise RoutingError("vision route does not correspond to current task")
+        if self.vision_retriever is None:
+            raise VisionRetrievalError(
+                "Vision Retrieval is not configured for this workflow"
+            )
+        result = self.vision_retriever.retrieve(
+            task=state.current_task,
+            objective=state.plan.objective,
+            constraints=state.plan.constraints,
+        )
+        if not isinstance(result, VisionRetrievalResult):
+            raise RoutingError(
+                "vision retriever must return a VisionRetrievalResult"
+            )
+        if result.task_id != state.current_task.id:
+            raise RoutingError(
+                "vision retrieval result task_id does not match current task"
+            )
+        if result.query != state.current_task.question:
+            raise RoutingError(
+                "vision retrieval result query does not match current task"
+            )
+        return {
+            **route_update,
+            "vision_results": {
+                **state.vision_results,
+                state.current_task.id: result,
+            },
+        }
 
     @staticmethod
     def _record_current_route(
@@ -233,6 +290,7 @@ class ResearchRoutingWorkflow:
             "current_route": state.current_route,
             "route_decisions": list(state.route_decisions),
             "web_results": dict(state.web_results),
+            "vision_results": dict(state.vision_results),
         }
 
     @staticmethod
@@ -246,6 +304,7 @@ class ResearchRoutingWorkflow:
             current_route=state["current_route"],
             route_decisions=list(state["route_decisions"]),
             web_results=dict(state["web_results"]),
+            vision_results=dict(state["vision_results"]),
         )
 
     def _select_task_node(self, state: _GraphState) -> dict[str, Any]:
@@ -269,7 +328,7 @@ class ResearchRoutingWorkflow:
     def _vision_entry_node(
         self,
         state: _GraphState,
-    ) -> dict[str, list[RouteDecision]]:
+    ) -> dict[str, Any]:
         return self.vision_entry(self._from_graph_state(state))
 
     def _advance_task_node(self, state: _GraphState) -> dict[str, Any]:

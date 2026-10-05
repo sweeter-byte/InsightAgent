@@ -7,13 +7,20 @@ from typing import Any, Protocol
 
 from insight_agent.indexing import Embedder
 from insight_agent.ingestion import SourceType
+from insight_agent.ingestion.models import normalize_source_types
 from insight_agent.retrieval.models import RetrievalPayloadError, RetrievalResult
 
 
 class SearchableVectorStore(Protocol):
     """Read-only vector-store capability consumed by ``VectorRetriever``."""
 
-    def search(self, vector: list[float], limit: int = 5) -> list[Any]:
+    def search(
+        self,
+        vector: list[float],
+        limit: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[Any]:
         """Return the nearest stored points with payloads attached."""
         ...
 
@@ -29,18 +36,32 @@ class VectorRetriever:
         self.embedder = embedder
         self.vector_store = vector_store
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[RetrievalResult]:
         """Embed one non-empty query and return up to ``top_k`` domain results."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must not be empty")
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
+        normalized_types = normalize_source_types(source_types)
 
         vectors = self.embedder.embed_documents([query])
         if len(vectors) != 1 or not vectors[0]:
             raise ValueError("query embedding must contain exactly one non-empty vector")
 
-        points = self.vector_store.search(vectors[0], limit=top_k)
+        if normalized_types is None:
+            points = self.vector_store.search(vectors[0], limit=top_k)
+        else:
+            points = self.vector_store.search(
+                vectors[0],
+                limit=top_k,
+                source_types=normalized_types,
+            )
         return [self._to_result(point) for point in points]
 
     @staticmethod

@@ -17,6 +17,7 @@ def _chunk(
     content: str,
     *,
     source: str = "notes.md",
+    source_type: SourceType = SourceType.MARKDOWN,
     metadata: dict[str, object] | None = None,
 ) -> Chunk:
     return Chunk(
@@ -24,7 +25,7 @@ def _chunk(
         document_id=f"doc-{chunk_id}",
         content=content,
         source=source,
-        source_type=SourceType.MARKDOWN,
+        source_type=source_type,
         chunk_index=0,
         start_char=0,
         end_char=len(content),
@@ -163,6 +164,27 @@ def test_bm25_empty_snapshot_returns_no_results() -> None:
     retriever = BM25Retriever(lambda: [])
 
     assert retriever.retrieve("anything") == []
+
+
+def test_bm25_filters_source_types_before_top_k() -> None:
+    chunks = [
+        _chunk("text", "shared query terms", source_type=SourceType.TEXT),
+        _chunk(
+            "image",
+            "shared query terms",
+            source="diagram.png",
+            source_type=SourceType.IMAGE,
+        ),
+    ]
+    retriever = BM25Retriever(lambda: chunks)
+
+    results = retriever.retrieve(
+        "shared query terms",
+        top_k=1,
+        source_types={"image"},
+    )
+
+    assert [result.chunk_id for result in results] == ["image"]
 
 
 @pytest.mark.parametrize("top_k", [0, -1, True])

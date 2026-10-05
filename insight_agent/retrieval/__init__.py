@@ -17,6 +17,7 @@ from insight_agent.retrieval.sparse import BM25Retriever, tokenize
 from insight_agent.retrieval.tool import (
     SEARCH_KNOWLEDGE_BASE_SCHEMA,
     KnowledgeSearchTool,
+    build_default_hybrid_retriever,
     build_default_knowledge_search_tool,
 )
 
@@ -36,6 +37,7 @@ __all__ = [
     "SEARCH_KNOWLEDGE_BASE_SCHEMA",
     "SearchableVectorStore",
     "VectorRetriever",
+    "build_default_hybrid_retriever",
     "build_default_knowledge_search_tool",
     "format_results",
     "rrf_fuse",

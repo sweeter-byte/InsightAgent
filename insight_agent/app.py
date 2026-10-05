@@ -27,6 +27,7 @@ object.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from insight_agent.agent import ResearchAgent
@@ -56,12 +57,14 @@ class InsightAgent:
         research_agent: ResearchAgent,
         research_coordinator: ResearchCoordinator,
         direct_system_prompt: str = DIRECT_SYSTEM_PROMPT,
+        close_callbacks: Sequence[Callable[[], None]] = (),
     ) -> None:
         self.router = router
         self.llm = llm
         self.research_agent = research_agent
         self.research_coordinator = research_coordinator
         self.direct_system_prompt = direct_system_prompt
+        self._close_callbacks = list(close_callbacks)
 
     # ------------------------------------------------------------------ public
 
@@ -76,6 +79,12 @@ class InsightAgent:
             return self.research_agent.run(query)
 
         return self.research_coordinator.run(query)
+
+    def close(self) -> None:
+        """Release runtime-owned resources; repeated calls are harmless."""
+        callbacks, self._close_callbacks = self._close_callbacks, []
+        for callback in reversed(callbacks):
+            callback()
 
     # ----------------------------------------------------------------- private
 

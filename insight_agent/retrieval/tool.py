@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from insight_agent.retrieval.config import HybridRetrievalConfig
 from insight_agent.retrieval.formatting import format_results
+from insight_agent.retrieval.hybrid import HybridRetriever
 from insight_agent.retrieval.models import RetrievalResult
+
+if TYPE_CHECKING:
+    from insight_agent.indexing import QdrantVectorStore
 
 
 SEARCH_KNOWLEDGE_BASE_SCHEMA: dict[str, Any] = {
@@ -77,38 +81,63 @@ class KnowledgeSearchTool:
             self._retriever = self._retriever_factory()
         return self._retriever
 
+    def close(self) -> None:
+        """Release resources only if the lazy retriever was constructed."""
+        if self._retriever is None:
+            return
+        close = getattr(self._retriever, "close", None)
+        if callable(close):
+            close()
 
-def build_default_knowledge_search_tool() -> KnowledgeSearchTool:
+
+def build_default_knowledge_search_tool(
+    config: HybridRetrievalConfig | None = None,
+) -> KnowledgeSearchTool:
     """Build a lazy hybrid search tool after validating its configuration."""
-    config = HybridRetrievalConfig.from_env()
+    resolved_config = config or HybridRetrievalConfig.from_env()
 
     def create_retriever() -> Retriever:
         # Keep heavy model loading and local Qdrant opening out of application
         # composition; both occur only when the Agent actually invokes the tool.
-        from insight_agent.indexing import QdrantVectorStore, SentenceTransformerEmbedder
-        from insight_agent.retrieval.hybrid import HybridRetriever
-        from insight_agent.retrieval.reranker import CrossEncoderReranker
-        from insight_agent.retrieval.retriever import VectorRetriever
-        from insight_agent.retrieval.sparse import BM25Retriever
+        return build_default_hybrid_retriever(resolved_config)
 
-        vector_store = QdrantVectorStore()
+    return KnowledgeSearchTool(
+        retriever_factory=create_retriever,
+        default_top_k=resolved_config.final_top_k,
+    )
+
+
+def build_default_hybrid_retriever(
+    config: HybridRetrievalConfig,
+    vector_store: QdrantVectorStore | None = None,
+) -> HybridRetriever:
+    """Compose the project Hybrid Retriever, optionally over a shared store."""
+    from insight_agent.indexing import QdrantVectorStore, SentenceTransformerEmbedder
+    from insight_agent.retrieval.reranker import CrossEncoderReranker
+    from insight_agent.retrieval.retriever import VectorRetriever
+    from insight_agent.retrieval.sparse import BM25Retriever
+
+    owns_store = vector_store is None
+    store = QdrantVectorStore() if owns_store else vector_store
+    assert store is not None
+    try:
         dense_retriever = VectorRetriever(
             embedder=SentenceTransformerEmbedder(),
-            vector_store=vector_store,
+            vector_store=store,
         )
-        sparse_retriever = BM25Retriever(vector_store.load_chunks)
+        sparse_retriever = BM25Retriever(store.load_chunks)
         reranker = CrossEncoderReranker(config.reranker_model)
         return HybridRetriever(
             dense_retriever,
             sparse_retriever,
             reranker,
             config=config,
+            close_callback=store.close if owns_store else None,
         )
-
-    return KnowledgeSearchTool(
-        retriever_factory=create_retriever,
-        default_top_k=config.final_top_k,
-    )
+    except BaseException:
+        if owns_store:
+            store.close()
+        raise
 
 
 def _validate_final_top_k(top_k: int) -> None:

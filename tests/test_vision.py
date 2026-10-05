@@ -18,7 +18,9 @@ import pytest
 
 from insight_agent.ingestion.errors import IngestionError
 from insight_agent.ingestion.vision import (
+    OpenAICompatibleVisionClient,
     VISION_SYSTEM_PROMPT,
+    VisionModelConfig,
     describe_image,
     guess_mime_type,
 )
@@ -44,6 +46,54 @@ def _write_image(tmp_path: Path, name: str = "fig.png", payload: bytes = b"fake-
 def _fake_completion(content: Any) -> SimpleNamespace:
     message = SimpleNamespace(content=content)
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_optional_vision_config_is_absent_only_when_all_values_are_missing() -> None:
+    assert VisionModelConfig.from_env({}, required=False) is None
+
+
+def test_optional_vision_config_rejects_partial_configuration() -> None:
+    with pytest.raises(RuntimeError, match="VISION_BASE_URL.*VISION_MODEL"):
+        VisionModelConfig.from_env(
+            {"VISION_API_KEY": "configured"},
+            required=False,
+        )
+
+
+def test_project_vision_client_reuses_sdk_client_and_closes_it(
+    tmp_path: Path,
+) -> None:
+    first = _write_image(tmp_path, "first.png")
+    second = _write_image(tmp_path, "second.png")
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = _fake_completion("analysis")
+
+    with patch(
+        "insight_agent.ingestion.vision.OpenAI",
+        return_value=mock_client,
+    ) as openai_cls:
+        client = OpenAICompatibleVisionClient(
+            VisionModelConfig(
+                api_key="key",
+                base_url="https://vision.example.invalid/v1",
+                model="model",
+            )
+        )
+        assert client.analyze_image(
+            str(first),
+            system_prompt="system",
+            user_prompt="first task",
+        ) == "analysis"
+        assert client.analyze_image(
+            str(second),
+            system_prompt="system",
+            user_prompt="second task",
+        ) == "analysis"
+        client.close()
+
+    openai_cls.assert_called_once()
+    assert mock_client.chat.completions.create.call_count == 2
+    mock_client.close.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

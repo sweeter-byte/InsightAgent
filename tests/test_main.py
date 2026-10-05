@@ -30,8 +30,12 @@ from insight_agent.routing.router import RetrievalRouter
 from insight_agent.web_search import (
     TavilySearchProvider,
     WebRetriever,
+    WebSearchConfigurationError,
     WebSearchError,
 )
+from insight_agent.indexing import Chunk
+from insight_agent.ingestion import SourceType
+from insight_agent.vision_retrieval import VisionRetriever
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +55,22 @@ class FakeApp:
         self.reply = reply
         self.raise_exc = raise_exc
         self.calls: list[str] = []
+        self.close_calls = 0
 
     def run(self, query: str) -> str:
         self.calls.append(query)
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.reply
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.fixture(autouse=True)
+def _disable_vision_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL"):
+        monkeypatch.delenv(name, raising=False)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +107,10 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
         app.research_coordinator.workflow.web_retriever.provider,
         TavilySearchProvider,
     )
-    assert app.research_coordinator.available_sources == set(RetrievalSource)
+    assert app.research_coordinator.available_sources == {
+        RetrievalSource.LOCAL,
+        RetrievalSource.WEB,
+    }
     assert app.research_coordinator.research_agent is app.research_agent
     assert isinstance(app.llm, LLMClient)
 
@@ -141,7 +158,6 @@ def test_build_app_omits_web_when_tavily_is_not_configured(
 
     assert app.research_coordinator.available_sources == {
         RetrievalSource.LOCAL,
-        RetrievalSource.VISION,
     }
     assert app.research_coordinator.workflow.web_retriever is None
 
@@ -184,6 +200,239 @@ def test_build_app_requires_explicit_reranker_model(
         cli._build_app()
 
 
+def _image_chunk(source: str) -> Chunk:
+    return Chunk(
+        id="chunk-image",
+        document_id="document-image",
+        content="A workflow diagram description",
+        source=source,
+        source_type=SourceType.IMAGE,
+        chunk_index=0,
+        start_char=0,
+        end_char=30,
+        metadata={"mime_type": "image/png"},
+    )
+
+
+def _set_vision_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VISION_API_KEY", "vision-key")
+    monkeypatch.setenv("VISION_BASE_URL", "https://vision.example.invalid/v1")
+    monkeypatch.setenv("VISION_MODEL", "vision-model")
+
+
+def test_vision_runtime_does_not_open_qdrant_without_vision_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "QdrantVectorStore",
+        lambda: (_ for _ in ()).throw(AssertionError("Qdrant must stay unopened")),
+    )
+
+    vision_retriever, shared_hybrid, cleanup = cli._build_vision_runtime(
+        cli.HybridRetrievalConfig(
+            dense_k=4,
+            sparse_k=4,
+            rerank_k=4,
+            final_top_k=2,
+            rrf_k=60,
+            reranker_model="reranker",
+        )
+    )
+
+    assert vision_retriever is None
+    assert shared_hybrid is None
+    assert cleanup is None
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_vision_runtime_omits_unavailable_original_images(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    indexed: bool,
+) -> None:
+    _set_vision_env(monkeypatch)
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def collection_exists(self) -> bool:
+            return True
+
+        def iter_chunks(self, *, source_types=None):  # noqa: ANN001, ANN201
+            assert source_types == {"image"}
+            return (
+                [_image_chunk(str(tmp_path / "deleted.png"))]
+                if indexed
+                else []
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    store = FakeStore()
+    monkeypatch.setattr(cli, "QdrantVectorStore", lambda: store)
+
+    vision_retriever, shared_hybrid, cleanup = cli._build_vision_runtime(
+        cli.HybridRetrievalConfig(
+            dense_k=4,
+            sparse_k=4,
+            rerank_k=4,
+            final_top_k=2,
+            rrf_k=60,
+            reranker_model="reranker",
+        )
+    )
+
+    assert vision_retriever is None
+    assert shared_hybrid is None
+    assert cleanup is None
+    assert store.closed is True
+
+
+def test_vision_runtime_builds_shared_hybrid_for_accessible_image(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_vision_env(monkeypatch)
+    image = tmp_path / "diagram.png"
+    image.write_bytes(b"image")
+
+    class FakeStore:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def collection_exists(self) -> bool:
+            return True
+
+        def iter_chunks(self, *, source_types=None):  # noqa: ANN001, ANN201
+            assert source_types == {"image"}
+            return [_image_chunk(str(image))]
+
+        def close(self) -> None:
+            self.closed = True
+
+    store = FakeStore()
+    shared_hybrid = object()
+    monkeypatch.setattr(cli, "QdrantVectorStore", lambda: store)
+    monkeypatch.setattr(
+        cli,
+        "build_default_hybrid_retriever",
+        lambda config, vector_store: shared_hybrid,
+    )
+    config = cli.HybridRetrievalConfig(
+        dense_k=4,
+        sparse_k=4,
+        rerank_k=4,
+        final_top_k=2,
+        rrf_k=60,
+        reranker_model="reranker",
+    )
+
+    vision_retriever, built_hybrid, cleanup = cli._build_vision_runtime(config)
+
+    assert isinstance(vision_retriever, VisionRetriever)
+    assert vision_retriever.hybrid_retriever is shared_hybrid
+    assert built_hybrid is shared_hybrid
+    assert store.closed is False
+    assert cleanup is not None
+    cleanup()
+    assert store.closed is True
+
+
+def test_build_app_shares_vision_hybrid_with_knowledge_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+    shared_hybrid = object()
+    vision_retriever = object()
+    monkeypatch.setattr(
+        cli,
+        "_build_vision_runtime",
+        lambda config: (vision_retriever, shared_hybrid, lambda: None),
+    )
+
+    app = cli._build_app()
+
+    workflow = app.research_coordinator.workflow
+    assert workflow.vision_retriever is vision_retriever
+    assert RetrievalSource.VISION in app.research_coordinator.available_sources
+    knowledge_tool = app.research_agent.registry.get("search_knowledge_base")
+    assert knowledge_tool._retriever is shared_hybrid
+
+
+def test_build_app_closes_lazy_knowledge_tool_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    class FakeKnowledgeTool:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def __call__(self, query: str, top_k: int = 5) -> str:
+            return ""
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+    knowledge_tool = FakeKnowledgeTool()
+    monkeypatch.setattr(
+        cli,
+        "build_default_knowledge_search_tool",
+        lambda config: knowledge_tool,
+    )
+
+    app = cli._build_app()
+    app.close()
+    app.close()
+
+    assert knowledge_tool.close_calls == 1
+
+
+def test_build_app_cleans_vision_resources_when_later_composition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    monkeypatch.setenv("WEB_SEARCH_TIMEOUT", "invalid")
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+    cleanup_calls: list[str] = []
+    monkeypatch.setattr(
+        cli,
+        "_build_vision_runtime",
+        lambda config: (object(), object(), lambda: cleanup_calls.append("closed")),
+    )
+
+    with pytest.raises(WebSearchConfigurationError, match="WEB_SEARCH_TIMEOUT"):
+        cli._build_app()
+
+    assert cleanup_calls == ["closed"]
+
+
 # ---------------------------------------------------------------------------
 # 2. one-shot mode
 # ---------------------------------------------------------------------------
@@ -199,6 +448,7 @@ def test_main_one_shot_prints_answer(
 
     assert rc == 0
     assert fake.calls == ["读取 notes.txt"]
+    assert fake.close_calls == 1
     assert "one-shot result" in capsys.readouterr().out
 
 

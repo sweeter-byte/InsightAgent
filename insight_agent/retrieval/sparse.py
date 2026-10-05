@@ -13,6 +13,7 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 from insight_agent.indexing import Chunk
+from insight_agent.ingestion.models import normalize_source_types
 from insight_agent.retrieval.models import RetrievalResult
 
 
@@ -92,12 +93,19 @@ class BM25Retriever:
         with self._snapshot_lock:
             self._snapshot = replacement
 
-    def retrieve(self, query: str, top_k: int = 5) -> list[RetrievalResult]:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        source_types: set[str] | None = None,
+    ) -> list[RetrievalResult]:
         """Rank the current snapshot with the same tokenizer used at build time."""
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must not be empty")
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
+        normalized_types = normalize_source_types(source_types)
 
         with self._snapshot_lock:
             snapshot = self._snapshot
@@ -108,8 +116,17 @@ class BM25Retriever:
         if not query_tokens:
             return []
         scores = snapshot.index.get_scores(query_tokens)
+        eligible_indices = (
+            range(len(snapshot.chunks))
+            if normalized_types is None
+            else (
+                index
+                for index, chunk in enumerate(snapshot.chunks)
+                if chunk.source_type.value in normalized_types
+            )
+        )
         ranked_indices = sorted(
-            range(len(snapshot.chunks)),
+            eligible_indices,
             key=lambda index: (-float(scores[index]), index),
         )[:top_k]
         return [

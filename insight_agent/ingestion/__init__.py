@@ -27,15 +27,25 @@ from insight_agent.ingestion.loaders.pdf_loader import load_pdf
 from insight_agent.ingestion.loaders.text_loader import load_text, load_text_file
 from insight_agent.ingestion.loaders.url_loader import load_url
 from insight_agent.ingestion.models import Document, SourceType
-from insight_agent.ingestion.vision import describe_image
+from insight_agent.ingestion.vision import (
+    OpenAICompatibleVisionClient,
+    VisionModelConfig,
+    analyze_image_with_prompt,
+    describe_image,
+    guess_mime_type,
+)
 
 __all__ = [
     "Document",
     "IngestionError",
+    "OpenAICompatibleVisionClient",
     "SourceType",
+    "VisionModelConfig",
+    "analyze_image_with_prompt",
     "describe_image",
     "documents_to_context",
     "infer_file_type",
+    "guess_mime_type",
     "ingest",
     "ingest_file",
     "ingest_text_file",
