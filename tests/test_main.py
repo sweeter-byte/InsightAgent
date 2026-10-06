@@ -21,6 +21,7 @@ import pytest
 from insight_agent import __main__ as cli
 from insight_agent.agent import AgentStepsExceeded, ResearchAgent
 from insight_agent.app import InsightAgent
+from insight_agent.evidence import EvidenceGrader, EvidenceGradingError
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
 from insight_agent.research import ResearchRoutingWorkflow
@@ -102,6 +103,7 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(app.research_coordinator.planner, ResearchPlanner)
     assert isinstance(app.research_coordinator.workflow, ResearchRoutingWorkflow)
     assert isinstance(app.research_coordinator.workflow.router, RetrievalRouter)
+    assert isinstance(app.research_coordinator.workflow.grader, EvidenceGrader)
     assert isinstance(app.research_coordinator.workflow.web_retriever, WebRetriever)
     assert isinstance(
         app.research_coordinator.workflow.web_retriever.provider,
@@ -139,6 +141,7 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
         is app.research_agent.llm
         is app.research_coordinator.planner.llm
         is app.research_coordinator.workflow.router.llm
+        is app.research_coordinator.workflow.grader.llm
     )
 
 
@@ -511,6 +514,22 @@ def test_main_one_shot_routing_error_returns_1(
     captured = capsys.readouterr()
     assert "[routing error]" in captured.err
     assert "unknown source" in captured.err
+
+
+def test_main_one_shot_evidence_grading_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureManager
+) -> None:
+    fake = FakeApp(
+        raise_exc=EvidenceGradingError("grader returned unknown Evidence ID")
+    )
+    monkeypatch.setattr(cli, "_build_app", lambda: fake)
+
+    rc = cli.main(["research", "topic"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[evidence grading error]" in captured.err
+    assert "unknown Evidence ID" in captured.err
 
 
 def test_main_one_shot_web_search_error_returns_1(

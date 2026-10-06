@@ -111,23 +111,24 @@ def test_retriever_filters_deduplicates_sources_and_forwards_context(
 
     result = retriever.retrieve(
         task=_task(),
+        query="Which storage limitations are visible?",
         objective="Inspect topology",
         constraints=["Use visible arrows only"],
     )
 
     assert hybrid.calls == [
         {
-            "query": "Do the branches converge?",
+            "query": "Which storage limitations are visible?",
             "top_k": 8,
             "source_types": {"image"},
         }
     ]
     assert [call["image_path"] for call in analyzer.calls] == [str(first), str(second)]
-    assert analyzer.calls[0]["question"] == "Do the branches converge?"
+    assert analyzer.calls[0]["question"] == "Which storage limitations are visible?"
     assert analyzer.calls[0]["objective"] == "Inspect topology"
     assert analyzer.calls[0]["constraints"] == ["Use visible arrows only"]
     assert result.task_id == "T2"
-    assert result.query == "Do the branches converge?"
+    assert result.query == "Which storage limitations are visible?"
     assert [analysis.source for analysis in result.analyses] == [str(first), str(second)]
     assert result.analyses[0].metadata == {"rank": "best"}
     assert result.failures == []
@@ -143,6 +144,18 @@ def test_no_candidates_is_distinct_from_analysis_failure() -> None:
     assert result.no_candidates is True
     assert result.analyses == []
     assert result.failures == []
+
+
+def test_retriever_defaults_to_task_question_when_query_is_omitted() -> None:
+    hybrid = FakeHybridRetriever([])
+
+    result = VisionRetriever(
+        hybrid_retriever=hybrid,
+        analyzer=FakeAnalyzer(),
+    ).retrieve(task=_task(), objective="Inspect", constraints=[])
+
+    assert hybrid.calls[0]["query"] == _task().question
+    assert result.query == _task().question
 
 
 @pytest.mark.parametrize(

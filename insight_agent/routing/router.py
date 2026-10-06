@@ -28,7 +28,10 @@ Rules:
 2. Choose one primary source. Do not split or rewrite the task.
 3. Do not execute retrieval, search, HTTP requests, tools, or vision analysis.
 4. Do not answer the research question and do not present facts as evidence.
-5. Return only one JSON object with no Markdown fences or extra text:
+5. Do not grade Evidence or decide whether the current Evidence is sufficient.
+6. Use the current retrieval_query and missing_information as routing context,
+   but do not rewrite them.
+7. Return only one JSON object with no Markdown fences or extra text:
    {"source": "local", "reason": "a non-empty explanation"}
 """
 
@@ -45,13 +48,30 @@ class RetrievalRouter:
         objective: str,
         constraints: list[str],
         available_sources: set[RetrievalSource],
+        retrieval_query: str | None = None,
+        missing_information: list[str] | None = None,
     ) -> RouteDecision:
         """Return a strictly parsed route decision for ``task``."""
-        self._validate_input(task, objective, constraints, available_sources)
+        if not isinstance(task, ResearchTask):
+            raise RoutingError("task must be a ResearchTask")
+        resolved_query = task.question if retrieval_query is None else retrieval_query
+        resolved_missing = (
+            [] if missing_information is None else missing_information
+        )
+        self._validate_input(
+            task,
+            objective,
+            constraints,
+            available_sources,
+            resolved_query,
+            resolved_missing,
+        )
         payload = {
             "objective": objective,
             "constraints": list(constraints),
             "task": {"id": task.id, "question": task.question},
+            "retrieval_query": resolved_query,
+            "missing_information": list(resolved_missing),
             "available_sources": sorted(source.value for source in available_sources),
         }
         messages: list[dict[str, Any]] = [
@@ -106,6 +126,8 @@ class RetrievalRouter:
         objective: str,
         constraints: list[str],
         available_sources: set[RetrievalSource],
+        retrieval_query: str,
+        missing_information: list[str],
     ) -> None:
         if not isinstance(task, ResearchTask):
             raise RoutingError("task must be a ResearchTask")
@@ -126,6 +148,15 @@ class RetrievalRouter:
             raise RoutingError(
                 "available_sources must contain only RetrievalSource values"
             )
+        if not isinstance(retrieval_query, str) or not retrieval_query.strip():
+            raise RoutingError("retrieval_query must be a non-empty string")
+        if not isinstance(missing_information, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in missing_information
+        ):
+            raise RoutingError(
+                "missing_information must be a list of non-empty strings"
+            )
 
     @staticmethod
     def _extract_text(response: Any) -> str:
@@ -134,4 +165,3 @@ class RetrievalRouter:
             return content if isinstance(content, str) else ""
         except (AttributeError, IndexError, TypeError):
             return ""
-

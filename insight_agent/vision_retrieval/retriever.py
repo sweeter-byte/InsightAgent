@@ -75,14 +75,18 @@ class VisionRetriever:
         self,
         *,
         task: ResearchTask,
+        query: str | None = None,
         objective: str,
         constraints: list[str],
     ) -> VisionRetrievalResult:
         if not isinstance(task, ResearchTask):
             raise VisionRetrievalError("task must be a ResearchTask")
+        effective_query = task.question if query is None else query
+        if not isinstance(effective_query, str) or not effective_query.strip():
+            raise VisionRetrievalError("query must be a non-empty string")
         try:
             candidates = self.hybrid_retriever.retrieve(
-                task.question,
+                effective_query,
                 top_k=self.candidate_k,
                 source_types={SourceType.IMAGE.value},
             )
@@ -95,7 +99,7 @@ class VisionRetriever:
         if not candidates:
             return VisionRetrievalResult(
                 task_id=task.id,
-                query=task.question,
+                query=effective_query,
                 analyses=[],
                 failures=[],
                 no_candidates=True,
@@ -118,7 +122,7 @@ class VisionRetriever:
             try:
                 content = self.analyzer.analyze(
                     image_path=source,
-                    question=task.question,
+                    question=effective_query,
                     objective=objective,
                     constraints=list(constraints),
                 )
@@ -142,7 +146,7 @@ class VisionRetriever:
 
         return VisionRetrievalResult(
             task_id=task.id,
-            query=task.question,
+            query=effective_query,
             analyses=analyses,
             failures=failures,
             no_candidates=False,

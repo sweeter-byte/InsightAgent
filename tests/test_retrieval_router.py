@@ -38,6 +38,8 @@ def _route(
     content: Any,
     *,
     available_sources: set[RetrievalSource] | None = None,
+    retrieval_query: str = "Which source should answer this?",
+    missing_information: list[str] | None = None,
 ) -> tuple[RouteDecision, FakeLLM]:
     llm = FakeLLM(content)
     router = RetrievalRouter(llm=llm)  # type: ignore[arg-type]
@@ -46,6 +48,8 @@ def _route(
         objective="Compare the available approaches",
         constraints=["Use current public information"],
         available_sources=available_sources or set(RetrievalSource),
+        retrieval_query=retrieval_query,
+        missing_information=list(missing_information or []),
     )
     return decision, llm
 
@@ -81,6 +85,8 @@ def test_router_calls_llm_without_tools_and_sends_only_routing_context() -> None
             "id": "T2",
             "question": "Which source should answer this?",
         },
+        "retrieval_query": "Which source should answer this?",
+        "missing_information": [],
         "available_sources": ["local", "vision", "web"],
     }
 
@@ -95,6 +101,53 @@ def test_router_prompt_defines_sources_and_forbids_execution() -> None:
     assert "do not execute" in prompt
     assert "do not answer" in prompt
     assert "do not split" in prompt
+    assert "do not grade evidence" in prompt
+
+
+def test_router_receives_retry_query_and_latest_missing_information() -> None:
+    _, llm = _route(
+        '{"source": "web", "reason": "Needs missing public details."}',
+        retrieval_query="structured memory deployment limitations",
+        missing_information=["Deployment limitations are missing"],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["task"]["question"] == "Which source should answer this?"
+    assert payload["retrieval_query"] == "structured memory deployment limitations"
+    assert payload["missing_information"] == [
+        "Deployment limitations are missing"
+    ]
+
+
+def test_router_defaults_new_context_for_existing_direct_callers() -> None:
+    llm = FakeLLM('{"source": "local", "reason": "Use indexed material."}')
+    router = RetrievalRouter(llm=llm)  # type: ignore[arg-type]
+    task = ResearchTask(id="T1", question="Original task question")
+
+    router.route(
+        task=task,
+        objective="Objective",
+        constraints=[],
+        available_sources={RetrievalSource.LOCAL},
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["retrieval_query"] == task.question
+    assert payload["missing_information"] == []
+
+
+def test_router_validates_task_before_resolving_legacy_query_default() -> None:
+    router = RetrievalRouter(
+        llm=FakeLLM('{"source": "local", "reason": "unused"}')
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(RoutingError, match="task must be a ResearchTask"):
+        router.route(
+            task=object(),  # type: ignore[arg-type]
+            objective="Objective",
+            constraints=[],
+            available_sources={RetrievalSource.LOCAL},
+        )
 
 
 def test_runtime_uses_current_task_id_instead_of_model_echo() -> None:
@@ -148,6 +201,9 @@ def test_router_rejects_source_outside_available_set() -> None:
         ({"constraints": "constraint"}, "constraints"),
         ({"available_sources": set()}, "available_sources"),
         ({"available_sources": {"local"}}, "RetrievalSource"),
+        ({"retrieval_query": "  "}, "retrieval_query"),
+        ({"missing_information": "missing"}, "missing_information"),
+        ({"missing_information": ["valid", ""]}, "missing_information"),
     ],
 )
 def test_router_rejects_invalid_runtime_input(
@@ -160,6 +216,8 @@ def test_router_rejects_invalid_runtime_input(
         "objective": "objective",
         "constraints": [],
         "available_sources": {RetrievalSource.LOCAL},
+        "retrieval_query": "question",
+        "missing_information": [],
     }
     arguments.update(overrides)
 

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from insight_agent.evidence import Evidence
+    from insight_agent.evidence import Evidence, EvidenceAssessment
     from insight_agent.retrieval import RetrievalResult
     from insight_agent.routing.models import RetrievalSource, RouteDecision
     from insight_agent.vision_retrieval.models import VisionRetrievalResult
@@ -51,11 +51,15 @@ class ResearchState:
     task_index: int = 0
     current_task: ResearchTask | None = None
     current_route: RouteDecision | None = None
+    retrieval_query: str | None = None
     route_decisions: list[RouteDecision] = field(default_factory=list)
     local_results: dict[str, list[RetrievalResult]] = field(default_factory=dict)
     web_results: dict[str, WebRetrievalResult] = field(default_factory=dict)
     vision_results: dict[str, VisionRetrievalResult] = field(default_factory=dict)
     evidence_pool: dict[str, list[Evidence]] = field(default_factory=dict)
+    evidence_assessments: dict[str, list[EvidenceAssessment]] = field(
+        default_factory=dict
+    )
 
 
 def validate_research_plan(plan: ResearchPlan) -> None:

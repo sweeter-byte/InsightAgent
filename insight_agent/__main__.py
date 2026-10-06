@@ -20,6 +20,7 @@ from typing import Optional
 
 from insight_agent.agent import AgentStepsExceeded, ResearchAgent
 from insight_agent.app import InsightAgent
+from insight_agent.evidence import EvidenceGrader, EvidenceGradingError
 from insight_agent.indexing import QdrantVectorStore
 from insight_agent.ingestion import (
     IngestionError,
@@ -118,6 +119,7 @@ def _compose_app(
     )
     planner = ResearchPlanner(llm=llm)
     retrieval_router = RetrievalRouter(llm=llm)
+    evidence_grader = EvidenceGrader(llm=llm)
     web_config = WebSearchConfig.from_env()
     web_retriever: WebRetriever | None = None
     available_sources = {
@@ -141,6 +143,7 @@ def _compose_app(
         local_retriever=knowledge_search_tool,
         web_retriever=web_retriever,
         vision_retriever=vision_retriever,
+        grader=evidence_grader,
     )
     research_coordinator = ResearchCoordinator(
         planner=planner,
@@ -253,6 +256,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         return 1
     except RoutingError as exc:
         print(f"[routing error] {exc}", file=sys.stderr)
+        return 1
+    except EvidenceGradingError as exc:
+        print(f"[evidence grading error] {exc}", file=sys.stderr)
         return 1
     except WebSearchError as exc:
         print(f"[web search error] {exc}", file=sys.stderr)

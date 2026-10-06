@@ -6,7 +6,12 @@ from typing import Any
 
 import pytest
 
-from insight_agent.evidence import EvidenceCollector
+from insight_agent.evidence import (
+    Evidence,
+    EvidenceAssessment,
+    EvidenceCollector,
+    EvidenceCoverage,
+)
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
 from insight_agent.research.workflow import ResearchRoutingWorkflow
 from insight_agent.retrieval import RetrievalResult
@@ -50,6 +55,8 @@ class FakeRouter:
         objective: str,
         constraints: list[str],
         available_sources: set[RetrievalSource],
+        retrieval_query: str,
+        missing_information: list[str],
     ) -> RouteDecision:
         self.calls.append(
             {
@@ -57,6 +64,8 @@ class FakeRouter:
                 "objective": objective,
                 "constraints": list(constraints),
                 "available_sources": set(available_sources),
+                "retrieval_query": retrieval_query,
+                "missing_information": list(missing_information),
             }
         )
         if not self.sources:
@@ -67,6 +76,61 @@ class FakeRouter:
             source=source,
             reason=f"Route {task.id} to {source.value}",
         )
+
+
+class FakeEvidenceGrader:
+    def __init__(
+        self,
+        assessments: list[EvidenceAssessment] | None = None,
+    ) -> None:
+        self.assessments = list(assessments or [])
+        self.calls: list[dict[str, Any]] = []
+
+    def grade(
+        self,
+        task: ResearchTask,
+        objective: str,
+        constraints: list[str],
+        evidence: list[Evidence],
+    ) -> EvidenceAssessment:
+        self.calls.append(
+            {
+                "task": task,
+                "objective": objective,
+                "constraints": list(constraints),
+                "evidence": list(evidence),
+            }
+        )
+        if self.assessments:
+            return self.assessments.pop(0)
+        return EvidenceAssessment(
+            task_id=task.id,
+            evidence_judgments=[],
+            coverage=EvidenceCoverage.COMPLETE,
+            sufficient=True,
+            missing_information=[],
+            reason="Enough for this workflow test.",
+        )
+
+
+def _assessment(
+    *,
+    task_id: str = "T1",
+    sufficient: bool,
+    missing_information: list[str] | None = None,
+) -> EvidenceAssessment:
+    return EvidenceAssessment(
+        task_id=task_id,
+        evidence_judgments=[],
+        coverage=(
+            EvidenceCoverage.COMPLETE
+            if sufficient
+            else EvidenceCoverage.PARTIAL
+        ),
+        sufficient=sufficient,
+        missing_information=list(missing_information or []),
+        reason="Sufficient." if sufficient else "More evidence is needed.",
+    )
 
 
 class FakeWebRetriever:
@@ -138,19 +202,21 @@ class FakeVisionRetriever:
         self,
         *,
         task: ResearchTask,
+        query: str | None = None,
         objective: str,
         constraints: list[str],
     ) -> VisionRetrievalResult:
         self.calls.append(
             {
                 "task": task,
+                "query": query,
                 "objective": objective,
                 "constraints": list(constraints),
             }
         )
         return VisionRetrievalResult(
             task_id=task.id,
-            query=task.question,
+            query=query or task.question,
             analyses=[
                 VisionAnalysis(
                     source=f"{task.id}.png",
@@ -169,6 +235,7 @@ class RecordingWorkflow(ResearchRoutingWorkflow):
         web_retriever: FakeWebRetriever | None = None,
         vision_retriever: FakeVisionRetriever | None = None,
         local_retriever: FakeLocalRetriever | None = None,
+        grader: FakeEvidenceGrader | None = None,
     ) -> None:
         self.entries: list[str] = []
         super().__init__(
@@ -176,6 +243,7 @@ class RecordingWorkflow(ResearchRoutingWorkflow):
             local_retriever=local_retriever or FakeLocalRetriever(),
             web_retriever=web_retriever,
             vision_retriever=vision_retriever,
+            grader=grader or FakeEvidenceGrader(),
         )
 
     def local_entry(self, state: ResearchState) -> dict[str, Any]:
@@ -199,6 +267,7 @@ class OrderedWorkflow(ResearchRoutingWorkflow):
         local_retriever: FakeLocalRetriever | None = None,
         web_retriever: FakeWebRetriever | None = None,
         vision_retriever: FakeVisionRetriever | None = None,
+        grader: FakeEvidenceGrader | None = None,
     ) -> None:
         self.events: list[str] = []
         super().__init__(
@@ -206,6 +275,7 @@ class OrderedWorkflow(ResearchRoutingWorkflow):
             local_retriever=local_retriever,
             web_retriever=web_retriever,
             vision_retriever=vision_retriever,
+            grader=grader or FakeEvidenceGrader(),
         )
 
     def local_entry(self, state: ResearchState) -> dict[str, Any]:
@@ -223,6 +293,14 @@ class OrderedWorkflow(ResearchRoutingWorkflow):
     def collect_evidence(self, state: ResearchState) -> dict[str, Any]:
         self.events.append("collect_evidence")
         return super().collect_evidence(state)
+
+    def grade_evidence(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("grade_evidence")
+        return super().grade_evidence(state)
+
+    def prepare_retry(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("prepare_retry")
+        return super().prepare_retry(state)
 
     def advance_task(self, state: ResearchState) -> dict[str, Any]:
         self.events.append("advance_task")
@@ -250,11 +328,16 @@ def test_research_state_keeps_compatible_routing_defaults() -> None:
     assert state.web_results == {}
     assert state.vision_results == {}
     assert state.evidence_pool == {}
+    assert state.evidence_assessments == {}
+    assert state.retrieval_query is None
 
 
 def test_select_task_uses_index_and_clears_previous_route() -> None:
     router = FakeRouter([RetrievalSource.LOCAL])
-    workflow = ResearchRoutingWorkflow(router=router)  # type: ignore[arg-type]
+    workflow = ResearchRoutingWorkflow(
+        router=router,  # type: ignore[arg-type]
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
     state = _state(task_count=2)
     state.task_index = 1
     state.current_route = RouteDecision(
@@ -265,7 +348,99 @@ def test_select_task_uses_index_and_clears_previous_route() -> None:
 
     update = workflow.select_task(state)
 
-    assert update == {"current_task": state.plan.tasks[1], "current_route": None}
+    assert update == {
+        "current_task": state.plan.tasks[1],
+        "current_route": None,
+        "retrieval_query": state.plan.tasks[1].question,
+    }
+
+
+def test_grade_evidence_appends_assessment_and_reads_entire_pool() -> None:
+    grader = FakeEvidenceGrader([_assessment(sufficient=True)])
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([]),  # type: ignore[arg-type]
+        grader=grader,  # type: ignore[arg-type]
+    )
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.evidence_pool = {"T1": [EvidenceCollector().collect_local(
+        "T1", FakeLocalRetriever().results
+    )[0]]}
+    previous = _assessment(
+        sufficient=False,
+        missing_information=["Earlier gap"],
+    )
+    state.evidence_assessments = {"T1": [previous]}
+
+    update = workflow.grade_evidence(state)
+
+    assert grader.calls[0]["evidence"] == state.evidence_pool["T1"]
+    assert update["evidence_assessments"] == {
+        "T1": [previous, _assessment(sufficient=True)]
+    }
+
+
+@pytest.mark.parametrize(
+    ("assessments", "expected"),
+    [
+        ([_assessment(sufficient=True)], "advance_task"),
+        (
+            [_assessment(sufficient=False, missing_information=["gap"])],
+            "prepare_retry",
+        ),
+        (
+            [
+                _assessment(sufficient=False, missing_information=["gap 1"]),
+                _assessment(sufficient=False, missing_information=["gap 2"]),
+            ],
+            "advance_task",
+        ),
+    ],
+)
+def test_choose_after_grading_is_sufficient_and_budget_aware(
+    assessments: list[EvidenceAssessment],
+    expected: str,
+) -> None:
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([]),  # type: ignore[arg-type]
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.evidence_assessments = {"T1": assessments}
+
+    assert workflow.choose_after_grading(state) == expected
+
+
+def test_prepare_retry_builds_query_from_question_and_missing_information() -> None:
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([]),  # type: ignore[arg-type]
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.evidence_assessments = {
+        "T1": [
+            _assessment(
+                sufficient=False,
+                missing_information=["Missing limitation", "Missing cost"],
+            )
+        ]
+    }
+
+    update = workflow.prepare_retry(state)
+
+    assert update["retrieval_query"] == (
+        "Original task:\nQuestion 1\n\n"
+        "Missing information:\n- Missing limitation\n- Missing cost"
+    )
+
+
+def test_advance_task_clears_transient_query() -> None:
+    state = _state()
+    state.retrieval_query = "focused query"
+
+    assert ResearchRoutingWorkflow.advance_task(state)["retrieval_query"] is None
 
 
 @pytest.mark.parametrize("source", list(RetrievalSource))
@@ -292,6 +467,7 @@ def test_web_branch_writes_task_scoped_result() -> None:
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.WEB]),  # type: ignore[arg-type]
         web_retriever=web_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -307,6 +483,7 @@ def test_local_branch_writes_task_scoped_raw_results() -> None:
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
         local_retriever=local_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -319,7 +496,8 @@ def test_local_branch_writes_task_scoped_raw_results() -> None:
 
 def test_local_branch_requires_configured_retriever() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.LOCAL])
+        router=FakeRouter([RetrievalSource.LOCAL]),
+        grader=FakeEvidenceGrader(),
     )
 
     with pytest.raises(RoutingError, match="Local Retrieval is not configured"):
@@ -339,7 +517,12 @@ def test_each_source_collects_evidence_before_advancing(
 
     final_state = workflow.run(_state())
 
-    assert workflow.events == [source.value, "collect_evidence", "advance_task"]
+    assert workflow.events == [
+        source.value,
+        "collect_evidence",
+        "grade_evidence",
+        "advance_task",
+    ]
     assert len(final_state.evidence_pool["T1"]) == 1
     evidence = final_state.evidence_pool["T1"][0]
     assert evidence.task_id == "T1"
@@ -361,6 +544,7 @@ def test_collect_evidence_deduplicates_an_existing_exact_id() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
         router=FakeRouter([]),
         local_retriever=FakeLocalRetriever(),
+        grader=FakeEvidenceGrader(),
     )
 
     update = workflow.collect_evidence(state)
@@ -388,7 +572,7 @@ def test_empty_source_result_creates_an_empty_task_evidence_pool(
             task = kwargs["task"]
             return VisionRetrievalResult(
                 task_id=task.id,
-                query=task.question,
+                query=kwargs["query"],
                 analyses=[],
                 failures=[],
                 no_candidates=True,
@@ -399,6 +583,7 @@ def test_empty_source_result_creates_an_empty_task_evidence_pool(
         local_retriever=FakeLocalRetriever([]),
         web_retriever=EmptyWebRetriever(),
         vision_retriever=EmptyVisionRetriever(),
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -411,6 +596,7 @@ def test_vision_branch_writes_task_scoped_result_with_plan_context() -> None:
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.VISION]),  # type: ignore[arg-type]
         vision_retriever=vision_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -439,6 +625,7 @@ def test_non_web_branches_do_not_call_web_retriever(
         vision_retriever=(
             FakeVisionRetriever() if source is RetrievalSource.VISION else None
         ),
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -457,6 +644,7 @@ def test_non_vision_branches_do_not_call_vision_retriever(
         local_retriever=FakeLocalRetriever(),
         web_retriever=FakeWebRetriever() if source is RetrievalSource.WEB else None,
         vision_retriever=vision_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -470,6 +658,7 @@ def test_multiple_web_tasks_accumulate_results_and_reach_end() -> None:
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.WEB, RetrievalSource.WEB]),  # type: ignore[arg-type]
         web_retriever=web_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state(task_count=2))
@@ -487,6 +676,7 @@ def test_multiple_vision_tasks_accumulate_results_and_reach_end() -> None:
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.VISION, RetrievalSource.VISION]),  # type: ignore[arg-type]
         vision_retriever=vision_retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state(task_count=2))
@@ -499,7 +689,8 @@ def test_multiple_vision_tasks_accumulate_results_and_reach_end() -> None:
 
 def test_web_branch_requires_configured_retriever() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.WEB])
+        router=FakeRouter([RetrievalSource.WEB]),
+        grader=FakeEvidenceGrader(),
     )
 
     with pytest.raises(WebSearchConfigurationError, match="not configured"):
@@ -508,7 +699,8 @@ def test_web_branch_requires_configured_retriever() -> None:
 
 def test_vision_branch_requires_configured_retriever() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.VISION])
+        router=FakeRouter([RetrievalSource.VISION]),
+        grader=FakeEvidenceGrader(),
     )
 
     with pytest.raises(VisionRetrievalError, match="not configured"):
@@ -540,6 +732,7 @@ def test_vision_branch_rejects_result_for_a_different_task(
     workflow = ResearchRoutingWorkflow(
         router=FakeRouter([RetrievalSource.VISION]),  # type: ignore[arg-type]
         vision_retriever=MismatchedVisionRetriever(),
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     with pytest.raises(RoutingError, match=message):
@@ -551,6 +744,7 @@ def test_one_task_produces_exactly_one_decision_and_ends_cleanly() -> None:
     workflow = ResearchRoutingWorkflow(
         router=router,  # type: ignore[arg-type]
         local_retriever=FakeLocalRetriever(),
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
     )
 
     final_state = workflow.run(_state())
@@ -560,6 +754,159 @@ def test_one_task_produces_exactly_one_decision_and_ends_cleanly() -> None:
     assert final_state.task_index == 1
     assert final_state.current_task is None
     assert final_state.current_route is None
+
+
+def test_insufficient_evidence_retries_through_router_then_accumulates() -> None:
+    router = FakeRouter([RetrievalSource.LOCAL, RetrievalSource.WEB])
+    grader = FakeEvidenceGrader(
+        [
+            _assessment(
+                sufficient=False,
+                missing_information=["Structured-memory limitations"],
+            ),
+            _assessment(sufficient=True),
+        ]
+    )
+    local_retriever = FakeLocalRetriever()
+    web_retriever = FakeWebRetriever()
+    workflow = OrderedWorkflow(
+        router,
+        local_retriever=local_retriever,
+        web_retriever=web_retriever,
+        grader=grader,
+    )
+
+    final_state = workflow.run(_state())
+
+    retry_query = (
+        "Original task:\nQuestion 1\n\n"
+        "Missing information:\n- Structured-memory limitations"
+    )
+    assert workflow.events == [
+        "local",
+        "collect_evidence",
+        "grade_evidence",
+        "prepare_retry",
+        "web",
+        "collect_evidence",
+        "grade_evidence",
+        "advance_task",
+    ]
+    assert [call["retrieval_query"] for call in router.calls] == [
+        "Question 1",
+        retry_query,
+    ]
+    assert router.calls[0]["missing_information"] == []
+    assert router.calls[1]["missing_information"] == [
+        "Structured-memory limitations"
+    ]
+    assert local_retriever.calls == [("Question 1", None)]
+    assert web_retriever.calls == [retry_query]
+    assert [decision.source for decision in final_state.route_decisions] == [
+        RetrievalSource.LOCAL,
+        RetrievalSource.WEB,
+    ]
+    assert len(final_state.evidence_pool["T1"]) == 2
+    assert [len(call["evidence"]) for call in grader.calls] == [1, 2]
+    assert len(final_state.evidence_assessments["T1"]) == 2
+    assert final_state.evidence_assessments["T1"][-1].sufficient is True
+
+
+def test_budget_exhaustion_keeps_last_assessment_insufficient() -> None:
+    router = FakeRouter([RetrievalSource.LOCAL, RetrievalSource.LOCAL])
+    grader = FakeEvidenceGrader(
+        [
+            _assessment(sufficient=False, missing_information=["gap 1"]),
+            _assessment(sufficient=False, missing_information=["gap 2"]),
+        ]
+    )
+    workflow = ResearchRoutingWorkflow(
+        router=router,  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=grader,  # type: ignore[arg-type]
+    )
+
+    final_state = workflow.run(_state())
+
+    assert len(router.calls) == 2
+    assert len(final_state.route_decisions) == 2
+    assert len(final_state.evidence_assessments["T1"]) == 2
+    assert final_state.evidence_assessments["T1"][-1].sufficient is False
+    assert final_state.evidence_assessments["T1"][-1].missing_information == [
+        "gap 2"
+    ]
+    assert len(final_state.evidence_pool["T1"]) == 1
+    assert final_state.task_index == 1
+
+
+def test_new_task_resets_query_after_previous_task_retry() -> None:
+    router = FakeRouter(
+        [
+            RetrievalSource.LOCAL,
+            RetrievalSource.LOCAL,
+            RetrievalSource.LOCAL,
+        ]
+    )
+    grader = FakeEvidenceGrader(
+        [
+            _assessment(sufficient=False, missing_information=["T1 gap"]),
+            _assessment(sufficient=True),
+            _assessment(task_id="T2", sufficient=True),
+        ]
+    )
+    workflow = ResearchRoutingWorkflow(
+        router=router,  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=grader,  # type: ignore[arg-type]
+    )
+
+    final_state = workflow.run(_state(task_count=2))
+
+    assert [call["retrieval_query"] for call in router.calls] == [
+        "Question 1",
+        "Original task:\nQuestion 1\n\nMissing information:\n- T1 gap",
+        "Question 2",
+    ]
+    assert router.calls[-1]["missing_information"] == []
+    assert [decision.task_id for decision in final_state.route_decisions] == [
+        "T1",
+        "T1",
+        "T2",
+    ]
+
+
+@pytest.mark.parametrize("source", list(RetrievalSource))
+def test_each_retriever_uses_current_retrieval_query(
+    source: RetrievalSource,
+) -> None:
+    local = FakeLocalRetriever()
+    web = FakeWebRetriever()
+    vision = FakeVisionRetriever()
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([]),  # type: ignore[arg-type]
+        local_retriever=local,
+        web_retriever=web,
+        vision_retriever=vision,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.current_route = RouteDecision(
+        task_id="T1",
+        source=source,
+        reason="test current query",
+    )
+    state.retrieval_query = "Focused retry query"
+
+    if source is RetrievalSource.LOCAL:
+        workflow.local_entry(state)
+        assert local.calls == [("Focused retry query", None)]
+    elif source is RetrievalSource.WEB:
+        workflow.web_entry(state)
+        assert web.calls == ["Focused retry query"]
+    else:
+        workflow.vision_entry(state)
+        assert vision.calls[0]["query"] == "Focused retry query"
 
 
 def test_multiple_tasks_are_routed_in_plan_order() -> None:
@@ -596,7 +943,8 @@ def test_multiple_tasks_are_routed_in_plan_order() -> None:
 
 def test_workflow_rejects_state_without_plan() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.LOCAL])
+        router=FakeRouter([RetrievalSource.LOCAL]),
+        grader=FakeEvidenceGrader(),
     )
 
     with pytest.raises(RoutingError, match="plan"):
@@ -610,7 +958,8 @@ def test_workflow_rejects_state_without_plan() -> None:
 
 def test_workflow_rejects_empty_available_sources() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.LOCAL])
+        router=FakeRouter([RetrievalSource.LOCAL]),
+        grader=FakeEvidenceGrader(),
     )
 
     with pytest.raises(RoutingError, match="available_sources"):
@@ -619,7 +968,8 @@ def test_workflow_rejects_empty_available_sources() -> None:
 
 def test_workflow_rejects_router_decision_outside_available_sources() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.WEB])
+        router=FakeRouter([RetrievalSource.WEB]),
+        grader=FakeEvidenceGrader(),
     )
     state = ResearchState(
         query="query",
@@ -633,10 +983,70 @@ def test_workflow_rejects_router_decision_outside_available_sources() -> None:
 
 def test_select_task_reports_out_of_range_index() -> None:
     workflow = ResearchRoutingWorkflow(  # type: ignore[arg-type]
-        router=FakeRouter([RetrievalSource.LOCAL])
+        router=FakeRouter([RetrievalSource.LOCAL]),
+        grader=FakeEvidenceGrader(),
     )
     state = _state()
     state.task_index = 1
 
     with pytest.raises(RoutingError, match="task_index"):
         workflow.select_task(state)
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_workflow_rejects_invalid_retrieval_round_budget(value: Any) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        ResearchRoutingWorkflow(
+            router=FakeRouter([]),  # type: ignore[arg-type]
+            grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+            max_retrieval_rounds=value,
+        )
+
+
+def test_custom_retrieval_round_budget_allows_a_third_round() -> None:
+    router = FakeRouter([RetrievalSource.LOCAL] * 3)
+    grader = FakeEvidenceGrader(
+        [
+            _assessment(sufficient=False, missing_information=["gap 1"]),
+            _assessment(sufficient=False, missing_information=["gap 2"]),
+            _assessment(sufficient=True),
+        ]
+    )
+    workflow = ResearchRoutingWorkflow(
+        router=router,  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=grader,  # type: ignore[arg-type]
+        max_retrieval_rounds=3,
+    )
+
+    final_state = workflow.run(_state())
+
+    assert len(final_state.route_decisions) == 3
+    assert len(final_state.evidence_assessments["T1"]) == 3
+    assert final_state.evidence_assessments["T1"][-1].sufficient is True
+
+
+def test_route_history_must_match_completed_assessment_rounds() -> None:
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+    state = _state()
+    state.current_task = state.plan.tasks[0]
+    state.current_route = RouteDecision(
+        task_id="T1",
+        source=RetrievalSource.LOCAL,
+        reason="new round",
+    )
+    state.retrieval_query = "Question 1"
+    state.route_decisions = [
+        RouteDecision(
+            task_id="T1",
+            source=RetrievalSource.LOCAL,
+            reason="ungraded prior round",
+        )
+    ]
+
+    with pytest.raises(RoutingError, match="assessment history"):
+        workflow.local_entry(state)
