@@ -27,16 +27,6 @@ class FakePlanner:
         return self.result
 
 
-class FakeResearchAgent:
-    def __init__(self, answer: str = "research answer") -> None:
-        self.answer = answer
-        self.calls: list[str] = []
-
-    def run(self, query: str) -> str:
-        self.calls.append(query)
-        return self.answer
-
-
 class FakeWorkflow:
     def __init__(self) -> None:
         self.calls: list[ResearchState] = []
@@ -62,6 +52,7 @@ class FakeWorkflow:
             available_sources=set(state.available_sources),
             task_index=len(state.plan.tasks),
             route_decisions=decisions,
+            final_output="# 研究结果\n",
         )
 
 
@@ -84,21 +75,19 @@ def _plan() -> ResearchPlan:
     )
 
 
-def test_coordinator_saves_state_and_delegates_to_existing_agent() -> None:
+def test_coordinator_saves_state_and_returns_workflow_final_output() -> None:
     plan = _plan()
     planner = FakePlanner(plan)
-    agent = FakeResearchAgent()
     workflow = FakeWorkflow()
     coordinator = ResearchCoordinator(
         planner=planner,  # type: ignore[arg-type]
         workflow=workflow,  # type: ignore[arg-type]
-        research_agent=agent,  # type: ignore[arg-type]
         available_sources={RetrievalSource.LOCAL, RetrievalSource.WEB},
     )
 
     answer = coordinator.run("研究 Agent Memory")
 
-    assert answer == "research answer"
+    assert answer == "# 研究结果\n"
     assert planner.calls == ["研究 Agent Memory"]
     assert len(workflow.calls) == 1
     initial_state = workflow.calls[0]
@@ -115,23 +104,16 @@ def test_coordinator_saves_state_and_delegates_to_existing_agent() -> None:
         "T1",
         "T2",
     ]
-    assert len(agent.calls) == 1
 
 
 def test_execution_context_preserves_query_and_structured_plan() -> None:
-    planner = FakePlanner(_plan())
-    agent = FakeResearchAgent()
-    workflow = FakeWorkflow()
-    coordinator = ResearchCoordinator(
-        planner=planner,  # type: ignore[arg-type]
-        workflow=workflow,  # type: ignore[arg-type]
-        research_agent=agent,  # type: ignore[arg-type]
+    state = ResearchState(
+        query="研究 Agent Memory",
+        plan=_plan(),
         available_sources={RetrievalSource.LOCAL, RetrievalSource.WEB},
     )
 
-    coordinator.run("研究 Agent Memory")
-
-    context = agent.calls[0]
+    context = format_research_context(FakeWorkflow().run(state))
     assert "研究 Agent Memory" in context
     assert '"objective": "Compare Agent Memory designs"' in context
     assert '"id": "T1"' in context
@@ -197,7 +179,7 @@ def test_execution_context_includes_task_scoped_vision_retrieval_material() -> N
     assert '"no_candidates": false' in context
 
 
-def test_coordinator_calls_existing_research_agent_once_after_workflow() -> None:
+def test_coordinator_returns_only_after_planning_and_workflow() -> None:
     events: list[str] = []
 
     class OrderedPlanner(FakePlanner):
@@ -210,18 +192,12 @@ def test_coordinator_calls_existing_research_agent_once_after_workflow() -> None
             events.append("workflow")
             return super().run(state)
 
-    class OrderedAgent(FakeResearchAgent):
-        def run(self, query: str) -> str:
-            events.append("agent")
-            return super().run(query)
-
     coordinator = ResearchCoordinator(
         planner=OrderedPlanner(_plan()),  # type: ignore[arg-type]
         workflow=OrderedWorkflow(),  # type: ignore[arg-type]
-        research_agent=OrderedAgent(),  # type: ignore[arg-type]
         available_sources=set(RetrievalSource),
     )
 
     coordinator.run("query")
 
-    assert events == ["planner", "workflow", "agent"]
+    assert events == ["planner", "workflow"]

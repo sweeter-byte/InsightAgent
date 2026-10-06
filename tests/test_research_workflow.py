@@ -11,9 +11,15 @@ from insight_agent.evidence import (
     EvidenceAssessment,
     EvidenceCollector,
     EvidenceCoverage,
+    EvidenceJudgment,
+    EvidenceQuality,
+    EvidenceRelevance,
 )
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
-from insight_agent.research.workflow import ResearchRoutingWorkflow
+from insight_agent.reporting import Claim
+from insight_agent.research.workflow import (
+    ResearchRoutingWorkflow as BaseResearchRoutingWorkflow,
+)
 from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing import RetrievalSource, RouteDecision, RoutingError
 from insight_agent.ingestion import Document, SourceType
@@ -102,15 +108,48 @@ class FakeEvidenceGrader:
             }
         )
         if self.assessments:
-            return self.assessments.pop(0)
-        return EvidenceAssessment(
-            task_id=task.id,
-            evidence_judgments=[],
-            coverage=EvidenceCoverage.COMPLETE,
-            sufficient=True,
-            missing_information=[],
-            reason="Enough for this workflow test.",
-        )
+            assessment = self.assessments.pop(0)
+        elif evidence:
+            assessment = EvidenceAssessment(
+                task_id=task.id,
+                evidence_judgments=[],
+                coverage=EvidenceCoverage.COMPLETE,
+                sufficient=True,
+                missing_information=[],
+                reason="Enough for this workflow test.",
+            )
+        else:
+            assessment = EvidenceAssessment(
+                task_id=task.id,
+                evidence_judgments=[],
+                coverage=EvidenceCoverage.INSUFFICIENT,
+                sufficient=False,
+                missing_information=["No Evidence was retrieved."],
+                reason="No Evidence is available.",
+            )
+        if evidence and not assessment.evidence_judgments:
+            assessment.evidence_judgments = [
+                EvidenceJudgment(
+                    evidence_id=item.id,
+                    relevance=EvidenceRelevance.RELEVANT,
+                    quality=EvidenceQuality.STRONG,
+                    reason="Usable workflow fixture.",
+                )
+                for item in evidence
+            ]
+        return assessment
+
+    def generate_section(self, **kwargs: Any) -> list[Claim]:
+        task = kwargs["task"]
+        evidence = kwargs["evidence"]
+        return [
+            Claim(
+                id=f"{task.id}-C1",
+                task_id=task.id,
+                text=f"Report result for {task.id}.",
+                evidence_ids=[item.id for item in evidence],
+            )
+        ]
 
 
 def _assessment(
@@ -131,6 +170,14 @@ def _assessment(
         missing_information=list(missing_information or []),
         reason="Sufficient." if sufficient else "More evidence is needed.",
     )
+
+
+class ResearchRoutingWorkflow(BaseResearchRoutingWorkflow):
+    """Test adapter that explicitly injects the offline report fake."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("report_generator", kwargs["grader"])
+        super().__init__(*args, **kwargs)
 
 
 class FakeWebRetriever:
@@ -307,6 +354,10 @@ class OrderedWorkflow(ResearchRoutingWorkflow):
         self.events.append("advance_task")
         return super().advance_task(state)
 
+    def generate_report(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("generate_report")
+        return super().generate_report(state)
+
 
 def _state(task_count: int = 1) -> ResearchState:
     return ResearchState(
@@ -376,9 +427,10 @@ def test_grade_evidence_appends_assessment_and_reads_entire_pool() -> None:
     update = workflow.grade_evidence(state)
 
     assert grader.calls[0]["evidence"] == state.evidence_pool["T1"]
-    assert update["evidence_assessments"] == {
-        "T1": [previous, _assessment(sufficient=True)]
-    }
+    history = update["evidence_assessments"]["T1"]
+    assert history[0] is previous
+    assert history[-1].sufficient is True
+    assert len(history[-1].evidence_judgments) == 1
 
 
 @pytest.mark.parametrize(
@@ -523,6 +575,7 @@ def test_each_source_collects_evidence_before_advancing(
         "collect_evidence",
         "grade_evidence",
         "advance_task",
+        "generate_report",
     ]
     assert len(final_state.evidence_pool["T1"]) == 1
     evidence = final_state.evidence_pool["T1"][0]
@@ -580,7 +633,7 @@ def test_empty_source_result_creates_an_empty_task_evidence_pool(
             )
 
     workflow = ResearchRoutingWorkflow(
-        router=FakeRouter([source]),  # type: ignore[arg-type]
+        router=FakeRouter([source, source]),  # type: ignore[arg-type]
         local_retriever=FakeLocalRetriever([]),
         web_retriever=EmptyWebRetriever(),
         vision_retriever=EmptyVisionRetriever(),
@@ -824,6 +877,7 @@ def test_insufficient_evidence_retries_through_router_then_accumulates() -> None
         "collect_evidence",
         "grade_evidence",
         "advance_task",
+        "generate_report",
     ]
     assert [call["retrieval_query"] for call in router.calls] == [
         task_question,

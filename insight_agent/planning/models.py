@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from insight_agent.evidence import Evidence, EvidenceAssessment
+    from insight_agent.reporting import StructuredReport
     from insight_agent.retrieval import RetrievalResult
     from insight_agent.routing.models import RetrievalSource, RouteDecision
     from insight_agent.vision_retrieval.models import VisionRetrievalResult
@@ -60,6 +61,8 @@ class ResearchState:
     evidence_assessments: dict[str, list[EvidenceAssessment]] = field(
         default_factory=dict
     )
+    report: StructuredReport | None = None
+    final_output: str | None = None
 
 
 def validate_research_plan(plan: ResearchPlan) -> None:

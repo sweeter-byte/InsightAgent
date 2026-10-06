@@ -8,6 +8,16 @@ from langgraph.graph import END, START, StateGraph
 
 from insight_agent.evidence import Evidence, EvidenceAssessment, EvidenceCollector
 from insight_agent.planning.models import ResearchPlan, ResearchState, ResearchTask
+from insight_agent.reporting import (
+    Claim,
+    MarkdownReportRenderer,
+    ReportGenerationError,
+    ReportSection,
+    StructuredReport,
+    assemble_report,
+    select_report_candidates,
+    validate_claims,
+)
 from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing.models import (
     RetrievalSource,
@@ -78,6 +88,20 @@ class TaskEvidenceGrader(Protocol):
         ...
 
 
+class TaskReportGenerator(Protocol):
+    def generate_section(
+        self,
+        *,
+        task: ResearchTask,
+        objective: str,
+        constraints: list[str],
+        evidence: list[Evidence],
+        assessment: EvidenceAssessment,
+    ) -> list[Claim]:
+        """Generate validated Claim candidates for one completed task."""
+        ...
+
+
 class _GraphState(TypedDict):
     """LangGraph-only schema adapted from the canonical dataclass at the boundary."""
 
@@ -94,6 +118,8 @@ class _GraphState(TypedDict):
     vision_results: dict[str, VisionRetrievalResult]
     evidence_pool: dict[str, list[Evidence]]
     evidence_assessments: dict[str, list[EvidenceAssessment]]
+    report: StructuredReport | None
+    final_output: str | None
 
 
 class ResearchRoutingWorkflow:
@@ -107,6 +133,7 @@ class ResearchRoutingWorkflow:
         local_retriever: LocalTaskRetriever | None = None,
         *,
         grader: TaskEvidenceGrader,
+        report_generator: TaskReportGenerator,
         max_retrieval_rounds: int = MAX_RETRIEVAL_ROUNDS,
     ) -> None:
         if (
@@ -117,6 +144,7 @@ class ResearchRoutingWorkflow:
             raise ValueError("max_retrieval_rounds must be a positive integer")
         self.router = router
         self.grader = grader
+        self.report_generator = report_generator
         self.local_retriever = local_retriever
         self.web_retriever = web_retriever
         self.vision_retriever = vision_retriever
@@ -135,6 +163,7 @@ class ResearchRoutingWorkflow:
         builder.add_node("grade_evidence", self._grade_evidence_node)
         builder.add_node("prepare_retry", self._prepare_retry_node)
         builder.add_node("advance_task", self._advance_task_node)
+        builder.add_node("generate_report", self._generate_report_node)
 
         builder.add_edge(START, "select_task")
         builder.add_edge("select_task", "route_task")
@@ -162,8 +191,9 @@ class ResearchRoutingWorkflow:
         builder.add_conditional_edges(
             "advance_task",
             self._next_step_edge,
-            {"select_task": "select_task", END: END},
+            {"select_task": "select_task", "generate_report": "generate_report"},
         )
+        builder.add_edge("generate_report", END)
         return builder.compile()
 
     def run(self, state: ResearchState) -> ResearchState:
@@ -201,6 +231,8 @@ class ResearchRoutingWorkflow:
                 raise RoutingError(
                     f"workflow route and assessment histories differ for task {task.id}"
                 )
+        if final_state.report is None or final_state.final_output is None:
+            raise RoutingError("workflow must finish with a rendered report")
         return final_state
 
     def select_task(self, state: ResearchState) -> dict[str, Any]:
@@ -492,6 +524,60 @@ class ResearchRoutingWorkflow:
             "retrieval_query": None,
         }
 
+    def generate_report(self, state: ResearchState) -> dict[str, Any]:
+        """Generate all sections once, after research for every task is complete."""
+        plan = state.plan
+        if plan is None:
+            raise ReportGenerationError("cannot generate a report without a plan")
+        if state.task_index != len(plan.tasks):
+            raise ReportGenerationError(
+                "report generation requires all research tasks to be complete"
+            )
+        if state.report is not None or state.final_output is not None:
+            raise ReportGenerationError("report has already been generated")
+
+        sections: list[ReportSection] = []
+        for task in plan.tasks:
+            history = state.evidence_assessments.get(task.id, [])
+            if not history:
+                raise ReportGenerationError(
+                    f"task {task.id} has no Evidence assessment"
+                )
+            assessment = history[-1]
+            candidates = select_report_candidates(
+                task,
+                list(state.evidence_pool.get(task.id, [])),
+                assessment,
+            )
+            if not candidates:
+                if assessment.sufficient:
+                    raise ReportGenerationError(
+                        f"task {task.id} is sufficient but has no report candidates"
+                    )
+                claims: list[Claim] = []
+            else:
+                claims = self.report_generator.generate_section(
+                    task=task,
+                    objective=plan.objective,
+                    constraints=list(plan.constraints),
+                    evidence=candidates,
+                    assessment=assessment,
+                )
+                validate_claims(task, candidates, claims)
+            sections.append(
+                ReportSection(
+                    task_id=task.id,
+                    title=task.question,
+                    claims=claims,
+                    sufficient=assessment.sufficient,
+                    missing_information=list(assessment.missing_information),
+                )
+            )
+
+        report = assemble_report(plan.objective, sections, state.evidence_pool)
+        final_output = MarkdownReportRenderer().render(report)
+        return {"report": report, "final_output": final_output}
+
     @staticmethod
     def _current_retrieval_query(state: ResearchState) -> str:
         query = state.retrieval_query
@@ -514,10 +600,14 @@ class ResearchRoutingWorkflow:
 
     @staticmethod
     def next_step(state: ResearchState) -> str:
-        """Loop when tasks remain; otherwise terminate the graph."""
+        """Loop when tasks remain; otherwise enter the fixed report stage."""
         if state.plan is None:
             raise RoutingError("cannot advance without a research plan")
-        return "select_task" if state.task_index < len(state.plan.tasks) else END
+        return (
+            "select_task"
+            if state.task_index < len(state.plan.tasks)
+            else "generate_report"
+        )
 
     @staticmethod
     def _to_graph_state(state: ResearchState) -> _GraphState:
@@ -544,6 +634,8 @@ class ResearchRoutingWorkflow:
                 task_id: list(assessments)
                 for task_id, assessments in state.evidence_assessments.items()
             },
+            "report": state.report,
+            "final_output": state.final_output,
         }
 
     @staticmethod
@@ -571,6 +663,8 @@ class ResearchRoutingWorkflow:
                 task_id: list(assessments)
                 for task_id, assessments in state["evidence_assessments"].items()
             },
+            report=state["report"],
+            final_output=state["final_output"],
         )
 
     def _select_task_node(self, state: _GraphState) -> dict[str, Any]:
@@ -608,6 +702,9 @@ class ResearchRoutingWorkflow:
 
     def _advance_task_node(self, state: _GraphState) -> dict[str, Any]:
         return self.advance_task(self._from_graph_state(state))
+
+    def _generate_report_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.generate_report(self._from_graph_state(state))
 
     def _choose_source_edge(self, state: _GraphState) -> str:
         return self.choose_source(self._from_graph_state(state))

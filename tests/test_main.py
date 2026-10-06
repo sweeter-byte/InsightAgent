@@ -25,6 +25,7 @@ from insight_agent.evidence import EvidenceGrader, EvidenceGradingError
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
 from insight_agent.research import ResearchRoutingWorkflow
+from insight_agent.reporting import ReportGenerationError, ReportGenerator
 from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
 from insight_agent.routing.router import RetrievalRouter
@@ -104,6 +105,10 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(app.research_coordinator.workflow, ResearchRoutingWorkflow)
     assert isinstance(app.research_coordinator.workflow.router, RetrievalRouter)
     assert isinstance(app.research_coordinator.workflow.grader, EvidenceGrader)
+    assert isinstance(
+        app.research_coordinator.workflow.report_generator,
+        ReportGenerator,
+    )
     assert isinstance(app.research_coordinator.workflow.web_retriever, WebRetriever)
     assert isinstance(
         app.research_coordinator.workflow.web_retriever.provider,
@@ -115,7 +120,6 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     }
     knowledge_tool = app.research_agent.registry.get("search_knowledge_base")
     assert app.research_coordinator.workflow.local_retriever is knowledge_tool
-    assert app.research_coordinator.research_agent is app.research_agent
     assert isinstance(app.llm, LLMClient)
 
 
@@ -142,6 +146,7 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
         is app.research_coordinator.planner.llm
         is app.research_coordinator.workflow.router.llm
         is app.research_coordinator.workflow.grader.llm
+        is app.research_coordinator.workflow.report_generator.llm
     )
 
 
@@ -530,6 +535,22 @@ def test_main_one_shot_evidence_grading_error_returns_1(
     captured = capsys.readouterr()
     assert "[evidence grading error]" in captured.err
     assert "unknown Evidence ID" in captured.err
+
+
+def test_main_one_shot_report_generation_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureManager
+) -> None:
+    fake = FakeApp(
+        raise_exc=ReportGenerationError("Claim references disallowed Evidence")
+    )
+    monkeypatch.setattr(cli, "_build_app", lambda: fake)
+
+    rc = cli.main(["research", "topic"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[report generation error]" in captured.err
+    assert "disallowed Evidence" in captured.err
 
 
 def test_main_one_shot_web_search_error_returns_1(

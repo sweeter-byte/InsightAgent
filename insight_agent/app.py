@@ -13,7 +13,7 @@ Flow::
     │ DIRECT       │ ANALYZE           │ RESEARCH                    │
     │  one plain   │  ResearchAgent    │  ResearchCoordinator        │
     │  chat call,  │  .run(query)      │  .run(query)                │
-    │  no tools,   │                   │  plan → route → same Agent  │
+    │  no tools,   │                   │  plan → research → report   │
     │  no loop     │                   │                             │
 
 Only `research` enters planning. `analyze` continues to call the existing

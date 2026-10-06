@@ -1,4 +1,4 @@
-"""Thin coordination from a research query to the existing agent loop."""
+"""Thin coordination from a research query to its rendered workflow report."""
 
 from __future__ import annotations
 
@@ -16,12 +16,6 @@ class Planner(Protocol):
         ...
 
 
-class ResearchRunner(Protocol):
-    def run(self, query: str) -> str:
-        """Execute one research context and return its answer."""
-        ...
-
-
 class ResearchWorkflow(Protocol):
     def run(self, state: ResearchState) -> ResearchState:
         """Route every planned task and return the final workflow state."""
@@ -29,13 +23,12 @@ class ResearchWorkflow(Protocol):
 
 
 class ResearchCoordinator:
-    """Plan a research query, retain its state, then reuse ``ResearchAgent``."""
+    """Plan a research query, retain its state, and return its rendered report."""
 
     def __init__(
         self,
         planner: Planner,
         workflow: ResearchWorkflow,
-        research_agent: ResearchRunner,
         available_sources: set[RetrievalSource],
     ) -> None:
         if not available_sources:
@@ -44,7 +37,6 @@ class ResearchCoordinator:
             raise ValueError("available_sources must contain RetrievalSource values")
         self.planner = planner
         self.workflow = workflow
-        self.research_agent = research_agent
         self.available_sources = set(available_sources)
         self.last_state: ResearchState | None = None
 
@@ -57,7 +49,9 @@ class ResearchCoordinator:
         )
         final_state = self.workflow.run(state)
         self.last_state = final_state
-        return self.research_agent.run(format_research_context(final_state))
+        if not isinstance(final_state.final_output, str):
+            raise ValueError("research workflow did not produce final_output")
+        return final_state.final_output
 
 
 def format_research_context(state: ResearchState) -> str:

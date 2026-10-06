@@ -6,7 +6,7 @@ Behavior:
 
 Nothing here is required by the agent itself; the CLI is just a thin wrapper
 that assembles the app — a shared ``LLMClient``, a default registry,
-``ResearchAgent``, both routers, the research workflow, and the ``InsightAgent``
+``ResearchAgent``, both routers, the research workflow, reporting, and the ``InsightAgent``
 façade — and reads a line of user input.
 """
 
@@ -31,6 +31,7 @@ from insight_agent.ingestion import (
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
 from insight_agent.research import ResearchRoutingWorkflow
+from insight_agent.reporting import ReportGenerationError, ReportGenerator
 from insight_agent.retrieval import (
     HybridRetrievalConfig,
     HybridRetriever,
@@ -65,7 +66,7 @@ def _build_app() -> InsightAgent:
     """Compose the full application object.
 
     A single ``LLMClient`` instance is shared by both routers, the planner, the
-    direct-answer path, and the ResearchAgent. We deliberately avoid a factory
+    direct-answer path, report generator, and ResearchAgent. We deliberately avoid a factory
     or DI framework for this small object graph.
     """
     llm = LLMClient()
@@ -120,6 +121,7 @@ def _compose_app(
     planner = ResearchPlanner(llm=llm)
     retrieval_router = RetrievalRouter(llm=llm)
     evidence_grader = EvidenceGrader(llm=llm)
+    report_generator = ReportGenerator(llm=llm)
     web_config = WebSearchConfig.from_env()
     web_retriever: WebRetriever | None = None
     available_sources = {
@@ -144,11 +146,11 @@ def _compose_app(
         web_retriever=web_retriever,
         vision_retriever=vision_retriever,
         grader=evidence_grader,
+        report_generator=report_generator,
     )
     research_coordinator = ResearchCoordinator(
         planner=planner,
         workflow=research_workflow,
-        research_agent=research_agent,
         available_sources=available_sources,
     )
     router = IntentRouter(llm=llm)
@@ -259,6 +261,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         return 1
     except EvidenceGradingError as exc:
         print(f"[evidence grading error] {exc}", file=sys.stderr)
+        return 1
+    except ReportGenerationError as exc:
+        print(f"[report generation error] {exc}", file=sys.stderr)
         return 1
     except WebSearchError as exc:
         print(f"[web search error] {exc}", file=sys.stderr)
