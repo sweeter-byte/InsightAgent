@@ -134,8 +134,9 @@ def _assessment(
 
 
 class FakeWebRetriever:
-    def __init__(self) -> None:
+    def __init__(self, content: str | None = None) -> None:
         self.calls: list[str] = []
+        self.content = content
 
     def retrieve(self, query: str) -> WebRetrievalResult:
         self.calls.append(query)
@@ -153,7 +154,7 @@ class FakeWebRetriever:
             ],
             documents=[
                 Document(
-                    content=f"Fetched content {rank}",
+                    content=self.content or f"Fetched content {rank}",
                     source=url,
                     source_type=SourceType.URL,
                     metadata={"final_url": url},
@@ -758,29 +759,61 @@ def test_one_task_produces_exactly_one_decision_and_ends_cleanly() -> None:
 
 def test_insufficient_evidence_retries_through_router_then_accumulates() -> None:
     router = FakeRouter([RetrievalSource.LOCAL, RetrievalSource.WEB])
+    task_question = "比较向量记忆与结构化记忆的核心机制、主要优势和局限"
     grader = FakeEvidenceGrader(
         [
             _assessment(
                 sufficient=False,
-                missing_information=["Structured-memory limitations"],
+                missing_information=["缺少结构化记忆的主要局限与适用边界"],
             ),
             _assessment(sufficient=True),
         ]
     )
-    local_retriever = FakeLocalRetriever()
-    web_retriever = FakeWebRetriever()
+    local_retriever = FakeLocalRetriever(
+        [
+            RetrievalResult(
+                chunk_id=f"chunk-{index}",
+                score=0.9 - index / 10,
+                content=content,
+                document_id="memory-notes",
+                source="notes/memory.md",
+                source_type=SourceType.MARKDOWN,
+                chunk_index=index,
+                start_char=index * 100,
+                end_char=index * 100 + len(content),
+            )
+            for index, content in enumerate(
+                [
+                    "向量记忆核心机制",
+                    "结构化记忆核心机制",
+                    "向量记忆优势",
+                ],
+                start=1,
+            )
+        ]
+    )
+    web_retriever = FakeWebRetriever("结构化记忆的局限与适用边界")
     workflow = OrderedWorkflow(
         router,
         local_retriever=local_retriever,
         web_retriever=web_retriever,
         grader=grader,
     )
+    state = ResearchState(
+        query=task_question,
+        plan=ResearchPlan(
+            objective="比较两类记忆方案",
+            constraints=["覆盖机制、优势和局限"],
+            tasks=[ResearchTask(id="T1", question=task_question)],
+        ),
+        available_sources=set(RetrievalSource),
+    )
 
-    final_state = workflow.run(_state())
+    final_state = workflow.run(state)
 
     retry_query = (
-        "Original task:\nQuestion 1\n\n"
-        "Missing information:\n- Structured-memory limitations"
+        f"Original task:\n{task_question}\n\n"
+        "Missing information:\n- 缺少结构化记忆的主要局限与适用边界"
     )
     assert workflow.events == [
         "local",
@@ -793,21 +826,26 @@ def test_insufficient_evidence_retries_through_router_then_accumulates() -> None
         "advance_task",
     ]
     assert [call["retrieval_query"] for call in router.calls] == [
-        "Question 1",
+        task_question,
         retry_query,
     ]
     assert router.calls[0]["missing_information"] == []
     assert router.calls[1]["missing_information"] == [
-        "Structured-memory limitations"
+        "缺少结构化记忆的主要局限与适用边界"
     ]
-    assert local_retriever.calls == [("Question 1", None)]
+    assert local_retriever.calls == [(task_question, None)]
     assert web_retriever.calls == [retry_query]
     assert [decision.source for decision in final_state.route_decisions] == [
         RetrievalSource.LOCAL,
         RetrievalSource.WEB,
     ]
-    assert len(final_state.evidence_pool["T1"]) == 2
-    assert [len(call["evidence"]) for call in grader.calls] == [1, 2]
+    assert [item.content for item in final_state.evidence_pool["T1"]] == [
+        "向量记忆核心机制",
+        "结构化记忆核心机制",
+        "向量记忆优势",
+        "结构化记忆的局限与适用边界",
+    ]
+    assert [len(call["evidence"]) for call in grader.calls] == [3, 4]
     assert len(final_state.evidence_assessments["T1"]) == 2
     assert final_state.evidence_assessments["T1"][-1].sufficient is True
 

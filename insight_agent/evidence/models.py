@@ -68,5 +68,5 @@ class EvidenceAssessment:
     evidence_judgments: list[EvidenceJudgment]
     coverage: EvidenceCoverage
     sufficient: bool
-    missing_information: list[str]
-    reason: str
+    missing_information: list[str] = field(default_factory=list)
+    reason: str = ""

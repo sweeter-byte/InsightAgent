@@ -120,6 +120,18 @@ def test_grading_models_use_the_closed_vocabulary() -> None:
     assert issubclass(EvidenceGradingError, RuntimeError)
 
 
+def test_assessment_defaults_to_no_missing_information_or_reason() -> None:
+    assessment = EvidenceAssessment(
+        task_id="T1",
+        evidence_judgments=[],
+        coverage=EvidenceCoverage.COMPLETE,
+        sufficient=True,
+    )
+
+    assert assessment.missing_information == []
+    assert assessment.reason == ""
+
+
 def test_grader_parses_a_valid_evidence_assessment() -> None:
     evidence = _evidence()
     llm = FakeLLM(
