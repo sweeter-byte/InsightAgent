@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
+import httpx
 import pytest
 
 from insight_agent.evidence import (
@@ -12,6 +16,7 @@ from insight_agent.evidence import (
     EvidenceCollector,
     EvidenceCoverage,
     EvidenceJudgment,
+    EvidenceGrader,
     EvidenceQuality,
     EvidenceRelevance,
 )
@@ -24,7 +29,9 @@ from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing import RetrievalSource, RouteDecision, RoutingError
 from insight_agent.ingestion import Document, SourceType
 from insight_agent.web_search import (
+    TavilySearchProvider,
     WebRetrievalResult,
+    WebRetriever,
     WebSearchConfigurationError,
     WebSearchHit,
 )
@@ -529,6 +536,98 @@ def test_web_branch_writes_task_scoped_result() -> None:
     assert set(final_state.web_results) == {"T1"}
     assert final_state.web_results["T1"].query == "Question 1"
     assert final_state.web_results["T1"].documents[0].content == "Fetched content 1"
+
+
+def test_tavily_http_retry_does_not_add_a_research_round() -> None:
+    request = httpx.Request("POST", "https://api.tavily.com/search")
+    response = httpx.Response(
+        200,
+        request=request,
+        json={
+            "results": [
+                {
+                    "title": "Result",
+                    "url": "https://example.com/result",
+                    "content": "Search snippet",
+                }
+            ]
+        },
+    )
+    delays: list[float] = []
+    retriever = WebRetriever(
+        TavilySearchProvider(api_key="tvly-test", sleeper=delays.append),
+        url_loader=lambda url, *, timeout: [
+            Document(
+                content="Fetched content",
+                source=url,
+                source_type=SourceType.URL,
+                metadata={"final_url": url},
+            )
+        ],
+    )
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.WEB]),  # type: ignore[arg-type]
+        web_retriever=retriever,
+        grader=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+
+    with patch(
+        "insight_agent.web_search.provider.httpx.post",
+        side_effect=[httpx.ConnectTimeout("connect timed out"), response],
+    ) as post:
+        final_state = workflow.run(_state())
+
+    assert post.call_count == 2
+    assert delays == [0.5]
+    assert len(final_state.route_decisions) == 1
+    assert len(final_state.evidence_assessments["T1"]) == 1
+
+
+def test_grader_repair_does_not_add_a_research_round() -> None:
+    class RepairingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages: list[dict[str, Any]], tools: Any = None) -> Any:
+            self.calls += 1
+            evidence_ids = [
+                item["evidence_id"]
+                for item in json.loads(messages[1]["content"])["evidence"]
+            ]
+            judged_ids = [] if self.calls == 1 else evidence_ids
+            payload = {
+                "task_id": "T1",
+                "evidence_judgments": [
+                    {
+                        "evidence_id": evidence_id,
+                        "relevance": "relevant",
+                        "quality": "strong",
+                        "reason": "Direct support with provenance.",
+                    }
+                    for evidence_id in judged_ids
+                ],
+                "coverage": "complete",
+                "sufficient": True,
+                "missing_information": [],
+                "reason": "The task is covered.",
+            }
+            message = SimpleNamespace(content=json.dumps(payload), tool_calls=None)
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    llm = RepairingLLM()
+    grader = EvidenceGrader(llm=llm)  # type: ignore[arg-type]
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=grader,
+        report_generator=FakeEvidenceGrader(),  # type: ignore[arg-type]
+    )
+
+    final_state = workflow.run(_state())
+
+    assert llm.calls == 2
+    assert len(final_state.route_decisions) == 1
+    assert len(final_state.evidence_assessments["T1"]) == 1
 
 
 def test_local_branch_writes_task_scoped_raw_results() -> None:

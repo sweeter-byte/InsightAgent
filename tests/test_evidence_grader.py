@@ -40,6 +40,25 @@ class FakeLLM:
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
+class ScriptedLLM:
+    def __init__(self, *contents: str) -> None:
+        self.contents = list(contents)
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        self.calls.append(
+            {"messages": [dict(message) for message in messages], "tools": tools}
+        )
+        if not self.contents:
+            raise AssertionError("ScriptedLLM ran out of responses")
+        message = SimpleNamespace(content=self.contents.pop(0), tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
 def _task() -> ResearchTask:
     return ResearchTask(id="T1", question="Compare memory mechanisms.")
 
@@ -179,6 +198,89 @@ def test_grader_parses_a_valid_evidence_assessment() -> None:
     )
     assert len(llm.calls) == 1
     assert llm.calls[0]["tools"] is None
+
+
+def test_grader_repairs_a_missing_judgment_with_one_complete_regeneration() -> None:
+    evidence = [_evidence(f"ev-{index}") for index in range(1, 5)]
+    invalid = _valid_payload("ev-1", "ev-2", "ev-3")
+    repaired = _valid_payload("ev-1", "ev-2", "ev-3", "ev-4")
+    llm = ScriptedLLM(json.dumps(invalid), json.dumps(repaired))
+
+    assessment = EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=["Cover trade-offs"],
+        evidence=evidence,
+    )
+
+    assert [item.evidence_id for item in assessment.evidence_judgments] == [
+        "ev-1",
+        "ev-2",
+        "ev-3",
+        "ev-4",
+    ]
+    assert len(llm.calls) == 2
+    repair_messages = llm.calls[1]["messages"]
+    assert repair_messages[:2] == llm.calls[0]["messages"]
+    assert repair_messages[2] == {"role": "assistant", "content": json.dumps(invalid)}
+    repair_instruction = repair_messages[3]["content"]
+    assert "missing judgment for Evidence ID(s): ev-4" in repair_instruction
+    assert "complete Assessment" in repair_instruction
+    assert "exactly once" in repair_instruction
+    original_payload = json.loads(repair_messages[1]["content"])
+    assert [item["evidence_id"] for item in original_payload["evidence"]] == [
+        "ev-1",
+        "ev-2",
+        "ev-3",
+        "ev-4",
+    ]
+
+
+def test_grader_stops_after_one_failed_repair() -> None:
+    evidence = [_evidence("ev-1"), _evidence("ev-2")]
+    still_missing = json.dumps(_valid_payload("ev-1"))
+    llm = ScriptedLLM(still_missing, still_missing)
+
+    with pytest.raises(EvidenceGradingError, match="missing judgment.*ev-2"):
+        EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+            task=_task(),
+            objective="Compare memory systems",
+            constraints=[],
+            evidence=evidence,
+        )
+
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        _valid_payload("invented"),
+        _valid_payload("ev-1", "ev-1"),
+        {
+            **_valid_payload("ev-1"),
+            "coverage": "partial",
+            "sufficient": False,
+            "missing_information": [],
+        },
+    ],
+    ids=["invented-id", "duplicate-id", "missing-information"],
+)
+def test_grader_repairs_other_assessment_contract_violations(
+    invalid: dict[str, Any],
+) -> None:
+    repaired = _valid_payload("ev-1")
+    llm = ScriptedLLM(json.dumps(invalid), json.dumps(repaired))
+
+    assessment = EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[_evidence()],
+    )
+
+    assert assessment.task_id == "T1"
+    assert len(llm.calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -325,7 +427,8 @@ def test_grader_rejects_unparseable_model_output(
     content: str,
     message: str,
 ) -> None:
-    grader = EvidenceGrader(llm=FakeLLM(content))  # type: ignore[arg-type]
+    llm = FakeLLM(content)
+    grader = EvidenceGrader(llm=llm)  # type: ignore[arg-type]
 
     with pytest.raises(EvidenceGradingError, match=message):
         grader.grade(
@@ -334,6 +437,33 @@ def test_grader_rejects_unparseable_model_output(
             constraints=[],
             evidence=[_evidence()],
         )
+
+    assert len(llm.calls) == 1
+
+
+def test_grader_does_not_repair_llm_network_errors() -> None:
+    network_error = ConnectionError("LLM endpoint unavailable")
+
+    class FailingLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            raise network_error
+
+    llm = FailingLLM()
+
+    with pytest.raises(ConnectionError) as excinfo:
+        EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+            task=_task(),
+            objective="Compare memory systems",
+            constraints=[],
+            evidence=[_evidence()],
+        )
+
+    assert excinfo.value is network_error
+    assert llm.calls == 1
 
 
 def test_grader_wraps_invalid_retrieval_source_as_grading_error() -> None:

@@ -104,6 +104,57 @@ def test_tavily_provider_maps_ordered_hits_and_candidate_only_request() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "transient_error",
+    [
+        httpx.ConnectTimeout("connect timed out"),
+        httpx.ReadTimeout("read timed out"),
+        httpx.ConnectError("connection failed"),
+    ],
+    ids=["connect-timeout", "read-timeout", "connect-error"],
+)
+def test_tavily_provider_retries_transient_network_error_then_succeeds(
+    transient_error: httpx.RequestError,
+) -> None:
+    response = FakeResponse({"results": []})
+    delays: list[float] = []
+
+    with patch(
+        "insight_agent.web_search.provider.httpx.post",
+        side_effect=[transient_error, response],
+    ) as post:
+        hits = TavilySearchProvider(
+            api_key="tvly-test",
+            sleeper=delays.append,
+        ).search("query", limit=3)
+
+    assert hits == []
+    assert post.call_count == 2
+    assert delays == [0.5]
+
+
+def test_tavily_provider_stops_after_three_transient_failures() -> None:
+    timeout = httpx.ConnectTimeout("connect timed out")
+    delays: list[float] = []
+
+    with patch(
+        "insight_agent.web_search.provider.httpx.post",
+        side_effect=timeout,
+    ) as post:
+        with pytest.raises(
+            WebSearchError,
+            match="Tavily search failed after 3 attempts: ConnectTimeout",
+        ) as excinfo:
+            TavilySearchProvider(
+                api_key="tvly-test",
+                sleeper=delays.append,
+            ).search("query", limit=3)
+
+    assert post.call_count == 3
+    assert delays == [0.5, 1.0]
+    assert excinfo.value.__cause__ is timeout
+
+
 def test_tavily_provider_rejects_missing_api_key() -> None:
     with pytest.raises(WebSearchConfigurationError, match="TAVILY_API_KEY"):
         TavilySearchProvider(api_key="  ")
@@ -128,16 +179,20 @@ def test_tavily_provider_validates_search_input(
         provider.search(query, limit=limit)
 
 
-def test_tavily_provider_wraps_request_errors() -> None:
-    request_error = httpx.ConnectError("connection refused")
+def test_tavily_provider_does_not_retry_other_request_errors() -> None:
+    request_error = httpx.WriteError("write failed")
 
     with patch(
         "insight_agent.web_search.provider.httpx.post",
         side_effect=request_error,
-    ):
+    ) as post:
         with pytest.raises(WebSearchError, match="Tavily search request failed") as excinfo:
-            TavilySearchProvider(api_key="tvly-test").search("query", limit=3)
+            TavilySearchProvider(
+                api_key="tvly-test",
+                sleeper=lambda _: pytest.fail("non-transient error must not sleep"),
+            ).search("query", limit=3)
 
+    assert post.call_count == 1
     assert excinfo.value.__cause__ is request_error
 
 
@@ -147,9 +202,14 @@ def test_tavily_provider_wraps_http_status_errors() -> None:
     with patch(
         "insight_agent.web_search.provider.httpx.post",
         return_value=response,
-    ):
+    ) as post:
         with pytest.raises(WebSearchError, match="HTTP 401"):
-            TavilySearchProvider(api_key="tvly-test").search("query", limit=3)
+            TavilySearchProvider(
+                api_key="tvly-test",
+                sleeper=lambda _: pytest.fail("HTTP errors must not sleep"),
+            ).search("query", limit=3)
+
+    assert post.call_count == 1
 
 
 def test_tavily_provider_rejects_invalid_json() -> None:

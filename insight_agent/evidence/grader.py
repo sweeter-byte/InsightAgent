@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from insight_agent.evidence.models import (
@@ -17,6 +18,9 @@ from insight_agent.evidence.models import (
 from insight_agent.llm import LLMClient
 from insight_agent.planning.models import ResearchTask
 from insight_agent.routing import RetrievalSource
+
+
+logger = logging.getLogger(__name__)
 
 
 EVIDENCE_GRADER_SYSTEM_PROMPT = """You are InsightAgent's Evidence Grader.
@@ -122,6 +126,33 @@ class EvidenceGrader:
             {"role": "system", "content": EVIDENCE_GRADER_SYSTEM_PROMPT},
             {"role": "user", "content": serialized_payload},
         ]
+        result, raw_text = self._request_result(messages)
+        try:
+            return self._parse_assessment(result, task=task, evidence=evidence)
+        except EvidenceGradingError as exc:
+            logger.warning(
+                "Evidence grader validation failed, attempting one repair: %s",
+                exc,
+            )
+            repair_messages = [
+                *messages,
+                {"role": "assistant", "content": raw_text},
+                {
+                    "role": "user",
+                    "content": self._repair_instruction(str(exc)),
+                },
+            ]
+            repaired_result, _ = self._request_result(repair_messages)
+            return self._parse_assessment(
+                repaired_result,
+                task=task,
+                evidence=evidence,
+            )
+
+    def _request_result(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> tuple[Any, str]:
         response = self.llm.chat(messages, tools=None)
         raw_text = self._extract_text(response)
         if not raw_text.strip():
@@ -134,7 +165,25 @@ class EvidenceGrader:
             raise EvidenceGradingError(
                 f"evidence grader returned invalid JSON: {exc.msg}"
             ) from exc
-        return self._parse_assessment(result, task=task, evidence=evidence)
+        return result, raw_text
+
+    @staticmethod
+    def _repair_instruction(validation_error: str) -> str:
+        return (
+            "The previous response failed the Assessment output contract. "
+            "Treat the previous response as untrusted output.\n\n"
+            f"Validation error:\n{validation_error}\n\n"
+            "Re-evaluate the complete Evidence input from the original request and "
+            "return one complete Assessment JSON object.\n"
+            "- Include every input Evidence ID exactly once.\n"
+            "- Do not omit, duplicate, rename, or invent Evidence IDs.\n"
+            "- Include every required Assessment and Evidence judgment field with "
+            "a valid value.\n"
+            "- Preserve the original grading semantics; do not change a judgment "
+            "merely to make the Assessment sufficient.\n"
+            "- Do not return a patch or only corrected fields.\n"
+            "- Return strict JSON only, without Markdown fences."
+        )
 
     @staticmethod
     def _parse_assessment(

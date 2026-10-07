@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import httpx
@@ -14,6 +17,15 @@ from insight_agent.web_search.models import WebSearchHit
 
 
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_RETRY_DELAYS = (0.5, 1.0)
+_TRANSIENT_NETWORK_ERRORS = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.ConnectError,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class SearchProvider(Protocol):
@@ -27,7 +39,13 @@ class SearchProvider(Protocol):
 class TavilySearchProvider:
     """Thin adapter around Tavily's candidate Search REST endpoint."""
 
-    def __init__(self, *, api_key: str, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        timeout: float = 30.0,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
         if not isinstance(api_key, str) or not api_key.strip():
             raise WebSearchConfigurationError("TAVILY_API_KEY must not be empty")
         if (
@@ -40,6 +58,7 @@ class TavilySearchProvider:
             )
         self.api_key = api_key.strip()
         self.timeout = float(timeout)
+        self._sleeper = sleeper
 
     def search(self, query: str, *, limit: int) -> list[WebSearchHit]:
         if not isinstance(query, str) or not query.strip():
@@ -47,27 +66,43 @@ class TavilySearchProvider:
         if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
             raise WebSearchError("search limit must be a positive integer")
 
-        try:
-            response = httpx.post(
-                TAVILY_SEARCH_URL,
-                json={
-                    "query": query,
-                    "search_depth": "basic",
-                    "max_results": limit,
-                    "include_answer": False,
-                    "include_images": False,
-                    "include_raw_content": False,
-                },
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise WebSearchError(
-                f"Tavily search failed with HTTP {exc.response.status_code}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise WebSearchError(f"Tavily search request failed: {exc}") from exc
+        max_attempts = len(TAVILY_RETRY_DELAYS) + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = httpx.post(
+                    TAVILY_SEARCH_URL,
+                    json={
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": limit,
+                        "include_answer": False,
+                        "include_images": False,
+                        "include_raw_content": False,
+                    },
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                break
+            except httpx.HTTPStatusError as exc:
+                raise WebSearchError(
+                    f"Tavily search failed with HTTP {exc.response.status_code}"
+                ) from exc
+            except _TRANSIENT_NETWORK_ERRORS as exc:
+                if attempt == max_attempts:
+                    raise WebSearchError(
+                        "Tavily search failed after "
+                        f"{max_attempts} attempts: {type(exc).__name__}: {exc}"
+                    ) from exc
+                logger.warning(
+                    "Tavily search transient failure (%s), retrying (%d/%d)",
+                    type(exc).__name__,
+                    attempt + 1,
+                    max_attempts,
+                )
+                self._sleeper(TAVILY_RETRY_DELAYS[attempt - 1])
+            except httpx.RequestError as exc:
+                raise WebSearchError(f"Tavily search request failed: {exc}") from exc
 
         try:
             payload = response.json()
