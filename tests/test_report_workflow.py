@@ -188,8 +188,7 @@ def test_generate_report_skips_llm_for_no_allowed_evidence_and_keeps_gap() -> No
     assert update["report"].sections[0].missing_information == [
         "Missing limitation."
     ]
-    assert "当前没有可靠结论" in update["final_output"]
-    assert "Missing limitation." in update["final_output"]
+    assert "final_output" not in update
 
 
 def test_generate_report_rejects_sufficient_assessment_without_candidates() -> None:

@@ -24,6 +24,7 @@ from insight_agent.routing.models import (
     RouteDecision,
     RoutingError,
 )
+from insight_agent.self_check import SelfCheckResult
 from insight_agent.web_search.errors import WebSearchConfigurationError
 from insight_agent.web_search.models import WebRetrievalResult
 from insight_agent.vision_retrieval.errors import VisionRetrievalError
@@ -120,6 +121,8 @@ class _GraphState(TypedDict):
     evidence_assessments: dict[str, list[EvidenceAssessment]]
     report: StructuredReport | None
     final_output: str | None
+    self_check_result: SelfCheckResult | None
+    self_check_rounds: int
 
 
 class ResearchRoutingWorkflow:
@@ -575,8 +578,7 @@ class ResearchRoutingWorkflow:
             )
 
         report = assemble_report(plan.objective, sections, state.evidence_pool)
-        final_output = MarkdownReportRenderer().render(report)
-        return {"report": report, "final_output": final_output}
+        return {"report": report}
 
     @staticmethod
     def _current_retrieval_query(state: ResearchState) -> str:
@@ -636,6 +638,8 @@ class ResearchRoutingWorkflow:
             },
             "report": state.report,
             "final_output": state.final_output,
+            "self_check_result": state.self_check_result,
+            "self_check_rounds": state.self_check_rounds,
         }
 
     @staticmethod
@@ -665,6 +669,8 @@ class ResearchRoutingWorkflow:
             },
             report=state["report"],
             final_output=state["final_output"],
+            self_check_result=state["self_check_result"],
+            self_check_rounds=state["self_check_rounds"],
         )
 
     def _select_task_node(self, state: _GraphState) -> dict[str, Any]:

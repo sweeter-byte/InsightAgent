@@ -27,6 +27,12 @@ from insight_agent.research.workflow import (
 )
 from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing import RetrievalSource, RouteDecision, RoutingError
+from insight_agent.self_check import (
+    SelfCheckIssue,
+    SelfCheckIssueCode,
+    SelfCheckResult,
+    SelfCheckStatus,
+)
 from insight_agent.ingestion import Document, SourceType
 from insight_agent.web_search import (
     TavilySearchProvider,
@@ -281,6 +287,30 @@ class FakeVisionRetriever:
             ],
             failures=[],
         )
+
+
+def test_graph_state_round_trip_preserves_self_check_fields() -> None:
+    state = _state()
+    state.self_check_result = SelfCheckResult(
+        status=SelfCheckStatus.REVISE,
+        issues=[
+            SelfCheckIssue(
+                code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+                reason="Claim needs repair.",
+                task_id="T1",
+                claim_id="T1-C1",
+            )
+        ],
+        summary="Repair required.",
+    )
+    state.self_check_rounds = 1
+
+    restored = BaseResearchRoutingWorkflow._from_graph_state(
+        BaseResearchRoutingWorkflow._to_graph_state(state)
+    )
+
+    assert restored.self_check_result == state.self_check_result
+    assert restored.self_check_rounds == 1
 
 
 class RecordingWorkflow(ResearchRoutingWorkflow):
