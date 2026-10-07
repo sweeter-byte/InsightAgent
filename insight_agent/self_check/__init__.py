@@ -8,9 +8,11 @@ from insight_agent.self_check.models import (
     SelfCheckResult,
     SelfCheckStatus,
 )
+from insight_agent.self_check.repair import ReportRepairer
 
 __all__ = [
     "ReportSelfChecker",
+    "ReportRepairer",
     "SelfCheckError",
     "SelfCheckIssue",
     "SelfCheckIssueCode",

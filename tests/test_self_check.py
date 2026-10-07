@@ -17,9 +17,16 @@ from insight_agent.evidence import (
     EvidenceRelevance,
 )
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
-from insight_agent.reporting import Claim, ReportSection, StructuredReport, assemble_report
+from insight_agent.reporting import (
+    Claim,
+    ReportGenerationError,
+    ReportSection,
+    StructuredReport,
+    assemble_report,
+)
 from insight_agent.routing import RetrievalSource
 from insight_agent.self_check import (
+    ReportRepairer,
     ReportSelfChecker,
     SelfCheckError,
     SelfCheckIssue,
@@ -380,3 +387,183 @@ def test_checker_rejects_claim_and_task_mismatch() -> None:
             evidence_pool=pool,
             assessments=assessments,
         )
+
+
+def test_repairer_rebuilds_a_narrowed_report_from_runtime_state() -> None:
+    plan, report, pool, assessments = _research_inputs()
+    report.sections[0].claims[0].text = (
+        "Method A reduces token use in all research scenarios."
+    )
+    issue = SelfCheckIssue(
+        code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+        reason="The Claim overgeneralizes two experiments.",
+        task_id="T1",
+        claim_id="T1-C1",
+    )
+    result = SelfCheckResult(
+        status=SelfCheckStatus.REVISE,
+        issues=[issue],
+        summary="Narrow the Claim to the observed experiments.",
+    )
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "objective": "Assess method A",
+                "sections": [
+                    {
+                        "task_id": "T1",
+                        "title": "How does method A perform?",
+                        "claims": [
+                            {
+                                "text": (
+                                    "Method A reduced tokens in two experiments."
+                                ),
+                                "evidence_ids": ["E1"],
+                            }
+                        ],
+                        "sufficient": False,
+                        "missing_information": [
+                            "Long-term maintenance cost is unknown."
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    repaired = ReportRepairer(llm=llm).repair(
+        plan=plan,
+        report=report,
+        self_check_result=result,
+        evidence_pool=pool,
+        assessments=assessments,
+    )
+
+    assert repaired.sections[0].claims == [
+        Claim(
+            id="T1-C1",
+            task_id="T1",
+            text="Method A reduced tokens in two experiments.",
+            evidence_ids=["E1"],
+        )
+    ]
+    assert repaired.sections[0].sufficient is False
+    assert repaired.sections[0].missing_information == [
+        "Long-term maintenance cost is unknown."
+    ]
+    assert repaired.citations == report.citations
+    assert llm.calls[0]["tools"] is None
+
+
+def _repair_payload() -> dict[str, Any]:
+    return {
+        "objective": "Assess method A",
+        "sections": [
+            {
+                "task_id": "T1",
+                "title": "How does method A perform?",
+                "claims": [
+                    {
+                        "text": "Method A reduced tokens in two experiments.",
+                        "evidence_ids": ["E1"],
+                    }
+                ],
+                "sufficient": False,
+                "missing_information": [
+                    "Long-term maintenance cost is unknown."
+                ],
+            }
+        ],
+    }
+
+
+def _revise_result(
+    *,
+    task_id: str | None = "T1",
+    claim_id: str | None = "T1-C1",
+) -> SelfCheckResult:
+    return SelfCheckResult(
+        status=SelfCheckStatus.REVISE,
+        issues=[
+            SelfCheckIssue(
+                code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+                reason="Claim must be narrowed.",
+                task_id=task_id,
+                claim_id=claim_id,
+            )
+        ],
+        summary="Repair required.",
+    )
+
+
+def test_repairer_rejects_unvalidated_issue_identity() -> None:
+    plan, report, pool, assessments = _research_inputs()
+
+    with pytest.raises(SelfCheckError, match="unknown Claim"):
+        ReportRepairer(llm=FakeLLM(json.dumps(_repair_payload()))).repair(
+            plan=plan,
+            report=report,
+            self_check_result=_revise_result(claim_id="T1-C99"),
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("unknown_evidence", ReportGenerationError, "allowed candidate"),
+        ("claim_extra_source", SelfCheckError, "field set"),
+        ("changed_objective", SelfCheckError, "objective"),
+        ("changed_sufficiency", SelfCheckError, "sufficiency"),
+        ("changed_gaps", SelfCheckError, "missing_information"),
+    ],
+)
+def test_repairer_rejects_changes_outside_controlled_boundary(
+    case: str,
+    error: type[Exception],
+    message: str,
+) -> None:
+    plan, report, pool, assessments = _research_inputs()
+    payload = _repair_payload()
+    section = payload["sections"][0]
+    claim = section["claims"][0]
+    if case == "unknown_evidence":
+        claim["evidence_ids"] = ["invented"]
+    elif case == "claim_extra_source":
+        claim["source"] = "https://invented.invalid"
+    elif case == "changed_objective":
+        payload["objective"] = "A new objective"
+    elif case == "changed_sufficiency":
+        section["sufficient"] = True
+    elif case == "changed_gaps":
+        section["missing_information"] = []
+
+    with pytest.raises(error, match=message):
+        ReportRepairer(llm=FakeLLM(json.dumps(payload))).repair(
+            plan=plan,
+            report=report,
+            self_check_result=_revise_result(),
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+
+def test_repairer_rejects_pass_result_before_calling_llm() -> None:
+    plan, report, pool, assessments = _research_inputs()
+    llm = FakeLLM(json.dumps(_repair_payload()))
+
+    with pytest.raises(SelfCheckError, match="revise"):
+        ReportRepairer(llm=llm).repair(
+            plan=plan,
+            report=report,
+            self_check_result=SelfCheckResult(
+                status=SelfCheckStatus.PASS,
+                issues=[],
+                summary="No repair required.",
+            ),
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+    assert llm.calls == []
