@@ -149,7 +149,20 @@ def test_router_sends_system_and_user_messages() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Intent enum value checks
+# 6. Prompt contract
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_prioritizes_explicit_research_over_named_materials() -> None:
+    assert (
+        "An explicit request to conduct research MUST be classified as research"
+        in ROUTER_SYSTEM_PROMPT
+    )
+    assert "indexed local materials or images" in ROUTER_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# 7. Intent enum value checks
 # ---------------------------------------------------------------------------
 
 
