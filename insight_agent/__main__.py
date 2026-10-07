@@ -42,6 +42,7 @@ from insight_agent.retrieval import (
 from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
 from insight_agent.routing.router import RetrievalRouter
+from insight_agent.self_check import ReportRepairer, ReportSelfChecker, SelfCheckError
 from insight_agent.tools.registry import build_default_registry, default_tool_schemas
 from insight_agent.web_search import (
     TavilySearchProvider,
@@ -122,6 +123,8 @@ def _compose_app(
     retrieval_router = RetrievalRouter(llm=llm)
     evidence_grader = EvidenceGrader(llm=llm)
     report_generator = ReportGenerator(llm=llm)
+    self_checker = ReportSelfChecker(llm=llm)
+    report_repairer = ReportRepairer(llm=llm)
     web_config = WebSearchConfig.from_env()
     web_retriever: WebRetriever | None = None
     available_sources = {
@@ -147,6 +150,8 @@ def _compose_app(
         vision_retriever=vision_retriever,
         grader=evidence_grader,
         report_generator=report_generator,
+        self_checker=self_checker,
+        report_repairer=report_repairer,
     )
     research_coordinator = ResearchCoordinator(
         planner=planner,
@@ -264,6 +269,9 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
         return 1
     except ReportGenerationError as exc:
         print(f"[report generation error] {exc}", file=sys.stderr)
+        return 1
+    except SelfCheckError as exc:
+        print(f"[self-check error] {exc}", file=sys.stderr)
         return 1
     except WebSearchError as exc:
         print(f"[web search error] {exc}", file=sys.stderr)

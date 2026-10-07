@@ -29,6 +29,11 @@ from insight_agent.reporting import ReportGenerationError, ReportGenerator
 from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
 from insight_agent.routing.router import RetrievalRouter
+from insight_agent.self_check import (
+    ReportRepairer,
+    ReportSelfChecker,
+    SelfCheckError,
+)
 from insight_agent.web_search import (
     TavilySearchProvider,
     WebRetriever,
@@ -109,6 +114,14 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
         app.research_coordinator.workflow.report_generator,
         ReportGenerator,
     )
+    assert isinstance(
+        app.research_coordinator.workflow.self_checker,
+        ReportSelfChecker,
+    )
+    assert isinstance(
+        app.research_coordinator.workflow.report_repairer,
+        ReportRepairer,
+    )
     assert isinstance(app.research_coordinator.workflow.web_retriever, WebRetriever)
     assert isinstance(
         app.research_coordinator.workflow.web_retriever.provider,
@@ -147,6 +160,8 @@ def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> 
         is app.research_coordinator.workflow.router.llm
         is app.research_coordinator.workflow.grader.llm
         is app.research_coordinator.workflow.report_generator.llm
+        is app.research_coordinator.workflow.self_checker.llm
+        is app.research_coordinator.workflow.report_repairer.llm
     )
 
 
@@ -551,6 +566,20 @@ def test_main_one_shot_report_generation_error_returns_1(
     captured = capsys.readouterr()
     assert "[report generation error]" in captured.err
     assert "disallowed Evidence" in captured.err
+
+
+def test_main_one_shot_self_check_error_returns_1(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureManager
+) -> None:
+    fake = FakeApp(raise_exc=SelfCheckError("Repair failed after one round"))
+    monkeypatch.setattr(cli, "_build_app", lambda: fake)
+
+    rc = cli.main(["research", "topic"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "[self-check error]" in captured.err
+    assert "Repair failed after one round" in captured.err
 
 
 def test_main_one_shot_web_search_error_returns_1(
