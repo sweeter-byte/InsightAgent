@@ -16,10 +16,11 @@ from insight_agent.evidence import (
 )
 from insight_agent.ingestion import SourceType
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
-from insight_agent.reporting import Claim, ReportGenerationError
+from insight_agent.reporting import Claim, ReportGenerationError, StructuredReport
 from insight_agent.research import ResearchRoutingWorkflow
 from insight_agent.retrieval import RetrievalResult
 from insight_agent.routing import RetrievalSource, RouteDecision
+from insight_agent.self_check import SelfCheckResult, SelfCheckStatus
 
 
 def _plan(task_count: int = 1) -> ResearchPlan:
@@ -146,12 +147,28 @@ class FakeReportGenerator:
         ]
 
 
+class AlwaysPassSelfChecker:
+    def check(self, **kwargs: Any) -> SelfCheckResult:
+        return SelfCheckResult(
+            status=SelfCheckStatus.PASS,
+            issues=[],
+            summary="Offline report fixture passes.",
+        )
+
+
+class NeverReportRepairer:
+    def repair(self, **kwargs: Any) -> StructuredReport:
+        raise AssertionError("Passing report fixture must not repair")
+
+
 def _workflow(report_generator: FakeReportGenerator) -> ResearchRoutingWorkflow:
     return ResearchRoutingWorkflow(
         router=FakeRouter(),  # type: ignore[arg-type]
         local_retriever=FakeRetriever(),
         grader=ScriptedGrader([]),  # type: ignore[arg-type]
         report_generator=report_generator,  # type: ignore[arg-type]
+        self_checker=AlwaysPassSelfChecker(),  # type: ignore[arg-type]
+        report_repairer=NeverReportRepairer(),  # type: ignore[arg-type]
     )
 
 
@@ -223,6 +240,8 @@ def test_complete_workflow_generates_report_once_after_all_tasks() -> None:
             ]
         ),
         report_generator=report_generator,  # type: ignore[arg-type]
+        self_checker=AlwaysPassSelfChecker(),  # type: ignore[arg-type]
+        report_repairer=NeverReportRepairer(),  # type: ignore[arg-type]
     )
     state = ResearchState(
         query="query",

@@ -21,7 +21,7 @@ from insight_agent.evidence import (
     EvidenceRelevance,
 )
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
-from insight_agent.reporting import Claim
+from insight_agent.reporting import Claim, StructuredReport
 from insight_agent.research.workflow import (
     ResearchRoutingWorkflow as BaseResearchRoutingWorkflow,
 )
@@ -165,6 +165,20 @@ class FakeEvidenceGrader:
         ]
 
 
+class AlwaysPassSelfChecker:
+    def check(self, **kwargs: Any) -> SelfCheckResult:
+        return SelfCheckResult(
+            status=SelfCheckStatus.PASS,
+            issues=[],
+            summary="Offline workflow fixture passes.",
+        )
+
+
+class NeverReportRepairer:
+    def repair(self, **kwargs: Any) -> StructuredReport:
+        raise AssertionError("Passing workflow fixture must not repair")
+
+
 def _assessment(
     *,
     task_id: str = "T1",
@@ -190,6 +204,8 @@ class ResearchRoutingWorkflow(BaseResearchRoutingWorkflow):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         kwargs.setdefault("report_generator", kwargs["grader"])
+        kwargs.setdefault("self_checker", AlwaysPassSelfChecker())
+        kwargs.setdefault("report_repairer", NeverReportRepairer())
         super().__init__(*args, **kwargs)
 
 
@@ -394,6 +410,14 @@ class OrderedWorkflow(ResearchRoutingWorkflow):
     def generate_report(self, state: ResearchState) -> dict[str, Any]:
         self.events.append("generate_report")
         return super().generate_report(state)
+
+    def self_check_report(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("self_check_report")
+        return super().self_check_report(state)
+
+    def finalize_report(self, state: ResearchState) -> dict[str, Any]:
+        self.events.append("finalize_report")
+        return super().finalize_report(state)
 
 
 def _state(task_count: int = 1) -> ResearchState:
@@ -705,6 +729,8 @@ def test_each_source_collects_evidence_before_advancing(
         "grade_evidence",
         "advance_task",
         "generate_report",
+        "self_check_report",
+        "finalize_report",
     ]
     assert len(final_state.evidence_pool["T1"]) == 1
     evidence = final_state.evidence_pool["T1"][0]
@@ -1007,6 +1033,8 @@ def test_insufficient_evidence_retries_through_router_then_accumulates() -> None
         "grade_evidence",
         "advance_task",
         "generate_report",
+        "self_check_report",
+        "finalize_report",
     ]
     assert [call["retrieval_query"] for call in router.calls] == [
         task_question,

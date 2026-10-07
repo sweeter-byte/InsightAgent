@@ -24,7 +24,11 @@ from insight_agent.routing.models import (
     RouteDecision,
     RoutingError,
 )
-from insight_agent.self_check import SelfCheckResult
+from insight_agent.self_check import (
+    SelfCheckError,
+    SelfCheckResult,
+    SelfCheckStatus,
+)
 from insight_agent.web_search.errors import WebSearchConfigurationError
 from insight_agent.web_search.models import WebRetrievalResult
 from insight_agent.vision_retrieval.errors import VisionRetrievalError
@@ -32,6 +36,7 @@ from insight_agent.vision_retrieval.models import VisionRetrievalResult
 
 
 MAX_RETRIEVAL_ROUNDS = 2
+MAX_REPAIR_ROUNDS = 1
 
 
 class TaskRouter(Protocol):
@@ -103,6 +108,33 @@ class TaskReportGenerator(Protocol):
         ...
 
 
+class ReportChecker(Protocol):
+    def check(
+        self,
+        *,
+        plan: ResearchPlan,
+        report: StructuredReport,
+        evidence_pool: dict[str, list[Evidence]],
+        assessments: dict[str, list[EvidenceAssessment]],
+    ) -> SelfCheckResult:
+        """Check one complete report without changing research state."""
+        ...
+
+
+class ReportRepairer(Protocol):
+    def repair(
+        self,
+        *,
+        plan: ResearchPlan,
+        report: StructuredReport,
+        self_check_result: SelfCheckResult,
+        evidence_pool: dict[str, list[Evidence]],
+        assessments: dict[str, list[EvidenceAssessment]],
+    ) -> StructuredReport:
+        """Return a controlled repaired report from existing state only."""
+        ...
+
+
 class _GraphState(TypedDict):
     """LangGraph-only schema adapted from the canonical dataclass at the boundary."""
 
@@ -137,6 +169,8 @@ class ResearchRoutingWorkflow:
         *,
         grader: TaskEvidenceGrader,
         report_generator: TaskReportGenerator,
+        self_checker: ReportChecker,
+        report_repairer: ReportRepairer,
         max_retrieval_rounds: int = MAX_RETRIEVAL_ROUNDS,
     ) -> None:
         if (
@@ -148,6 +182,8 @@ class ResearchRoutingWorkflow:
         self.router = router
         self.grader = grader
         self.report_generator = report_generator
+        self.self_checker = self_checker
+        self.report_repairer = report_repairer
         self.local_retriever = local_retriever
         self.web_retriever = web_retriever
         self.vision_retriever = vision_retriever
@@ -167,6 +203,10 @@ class ResearchRoutingWorkflow:
         builder.add_node("prepare_retry", self._prepare_retry_node)
         builder.add_node("advance_task", self._advance_task_node)
         builder.add_node("generate_report", self._generate_report_node)
+        builder.add_node("self_check_report", self._self_check_report_node)
+        builder.add_node("repair_report", self._repair_report_node)
+        builder.add_node("finalize_report", self._finalize_report_node)
+        builder.add_node("failed", self._failed_node)
 
         builder.add_edge(START, "select_task")
         builder.add_edge("select_task", "route_task")
@@ -196,7 +236,18 @@ class ResearchRoutingWorkflow:
             self._next_step_edge,
             {"select_task": "select_task", "generate_report": "generate_report"},
         )
-        builder.add_edge("generate_report", END)
+        builder.add_edge("generate_report", "self_check_report")
+        builder.add_conditional_edges(
+            "self_check_report",
+            self._choose_after_self_check_edge,
+            {
+                "finalize_report": "finalize_report",
+                "repair_report": "repair_report",
+                "failed": "failed",
+            },
+        )
+        builder.add_edge("repair_report", "self_check_report")
+        builder.add_edge("finalize_report", END)
         return builder.compile()
 
     def run(self, state: ResearchState) -> ResearchState:
@@ -234,7 +285,12 @@ class ResearchRoutingWorkflow:
                 raise RoutingError(
                     f"workflow route and assessment histories differ for task {task.id}"
                 )
-        if final_state.report is None or final_state.final_output is None:
+        if (
+            final_state.report is None
+            or final_state.final_output is None
+            or final_state.self_check_result is None
+            or final_state.self_check_result.status is not SelfCheckStatus.PASS
+        ):
             raise RoutingError("workflow must finish with a rendered report")
         return final_state
 
@@ -580,6 +636,71 @@ class ResearchRoutingWorkflow:
         report = assemble_report(plan.objective, sections, state.evidence_pool)
         return {"report": report}
 
+    def self_check_report(
+        self,
+        state: ResearchState,
+    ) -> dict[str, SelfCheckResult]:
+        """Check the structured report without modifying it."""
+        if state.plan is None or state.report is None:
+            raise SelfCheckError(
+                "self-check requires a research plan and structured report"
+            )
+        result = self.self_checker.check(
+            plan=state.plan,
+            report=state.report,
+            evidence_pool=state.evidence_pool,
+            assessments=state.evidence_assessments,
+        )
+        self._validate_self_check_result(result)
+        return {"self_check_result": result}
+
+    @staticmethod
+    def choose_after_self_check(state: ResearchState) -> str:
+        """Route a validated result using the fixed one-Repair budget."""
+        result = state.self_check_result
+        ResearchRoutingWorkflow._validate_self_check_result(result)
+        assert result is not None
+        if result.status is SelfCheckStatus.PASS:
+            return "finalize_report"
+        if state.self_check_rounds < MAX_REPAIR_ROUNDS:
+            return "repair_report"
+        return "failed"
+
+    @staticmethod
+    def finalize_report(state: ResearchState) -> dict[str, str]:
+        """Render Markdown only after the latest self-check passed."""
+        result = state.self_check_result
+        ResearchRoutingWorkflow._validate_self_check_result(result)
+        if result is None or result.status is not SelfCheckStatus.PASS:
+            raise SelfCheckError("only a passing report may be finalized")
+        if state.report is None:
+            raise SelfCheckError("cannot finalize without a structured report")
+        if state.final_output is not None:
+            raise SelfCheckError("report has already been finalized")
+        return {"final_output": MarkdownReportRenderer().render(state.report)}
+
+    def repair_report(self, state: ResearchState) -> dict[str, Any]:
+        """Implemented after its bounded-loop behavior is established by tests."""
+        raise SelfCheckError("controlled repair is not available")
+
+    @staticmethod
+    def fail_self_check(state: ResearchState) -> dict[str, Any]:
+        """Implemented after exhausted-budget behavior is established by tests."""
+        raise SelfCheckError("report self-check failed")
+
+    @staticmethod
+    def _validate_self_check_result(result: object) -> None:
+        if not isinstance(result, SelfCheckResult):
+            raise SelfCheckError("self-checker must return SelfCheckResult")
+        if not isinstance(result.status, SelfCheckStatus):
+            raise SelfCheckError("self-check result status is invalid")
+        if result.status is SelfCheckStatus.PASS and result.issues:
+            raise SelfCheckError("pass self-check result must not contain issues")
+        if result.status is SelfCheckStatus.REVISE and not result.issues:
+            raise SelfCheckError(
+                "revise self-check result must contain at least one issue"
+            )
+
     @staticmethod
     def _current_retrieval_query(state: ResearchState) -> str:
         query = state.retrieval_query
@@ -712,6 +833,18 @@ class ResearchRoutingWorkflow:
     def _generate_report_node(self, state: _GraphState) -> dict[str, Any]:
         return self.generate_report(self._from_graph_state(state))
 
+    def _self_check_report_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.self_check_report(self._from_graph_state(state))
+
+    def _repair_report_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.repair_report(self._from_graph_state(state))
+
+    def _finalize_report_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.finalize_report(self._from_graph_state(state))
+
+    def _failed_node(self, state: _GraphState) -> dict[str, Any]:
+        return self.fail_self_check(self._from_graph_state(state))
+
     def _choose_source_edge(self, state: _GraphState) -> str:
         return self.choose_source(self._from_graph_state(state))
 
@@ -720,3 +853,6 @@ class ResearchRoutingWorkflow:
 
     def _next_step_edge(self, state: _GraphState) -> str:
         return self.next_step(self._from_graph_state(state))
+
+    def _choose_after_self_check_edge(self, state: _GraphState) -> str:
+        return self.choose_after_self_check(self._from_graph_state(state))
