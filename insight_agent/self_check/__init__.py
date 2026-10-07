@@ -1,5 +1,6 @@
 """Public API for report self-check and controlled repair."""
 
+from insight_agent.self_check.checker import ReportSelfChecker
 from insight_agent.self_check.models import (
     SelfCheckError,
     SelfCheckIssue,
@@ -9,6 +10,7 @@ from insight_agent.self_check.models import (
 )
 
 __all__ = [
+    "ReportSelfChecker",
     "SelfCheckError",
     "SelfCheckIssue",
     "SelfCheckIssueCode",
