@@ -167,8 +167,9 @@ runtime-validated `StructuredReport` to the workflow.
 ## Workflow Integration
 
 `ResearchRoutingWorkflow` receives injected self-checker and repairer
-collaborators and a positive `max_repair_rounds` value whose default is one.
-The canonical and LangGraph state schemas carry the two new fields.
+collaborators. Its Chapter 14 repair budget is the fixed constant
+`MAX_REPAIR_ROUNDS = 1`; it is not configurable to a larger value. The
+canonical and LangGraph state schemas carry the two new fields.
 
 `generate_report` stops rendering and returns only `report`.
 `self_check_report` returns only `self_check_result`.
