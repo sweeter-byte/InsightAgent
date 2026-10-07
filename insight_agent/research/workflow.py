@@ -680,13 +680,45 @@ class ResearchRoutingWorkflow:
         return {"final_output": MarkdownReportRenderer().render(state.report)}
 
     def repair_report(self, state: ResearchState) -> dict[str, Any]:
-        """Implemented after its bounded-loop behavior is established by tests."""
-        raise SelfCheckError("controlled repair is not available")
+        """Apply one controlled Repair and return to self-check."""
+        if state.plan is None or state.report is None:
+            raise SelfCheckError("repair requires a plan and structured report")
+        result = state.self_check_result
+        self._validate_self_check_result(result)
+        if result is None or result.status is not SelfCheckStatus.REVISE:
+            raise SelfCheckError("repair requires a revise result")
+        if state.self_check_rounds >= MAX_REPAIR_ROUNDS:
+            raise SelfCheckError("report repair budget is exhausted")
+        if state.final_output is not None:
+            raise SelfCheckError("cannot repair a finalized report")
+        repaired = self.report_repairer.repair(
+            plan=state.plan,
+            report=state.report,
+            self_check_result=result,
+            evidence_pool=state.evidence_pool,
+            assessments=state.evidence_assessments,
+        )
+        repaired = self._validate_repaired_report(state, repaired)
+        return {
+            "report": repaired,
+            "self_check_rounds": state.self_check_rounds + 1,
+        }
 
     @staticmethod
     def fail_self_check(state: ResearchState) -> dict[str, Any]:
-        """Implemented after exhausted-budget behavior is established by tests."""
-        raise SelfCheckError("report self-check failed")
+        """Fail closed after a revised report exhausts its Repair budget."""
+        result = state.self_check_result
+        ResearchRoutingWorkflow._validate_self_check_result(result)
+        if result is None or result.status is not SelfCheckStatus.REVISE:
+            raise SelfCheckError("failure requires a revise self-check result")
+        if state.self_check_rounds < MAX_REPAIR_ROUNDS:
+            raise SelfCheckError("failure reached before repair budget exhaustion")
+        if state.final_output is not None:
+            raise SelfCheckError("failed report must not have final output")
+        raise SelfCheckError(
+            "report self-check failed after "
+            f"{state.self_check_rounds} repair: {result.summary}"
+        )
 
     @staticmethod
     def _validate_self_check_result(result: object) -> None:
@@ -700,6 +732,57 @@ class ResearchRoutingWorkflow:
             raise SelfCheckError(
                 "revise self-check result must contain at least one issue"
             )
+
+    @staticmethod
+    def _validate_repaired_report(
+        state: ResearchState,
+        repaired: object,
+    ) -> StructuredReport:
+        if not isinstance(repaired, StructuredReport):
+            raise SelfCheckError("report repairer must return StructuredReport")
+        assert state.plan is not None
+        if repaired.objective != state.plan.objective:
+            raise SelfCheckError("repaired report objective does not match the plan")
+        if [section.task_id for section in repaired.sections] != [
+            task.id for task in state.plan.tasks
+        ]:
+            raise SelfCheckError("repaired report sections must follow the plan")
+        for task, section in zip(
+            state.plan.tasks,
+            repaired.sections,
+            strict=True,
+        ):
+            history = state.evidence_assessments.get(task.id, [])
+            if not history:
+                raise SelfCheckError(
+                    f"task {task.id} has no Evidence assessment for repair"
+                )
+            assessment = history[-1]
+            if section.title != task.question:
+                raise SelfCheckError("repair must preserve report section titles")
+            if (
+                section.sufficient is not assessment.sufficient
+                or section.missing_information != assessment.missing_information
+            ):
+                raise SelfCheckError(
+                    "repair must preserve the latest Evidence assessment"
+                )
+            candidates = select_report_candidates(
+                task,
+                list(state.evidence_pool.get(task.id, [])),
+                assessment,
+            )
+            validate_claims(task, candidates, section.claims)
+        validated = assemble_report(
+            state.plan.objective,
+            repaired.sections,
+            state.evidence_pool,
+        )
+        if validated != repaired:
+            raise SelfCheckError(
+                "repaired report citations do not match trusted Evidence"
+            )
+        return repaired
 
     @staticmethod
     def _current_retrieval_query(state: ResearchState) -> str:
