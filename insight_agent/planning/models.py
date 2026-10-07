@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from insight_agent.reporting import StructuredReport
     from insight_agent.retrieval import RetrievalResult
     from insight_agent.routing.models import RetrievalSource, RouteDecision
+    from insight_agent.self_check import SelfCheckResult
     from insight_agent.vision_retrieval.models import VisionRetrievalResult
     from insight_agent.web_search.models import WebRetrievalResult
 
@@ -63,6 +64,8 @@ class ResearchState:
     )
     report: StructuredReport | None = None
     final_output: str | None = None
+    self_check_result: SelfCheckResult | None = None
+    self_check_rounds: int = 0
 
 
 def validate_research_plan(plan: ResearchPlan) -> None:
