@@ -1,0 +1,21 @@
+{
+  "format_version": "evaluation_regression_policy.v1",
+  "aggregate_max_drops": {
+    "retrieval.mean_recall_at_k": 0.02,
+    "retrieval.mrr": 0.02,
+    "evidence.relevance_pass_rate": 0.02,
+    "evidence.coverage_pass_rate": 0.02,
+    "answer.grounded_claim_pass_rate": 0.02,
+    "answer.coverage_pass_rate": 0.02,
+    "answer.constraint_pass_rate": 0.02
+  },
+  "runtime_max_increase_ratios": {
+    "runtime.p95_latency_ms": 0.20,
+    "runtime.total_prompt_tokens": 0.20,
+    "runtime.total_completion_tokens": 0.20
+  },
+  "critical_case_ids": [],
+  "fail_on_any_pass_to_fail": true,
+  "missing_metric_action": "inconclusive",
+  "infrastructure_error_action": "inconclusive"
+}

@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from evals import (
+    claim_semantic_precondition_errors,
     provenance_valid_rate,
     validate_citations,
     validate_claim_bindings,
@@ -276,3 +277,59 @@ def test_validate_report_structure_reports_evidence_mapping_key_mismatch() -> No
     assert validate_report_structure(report, {"wrong-key": evidence}) == (
         "evidence_key_mismatch:wrong-key:E1",
     )
+
+
+def test_validate_claim_bindings_reports_blank_text_and_duplicate_claim_ids() -> None:
+    evidence = _evidence("E1")
+    report = _report(
+        Claim(id="T1-C1", task_id="T1", text=" ", evidence_ids=["E1"]),
+        Claim(id="T1-C1", task_id="T1", text="Fact", evidence_ids=["E1"]),
+    )
+
+    errors = validate_claim_bindings(report, {"E1": evidence})
+
+    assert "invalid_claim_text:T1-C1" in errors
+    assert "duplicate_claim_id:T1-C1" in errors
+
+
+def test_claim_semantic_preconditions_identify_only_affected_claims() -> None:
+    valid = _evidence("E1")
+    other_task = _evidence("E2", task_id="T2")
+    report = _report(
+        Claim(id="T1-C1", task_id="T1", text="Valid", evidence_ids=["E1"]),
+        Claim(id="T1-C2", task_id="T1", text="Missing", evidence_ids=["missing"]),
+        Claim(id="T1-C3", task_id="T1", text="Cross-task", evidence_ids=["E2"]),
+    )
+    report.citations = [build_citation(1, valid), build_citation(2, other_task)]
+
+    errors = claim_semantic_precondition_errors(
+        report,
+        {"E1": valid, "E2": other_task},
+    )
+
+    assert errors["T1-C1"] == ()
+    assert "missing_evidence:T1-C2:missing" in errors["T1-C2"]
+    assert "cross_task_binding:T1-C3:E2" in errors["T1-C3"]
+
+
+def test_claim_semantic_preconditions_include_citation_provenance_errors() -> None:
+    first = _evidence("E1")
+    second = _evidence("E2")
+    report = _report(
+        Claim(id="T1-C1", task_id="T1", text="First", evidence_ids=["E1"]),
+        Claim(id="T1-C2", task_id="T1", text="Second", evidence_ids=["E2"]),
+    )
+    valid_second = build_citation(1, second)
+    report.citations = [
+        Citation(1, "E1", "Invented", first.source),
+        valid_second,
+    ]
+
+    errors = claim_semantic_precondition_errors(
+        report,
+        {"E1": first, "E2": second},
+    )
+
+    assert any("citation_provenance_mismatch:E1" in item for item in errors["T1-C1"])
+    assert any("duplicate_citation_number:1" in item for item in errors["T1-C1"])
+    assert any("duplicate_citation_number:1" in item for item in errors["T1-C2"])

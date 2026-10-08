@@ -22,6 +22,9 @@ htmlcov/
 # InsightAgent runtime state
 .insight_agent/
 
+# Generated Evaluation runs (Datasets and fixtures remain versioned)
+eval_results/runs/
+
 # Env / secrets
 .env
 .env.local

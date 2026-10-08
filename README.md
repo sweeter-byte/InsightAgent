@@ -448,3 +448,120 @@ Runtime policy is configured with `RUNTIME_REDIS_URL`,
 `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`. This chapter intentionally does not add
 authentication, distributed workers, automatic resume, WebSockets, or
 exactly-once execution.
+
+## What Chapter 17 adds
+
+Chapter 17 keeps Evaluation outside the production Research Workflow. The
+runner loads a fixed JSONL Dataset, calls the Retriever directly for Cases
+tagged `retrieval`, and calls an injected Workflow Runner directly for Cases
+tagged `research`; it does not use FastAPI, SSE, or Redis. The production
+adapter invokes the existing Planner and `ResearchRoutingWorkflow` without a
+checkpoint configuration, while the checked-in smoke run uses an explicitly
+labelled fake workflow.
+
+Run the fully network-blocked Offline Mock Test with recorded search hits,
+recorded page bodies, and the existing repository-local Vision image:
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python -m evals \
+  --dataset eval_data/research_eval_smoke_v1.jsonl \
+  --fixture evals/fixtures/smoke_v1.json \
+  --mode offline \
+  --output eval_results/runs
+```
+
+Use `--case <case-id>` to select one or more Cases. The CLI also accepts
+`--dataset-version`, `--model`, `--prompt-version`, `--index-version`,
+`--top-k`, and `--run-id`. Every run records the Git commit, Dataset version
+and SHA-256, model, Prompt version, Index version, Retriever configuration,
+mode, Evaluation type, and a canonical configuration fingerprint.
+
+Generated artifacts have this shape:
+
+```text
+eval_results/runs/<eval-run-id>/
+├── run.json
+├── bad_cases.json
+└── cases/<safe-case-id>/
+    ├── result.json
+    └── artifacts.json
+```
+
+`result.json` retains each Judge execution status and reason, structural
+errors, layer results, runtime metrics, and Case-level execution errors.
+`artifacts.json` retains the necessary raw workflow material. A failed Case
+does not discard later Cases. Aggregate quality denominators include only
+computed metrics and completed Judge labels; `not_computable`, `timeout`,
+invalid output, backend errors, and runtime failures remain separately
+counted. Token or call usage that cannot be observed is stored as `null`, not
+estimated.
+
+The smoke Dataset contains only traceable labels. Its Gold retrieval ID names
+an entry in `smoke-index-v1`, its Web required point cites the fixed recorded
+page, and the unlabeled Vision dimension is deliberately skipped. Offline
+mode installs a socket/DNS guard around each Case, so Web Search, page fetches,
+external LLM Judges, VLMs, Embeddings, and other network model clients cannot
+silently escape the fixture boundary.
+
+These outputs are **Mock Test** results and do not establish InsightAgent's
+real research quality. Live Tests require separately assembled real Retriever,
+Workflow, Judge, VLM, and Embedding components and must be labelled
+`live_test`; the fixture CLI intentionally refuses `--mode live` rather than
+misrepresenting recorded outputs as real-model results.
+
+### Bad Cases, Baselines, and Regression
+
+Each completed Evaluation Run writes a versioned `bad_cases.json`. Confirmed
+semantic or deterministic failures are classified as `retrieval_miss`,
+`rerank_drop`, `evidence_noise`, `evidence_gap`, `unsupported_claim`,
+`citation_error`, or `constraint_violation`; Case execution failures use the
+separate `runtime_failure` category. Judge timeout/backend/invalid-output
+states and missing Gold Labels are reported as Evaluation anomalies, not
+silently converted into Agent quality failures.
+
+Baseline creation is a separate, explicit operation and never occurs during a
+normal run:
+
+```bash
+conda run --no-capture-output -n insight-agent python -m evals \
+  --register-baseline eval_results/runs/<eval-run-id> \
+  --baseline-output eval_results/baselines/research-smoke-v1.json \
+  --baseline-kind mock_only \
+  --confirm-baseline
+```
+
+`mock_test` Runs can only become `mock_only` Baselines. They are useful for
+verifying the harness and recorded-fixture behavior, but cannot be registered
+as real-quality Baselines. Existing Baselines are not overwritten unless
+`--overwrite-baseline` is supplied explicitly.
+
+Compare an already-persisted Candidate without rerunning the workflow or any
+Judge:
+
+```bash
+conda run --no-capture-output -n insight-agent python -m evals \
+  --baseline eval_results/baselines/research-smoke-v1.json \
+  --candidate eval_results/runs/<candidate-run-id> \
+  --policy evals/policies/default_v1.json \
+  --report-output eval_results/reports/<candidate-run-id>
+```
+
+The comparator requires matching Dataset version/content, Case IDs, Gold IDs,
+fixture identity, Evaluation mode/type, and the Index version used by Gold
+retrieval labels. Model, Prompt, Git commit, and Reranker changes remain
+comparable because they are the system changes Regression is intended to
+measure. Missing metrics stay missing rather than becoming zero. Policy
+actions decide whether missing metrics and Evaluation infrastructure errors
+are ignored, regressions, or inconclusive.
+
+The command writes stable `regression.json` and `regression.md` reports. Exit
+codes are `0` for pass, `1` for regression, `2` for incompatible/configuration
+errors, and `3` for inconclusive comparisons.
+
+At this point the Chapter 17 Evaluation infrastructure is implemented: fixed
+Datasets and fixtures, layered evaluators, structured artifacts, Bad Cases,
+explicit Baselines, policy-driven comparison, and reports. Real-model quality
+is **not** validated by the checked-in Mock Test; that requires a separately
+assembled and reviewed `live_test` Run with real components and human-audited
+labels/Judge outcomes.

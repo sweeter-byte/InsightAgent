@@ -1,0 +1,67 @@
+{
+  "fixture_version": "smoke-v1",
+  "index_version": "smoke-index-v1",
+  "retrieval_by_query": {
+    "Why does chunk overlap preserve boundary context?": [
+      {
+        "chunk_id": "fixture-chunk-overlap",
+        "score": 1.0,
+        "content": "Chunk overlap retains context near adjacent chunk boundaries and reduces boundary truncation.",
+        "document_id": "fixture-chunking-notes",
+        "source": "evals/fixtures/smoke_v1.json",
+        "source_type": "markdown",
+        "chunk_index": 0,
+        "start_char": 0,
+        "end_char": 94,
+        "metadata": {
+          "fixture_version": "smoke-v1",
+          "label_source": "human-verified fixture passage"
+        }
+      }
+    ]
+  },
+  "search_hits_by_query": {
+    "How does the offline web evaluation avoid live network access?": [
+      {
+        "title": "Recorded offline evaluation note",
+        "url": "https://fixture.invalid/offline-evaluation",
+        "snippet": "Recorded search and page inputs make the Web path repeatable.",
+        "score": 1.0
+      }
+    ]
+  },
+  "pages_by_url": {
+    "https://fixture.invalid/offline-evaluation": {
+      "content": "Offline web evaluation uses recorded search hits and recorded page bodies. It does not fetch a live search provider or webpage service.",
+      "metadata": {
+        "title": "Recorded offline evaluation note",
+        "fixture_version": "smoke-v1"
+      }
+    }
+  },
+  "workflow_by_case": {
+    "recorded_web_research": {
+      "source": "web",
+      "section_title": "Offline Web",
+      "claim_text": "Offline web evaluation uses recorded search hits and recorded page bodies.",
+      "final_output": "# Offline Web\n\nOffline web evaluation uses recorded inputs only."
+    },
+    "fixed_vision_research": {
+      "source": "vision",
+      "section_title": "Fixed Vision",
+      "analysis": "The Evaluation fixture references the repository-local examples/vision_workflow.png image.",
+      "claim_text": "The offline fixture reuses the repository-local vision_workflow.png image.",
+      "final_output": "# Fixed Vision\n\nThe repository-local image is reused without downloading it."
+    }
+  },
+  "judge_results_by_case": {
+    "recorded_web_research": {
+      "label": "pass",
+      "reason": "Recorded Mock Judge result for the fixed Web fixture."
+    },
+    "fixed_vision_research": {
+      "label": "pass",
+      "reason": "Recorded Mock Judge result for the fixed local image fixture."
+    }
+  }
+}

@@ -36,3 +36,30 @@ def test_missing_model_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
     with pytest.raises(RuntimeError, match="LLM_MODEL"):
         LLMClient()
+
+
+def test_chat_forwards_optional_timeout_without_changing_legacy_calls() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> str:
+            calls.append(kwargs)
+            return "response"
+
+    client = object.__new__(LLMClient)
+    client.model = "judge-model"
+    client.client = type(
+        "FakeOpenAI",
+        (),
+        {"chat": type("FakeChat", (), {"completions": FakeCompletions()})()},
+    )()
+
+    assert client.chat([{"role": "user", "content": "first"}]) == "response"
+    assert client.chat(
+        [{"role": "user", "content": "second"}],
+        tools=None,
+        timeout=2.5,
+    ) == "response"
+
+    assert "timeout" not in calls[0]
+    assert calls[1]["timeout"] == 2.5

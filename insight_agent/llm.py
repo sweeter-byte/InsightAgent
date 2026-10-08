@@ -64,6 +64,8 @@ class LLMClient:
         self,
         messages: Sequence[dict[str, Any]],
         tools: Sequence[dict[str, Any]] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         """Call the Chat Completions API and return the raw SDK response.
 
@@ -72,6 +74,7 @@ class LLMClient:
             tools:    Optional list of OpenAI-format tool schemas. When omitted,
                       the call is made without the ``tools`` kwarg so the model
                       cannot emit tool calls.
+            timeout:  Optional per-request SDK deadline in seconds.
 
         Returns:
             The ``ChatCompletion`` object produced by the SDK. The caller is
@@ -83,4 +86,6 @@ class LLMClient:
         }
         if tools is not None:
             kwargs["tools"] = list(tools)
+        if timeout is not None:
+            kwargs["timeout"] = timeout
         return self.client.chat.completions.create(**kwargs)

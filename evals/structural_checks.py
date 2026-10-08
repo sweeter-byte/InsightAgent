@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from insight_agent.evidence import Evidence
 from insight_agent.reporting import (
+    Citation,
     ReportGenerationError,
     StructuredReport,
     build_citation,
@@ -20,8 +21,17 @@ def validate_claim_bindings(
 ) -> tuple[str, ...]:
     """Return structural errors in Claim-to-Evidence relationships."""
     errors: list[str] = []
+    seen_claim_ids: set[str] = set()
     for section in report.sections:
         for claim in section.claims:
+            if not isinstance(claim.id, str) or not claim.id.strip():
+                errors.append("invalid_claim_id:<missing>")
+            elif claim.id in seen_claim_ids:
+                errors.append(f"duplicate_claim_id:{claim.id}")
+            else:
+                seen_claim_ids.add(claim.id)
+            if not isinstance(claim.text, str) or not claim.text.strip():
+                errors.append(f"invalid_claim_text:{claim.id}")
             if claim.task_id != section.task_id:
                 errors.append(
                     "section_claim_task_mismatch:"
@@ -47,6 +57,106 @@ def validate_claim_bindings(
                         f"cross_task_binding:{claim.id}:{evidence_id}"
                     )
     return tuple(errors)
+
+
+def claim_semantic_precondition_errors(
+    report: StructuredReport,
+    evidence_by_id: Mapping[str, Evidence],
+) -> dict[str, tuple[str, ...]]:
+    """Map each Claim ID to structure errors that make judging it unsafe."""
+    claim_counts: dict[str, int] = {}
+    for section in report.sections:
+        for claim in section.claims:
+            claim_counts[claim.id] = claim_counts.get(claim.id, 0) + 1
+
+    citations_by_evidence: dict[str, list[Citation]] = {}
+    citation_number_counts: dict[int, int] = {}
+    for citation in report.citations:
+        citations_by_evidence.setdefault(citation.evidence_id, []).append(citation)
+        if isinstance(citation.number, int) and not isinstance(citation.number, bool):
+            citation_number_counts[citation.number] = (
+                citation_number_counts.get(citation.number, 0) + 1
+            )
+
+    errors_by_claim: dict[str, tuple[str, ...]] = {}
+    for section in report.sections:
+        for claim in section.claims:
+            errors: list[str] = []
+            if not isinstance(claim.id, str) or not claim.id.strip():
+                errors.append("invalid_claim_id:<missing>")
+            if claim_counts.get(claim.id, 0) > 1:
+                errors.append(f"duplicate_claim_id:{claim.id}")
+            if not isinstance(claim.text, str) or not claim.text.strip():
+                errors.append(f"invalid_claim_text:{claim.id}")
+            if claim.task_id != section.task_id:
+                errors.append(
+                    "section_claim_task_mismatch:"
+                    f"{section.task_id}:{claim.id}:{claim.task_id}"
+                )
+            if not claim.evidence_ids:
+                errors.append(f"claim_without_evidence:{claim.id}")
+
+            seen_evidence: set[str] = set()
+            for evidence_id in claim.evidence_ids:
+                if evidence_id in seen_evidence:
+                    errors.append(
+                        f"duplicate_evidence_binding:{claim.id}:{evidence_id}"
+                    )
+                    continue
+                seen_evidence.add(evidence_id)
+                evidence = evidence_by_id.get(evidence_id)
+                if evidence is None:
+                    errors.append(f"missing_evidence:{claim.id}:{evidence_id}")
+                else:
+                    if evidence.task_id != claim.task_id:
+                        errors.append(
+                            f"cross_task_binding:{claim.id}:{evidence_id}"
+                        )
+                    errors.extend(validate_evidence_provenance(evidence))
+
+                citations = citations_by_evidence.get(evidence_id, [])
+                if not citations:
+                    errors.append(f"missing_citation:{evidence_id}")
+                    continue
+                if len(citations) > 1:
+                    errors.append(f"duplicate_citation_evidence:{evidence_id}")
+                for citation in citations:
+                    number = citation.number
+                    if (
+                        isinstance(number, bool)
+                        or not isinstance(number, int)
+                        or number <= 0
+                    ):
+                        errors.append(
+                            "invalid_citation_number:"
+                            f"{evidence_id}:{number}"
+                        )
+                    elif citation_number_counts.get(number, 0) > 1:
+                        errors.append(
+                            f"duplicate_citation_number:{number}:{evidence_id}"
+                        )
+                    if evidence is None:
+                        errors.append(f"citation_missing_evidence:{evidence_id}")
+                        continue
+                    try:
+                        expected = build_citation(number, evidence)
+                    except ReportGenerationError:
+                        errors.append(
+                            f"citation_provenance_unbuildable:{evidence_id}"
+                        )
+                        continue
+                    for field_name in ("label", "source", "locator"):
+                        if getattr(citation, field_name) != getattr(
+                            expected, field_name
+                        ):
+                            errors.append(
+                                "citation_provenance_mismatch:"
+                                f"{evidence_id}:{field_name}"
+                            )
+
+            existing = list(errors_by_claim.get(claim.id, ()))
+            errors_by_claim[claim.id] = tuple(dict.fromkeys([*existing, *errors]))
+    return errors_by_claim
 
 
 def validate_evidence_provenance(evidence: Evidence) -> tuple[str, ...]:

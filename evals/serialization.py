@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 from enum import Enum
@@ -21,6 +23,77 @@ def evaluation_result_to_dict(result: EvaluationResult) -> dict[str, Any]:
         raise TypeError("evaluation result must serialize to a JSON object")
     json.dumps(value, ensure_ascii=False, allow_nan=False)
     return value
+
+
+def json_safe_value(value: Any) -> Any:
+    """Convert an artifact value to strict JSON-safe built-in values."""
+    converted = _json_value(value)
+    json.dumps(converted, ensure_ascii=False, allow_nan=False)
+    return converted
+
+
+def write_json_artifact(
+    path: str | Path,
+    value: Any,
+    *,
+    indent: int = 2,
+) -> None:
+    """Write an arbitrary Evaluation-owned artifact as strict UTF-8 JSON."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(
+            json_safe_value(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=indent,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def atomic_write_json_artifact(
+    path: str | Path,
+    value: Any,
+    *,
+    indent: int = 2,
+    overwrite: bool = True,
+) -> None:
+    """Publish a complete sibling JSON write, optionally without replacement."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = (
+        json.dumps(
+            json_safe_value(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=indent,
+        )
+        + "\n"
+    )
+    handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            temporary.replace(destination)
+        else:
+            os.link(temporary, destination)
+            temporary.unlink()
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def evaluation_result_to_json(
@@ -44,7 +117,9 @@ def write_evaluation_result(
     indent: int = 2,
 ) -> None:
     """Write one Evaluation Result to an explicit path."""
-    Path(path).write_text(
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
         evaluation_result_to_json(result, indent=indent) + "\n",
         encoding="utf-8",
     )

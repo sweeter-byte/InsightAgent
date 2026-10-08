@@ -30,9 +30,15 @@ dev = [
     "pytest-asyncio>=0.24.0",
 ]
 
+[project.scripts]
+insight-agent-eval = "evals.__main__:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["insight_agent*"]
+include = ["insight_agent*", "evals*"]
+
+[tool.setuptools.package-data]
+evals = ["fixtures/*.json", "policies/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -360,3 +360,101 @@ curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 `RUNTIME_RUN_TIMEOUT_SECONDS`、`RUNTIME_EVENT_TTL_SECONDS`、
 `RUNTIME_INFRA_RETRY_ATTEMPTS` 与 `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`
 统一配置。本章不实现认证、分布式 Worker、自动恢复、WebSocket 或 Exactly-Once。
+
+## 第十七章新增：Evaluation Harness
+
+第十七章把评测保留在生产 Research Workflow 之外。Runner 读取固定 JSONL
+Dataset：带 `retrieval` 标签的 Case 直接调用 Retriever，带 `research` 标签的
+Case 直接调用注入的 Workflow Runner，不默认经过 FastAPI、SSE 或 Redis。生产
+适配器直接复用既有 Planner 与 `ResearchRoutingWorkflow`，且不传 checkpoint
+配置；仓库自带的 smoke 运行则明确使用 Fake Workflow。
+
+以下命令运行完全禁止网络访问的 Offline Mock Test。搜索结果、网页正文均来自录制
+Fixture，Vision Case 复用仓库已有本地图片：
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  python -m evals \
+  --dataset eval_data/research_eval_smoke_v1.jsonl \
+  --fixture evals/fixtures/smoke_v1.json \
+  --mode offline \
+  --output eval_results/runs
+```
+
+可重复传入 `--case <case-id>` 选择 Case。CLI 还支持 `--dataset-version`、
+`--model`、`--prompt-version`、`--index-version`、`--top-k` 与 `--run-id`。
+每个 Run 记录 Git Commit、Dataset Version 与 SHA-256、Model、Prompt Version、
+Index Version、Retriever Configuration、Mode、Evaluation Type 和稳定的配置指纹。
+
+结果目录如下：
+
+```text
+eval_results/runs/<eval-run-id>/
+├── run.json
+├── bad_cases.json
+└── cases/<safe-case-id>/
+    ├── result.json
+    └── artifacts.json
+```
+
+`result.json` 保留逐 Judge 的执行状态与原因、结构错误、各层原始结果、运行指标和
+Case 级异常；`artifacts.json` 保留必要的 Workflow 中间产物。单个 Case 失败不会
+丢弃后续 Case。汇总质量分母只包含已计算指标和 `completed` Judge Label；
+`not_computable`、`timeout`、非法输出、后端错误与运行失败均单独计数。无法从现有
+产物观察到的 Token 或调用指标写为 `null`，不会估算。
+
+smoke Dataset 只包含可追溯标签：Gold Retrieval ID 明确属于
+`smoke-index-v1`，Web required point 指向固定网页正文；Vision 语义 Gold 缺失，
+因此相应维度明确跳过。Offline Runner 在每个 Case 外安装 Socket/DNS Guard，
+真实 Web Search、网页服务、外部 LLM Judge、VLM、Embedding 或其他网络模型组件
+都不能静默越过 Fixture 边界。
+
+上述结果是 **Mock Test**，不能用于宣称 InsightAgent 的真实研究质量。Live Test
+必须单独组装真实 Retriever、Workflow、Judge、VLM 与 Embedding，并标记为
+`live_test`；Fixture CLI 会拒绝 `--mode live`，避免把录制结果冒充真实模型结果。
+
+### Bad Case、Baseline 与 Regression
+
+每个完整 Evaluation Run 都会写入版本化的 `bad_cases.json`。确定的语义或结构失败
+会分类为 `retrieval_miss`、`rerank_drop`、`evidence_noise`、`evidence_gap`、
+`unsupported_claim`、`citation_error` 或 `constraint_violation`；Case 执行失败单独
+使用 `runtime_failure`。Judge timeout、backend error、invalid output 与缺少 Gold
+Label 会作为评测异常或不可计算项展示，不会被静默算成 Agent 质量失败。
+
+Baseline 只能通过独立命令显式登记，普通评测不会自动更新它：
+
+```bash
+conda run --no-capture-output -n insight-agent python -m evals \
+  --register-baseline eval_results/runs/<eval-run-id> \
+  --baseline-output eval_results/baselines/research-smoke-v1.json \
+  --baseline-kind mock_only \
+  --confirm-baseline
+```
+
+`mock_test` 只能登记成 `mock_only` Baseline，用于验证评测框架和固定 Fixture 的
+回归行为，不能冒充真实质量基线。除非显式传入 `--overwrite-baseline`，已有 Baseline
+不会被覆盖。
+
+下面的命令直接比较已落盘 Candidate，不会重跑 Workflow 或 Judge：
+
+```bash
+conda run --no-capture-output -n insight-agent python -m evals \
+  --baseline eval_results/baselines/research-smoke-v1.json \
+  --candidate eval_results/runs/<candidate-run-id> \
+  --policy evals/policies/default_v1.json \
+  --report-output eval_results/reports/<candidate-run-id>
+```
+
+Comparator 要求 Dataset 版本与内容、Case ID、Gold ID、Fixture、Evaluation
+Mode/Test Kind，以及 Gold Retrieval Label 所依赖的 Index Version 一致。Model、
+Prompt、Git Commit 与 Reranker 的变化只是被观察的系统改动，不会仅因配置指纹变化
+就拒绝比较。缺失指标保持缺失，不按 0 计算；Policy 决定缺失指标与评测基础设施
+错误应当忽略、判为回归，还是给出 inconclusive。
+
+命令稳定生成 `regression.json` 和 `regression.md`。退出码为：pass=`0`、
+regression=`1`、incompatible/配置错误=`2`、inconclusive=`3`。
+
+至此完成的是第十七章的评测基础设施：固定 Dataset/Fixture、三层 Evaluator、结构化
+Artifact、Bad Case、显式 Baseline、Policy 驱动的比较与报告。仓库内置 Mock Test
+并未完成真实模型质量验证；后者仍需要单独装配真实组件、运行 `live_test`，并对人工
+标注与 Judge 结果进行审查。
