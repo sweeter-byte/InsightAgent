@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Protocol, TypedDict
 
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import StateSnapshot
 
 from insight_agent.evidence import Evidence, EvidenceAssessment, EvidenceCollector
 from insight_agent.planning.models import ResearchPlan, ResearchState, ResearchTask
@@ -172,6 +175,7 @@ class ResearchRoutingWorkflow:
         self_checker: ReportChecker,
         report_repairer: ReportRepairer,
         max_retrieval_rounds: int = MAX_RETRIEVAL_ROUNDS,
+        checkpointer: BaseCheckpointSaver[Any] | None = None,
     ) -> None:
         if (
             isinstance(max_retrieval_rounds, bool)
@@ -189,9 +193,13 @@ class ResearchRoutingWorkflow:
         self.vision_retriever = vision_retriever
         self.max_retrieval_rounds = max_retrieval_rounds
         self.evidence_collector = EvidenceCollector()
-        self.graph = self._build_graph()
+        self.graph = self._build_graph(checkpointer=checkpointer)
 
-    def _build_graph(self) -> Any:
+    def _build_graph(
+        self,
+        *,
+        checkpointer: BaseCheckpointSaver[Any] | None,
+    ) -> Any:
         builder = StateGraph(_GraphState)
         builder.add_node("select_task", self._select_task_node)
         builder.add_node("route_task", self._route_task_node)
@@ -248,9 +256,14 @@ class ResearchRoutingWorkflow:
         )
         builder.add_edge("repair_report", "self_check_report")
         builder.add_edge("finalize_report", END)
-        return builder.compile()
+        return builder.compile(checkpointer=checkpointer)
 
-    def run(self, state: ResearchState) -> ResearchState:
+    def run(
+        self,
+        state: ResearchState,
+        *,
+        config: RunnableConfig | None = None,
+    ) -> ResearchState:
         """Execute the compiled graph and return the final canonical state."""
         if not isinstance(state, ResearchState):
             raise RoutingError("workflow state must be a ResearchState")
@@ -266,8 +279,39 @@ class ResearchRoutingWorkflow:
                 "research state available_sources must contain RetrievalSource values"
             )
 
-        result = self.graph.invoke(self._to_graph_state(state))
+        invoke_options = {"durability": "sync"} if config is not None else {}
+        result = self.graph.invoke(
+            self._to_graph_state(state),
+            config=config,
+            **invoke_options,
+        )
         final_state = self._from_graph_state(result)
+        if config is not None and self.graph.get_state(config).next:
+            return final_state
+        self._validate_completed_state(final_state)
+        return final_state
+
+    def get_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Return the latest LangGraph snapshot for one research thread."""
+        return self.graph.get_state(config)
+
+    @classmethod
+    def state_from_snapshot(cls, snapshot: StateSnapshot) -> ResearchState:
+        """Convert persisted graph values to the canonical research state."""
+        return cls._from_graph_state(snapshot.values)
+
+    def resume(self, config: RunnableConfig) -> ResearchState:
+        """Continue the latest checkpoint without submitting fresh input."""
+        result = self.graph.invoke(None, config=config, durability="sync")
+        state = self._from_graph_state(result)
+        if not self.graph.get_state(config).next:
+            self._validate_completed_state(state)
+        return state
+
+    def _validate_completed_state(self, final_state: ResearchState) -> None:
+        """Enforce invariants only after the graph has reached a terminal state."""
+        if final_state.plan is None:
+            raise RoutingError("workflow must finish with a research plan")
         for task in final_state.plan.tasks:
             route_count = sum(
                 decision.task_id == task.id
@@ -292,7 +336,6 @@ class ResearchRoutingWorkflow:
             or final_state.self_check_result.status is not SelfCheckStatus.PASS
         ):
             raise RoutingError("workflow must finish with a rendered report")
-        return final_state
 
     def select_task(self, state: ResearchState) -> dict[str, Any]:
         """Select the task at ``task_index`` and clear the previous route."""

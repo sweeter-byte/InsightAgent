@@ -30,7 +30,7 @@ from insight_agent.ingestion import (
 )
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
-from insight_agent.research import ResearchRoutingWorkflow
+from insight_agent.research import ResearchRoutingWorkflow, SQLiteCheckpointStore
 from insight_agent.reporting import ReportGenerationError, ReportGenerator
 from insight_agent.retrieval import (
     HybridRetrievalConfig,
@@ -75,15 +75,20 @@ def _build_app() -> InsightAgent:
     vision_retriever, shared_hybrid, vision_cleanup = _build_vision_runtime(
         retrieval_config
     )
+    checkpoint_store: SQLiteCheckpointStore | None = None
     try:
+        checkpoint_store = SQLiteCheckpointStore()
         return _compose_app(
             llm=llm,
             retrieval_config=retrieval_config,
             vision_retriever=vision_retriever,
             shared_hybrid=shared_hybrid,
             vision_cleanup=vision_cleanup,
+            checkpoint_store=checkpoint_store,
         )
     except BaseException:
+        if checkpoint_store is not None:
+            checkpoint_store.close()
         if vision_cleanup is not None:
             try:
                 vision_cleanup()
@@ -102,6 +107,7 @@ def _compose_app(
     vision_retriever: VisionRetriever | None,
     shared_hybrid: HybridRetriever | None,
     vision_cleanup: Callable[[], None] | None,
+    checkpoint_store: SQLiteCheckpointStore,
 ) -> InsightAgent:
     """Wire collaborators after optional Vision resources have been acquired."""
     knowledge_search_tool = (
@@ -152,6 +158,7 @@ def _compose_app(
         report_generator=report_generator,
         self_checker=self_checker,
         report_repairer=report_repairer,
+        checkpointer=checkpoint_store.checkpointer,
     )
     research_coordinator = ResearchCoordinator(
         planner=planner,
@@ -165,6 +172,7 @@ def _compose_app(
         research_agent=research_agent,
         research_coordinator=research_coordinator,
         close_callbacks=[
+            checkpoint_store.close,
             knowledge_search_tool.close,
             *([vision_cleanup] if vision_cleanup is not None else []),
         ],

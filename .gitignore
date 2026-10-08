@@ -19,6 +19,9 @@ htmlcov/
 # Local vector database
 .data/
 
+# InsightAgent runtime state
+.insight_agent/
+
 # Env / secrets
 .env
 .env.local

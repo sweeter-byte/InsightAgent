@@ -2,6 +2,7 @@
 
 from insight_agent.planning.coordinator import (
     ResearchCoordinator,
+    ResearchThreadSnapshot,
     format_research_context,
 )
 from insight_agent.planning.models import (
@@ -23,6 +24,7 @@ __all__ = [
     "ResearchPlanner",
     "ResearchState",
     "ResearchTask",
+    "ResearchThreadSnapshot",
     "format_research_context",
     "validate_research_plan",
 ]

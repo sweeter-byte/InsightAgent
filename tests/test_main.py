@@ -24,7 +24,7 @@ from insight_agent.app import InsightAgent
 from insight_agent.evidence import EvidenceGrader, EvidenceGradingError
 from insight_agent.llm import LLMClient
 from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
-from insight_agent.research import ResearchRoutingWorkflow
+from insight_agent.research import ResearchRoutingWorkflow, SQLiteCheckpointStore
 from insight_agent.reporting import ReportGenerationError, ReportGenerator
 from insight_agent.router import IntentRouter
 from insight_agent.routing import RetrievalSource, RoutingError
@@ -78,6 +78,30 @@ class FakeApp:
 def _disable_vision_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _temporary_checkpoint_stores(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[SQLiteCheckpointStore]:
+    stores: list[SQLiteCheckpointStore] = []
+
+    class TrackingStore(SQLiteCheckpointStore):
+        def __init__(self) -> None:
+            super().__init__(tmp_path / f"checkpoints-{len(stores)}.sqlite")
+            self.close_calls = 0
+            stores.append(self)
+
+        def close(self) -> None:
+            if not self._closed:
+                self.close_calls += 1
+            super().close()
+
+    monkeypatch.setattr(cli, "SQLiteCheckpointStore", TrackingStore)
+    yield stores
+    for store in stores:
+        store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -134,6 +158,58 @@ def test_build_app_returns_insight_agent(monkeypatch: pytest.MonkeyPatch) -> Non
     knowledge_tool = app.research_agent.registry.get("search_knowledge_base")
     assert app.research_coordinator.workflow.local_retriever is knowledge_tool
     assert isinstance(app.llm, LLMClient)
+
+
+def test_build_app_owns_checkpoint_store_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+    _temporary_checkpoint_stores: list[SQLiteCheckpointStore],
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+
+    app = cli._build_app()
+    store = _temporary_checkpoint_stores[0]
+
+    assert app.research_coordinator.workflow.graph.checkpointer is (
+        store.checkpointer
+    )
+    assert store.close_calls == 0  # type: ignore[attr-defined]
+    app.close()
+    app.close()
+    assert store.close_calls == 1  # type: ignore[attr-defined]
+
+
+def test_build_app_closes_checkpoint_store_when_composition_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    _temporary_checkpoint_stores: list[SQLiteCheckpointStore],
+) -> None:
+    class DummyOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+    monkeypatch.setenv("RERANKER_MODEL", "test-reranker")
+    monkeypatch.setattr("insight_agent.llm.OpenAI", DummyOpenAI)
+    monkeypatch.setattr(
+        cli,
+        "_compose_app",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("compose failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="compose failed"):
+        cli._build_app()
+
+    assert len(_temporary_checkpoint_stores) == 1
+    assert _temporary_checkpoint_stores[0].close_calls == 1  # type: ignore[attr-defined]
 
 
 def test_build_app_shares_single_llm_client(monkeypatch: pytest.MonkeyPatch) -> None:

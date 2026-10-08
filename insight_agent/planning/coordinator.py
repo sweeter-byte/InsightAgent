@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from typing import Protocol
+from uuid import uuid4
+
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import StateSnapshot
 
 from insight_agent.planning.models import ResearchPlan, ResearchState
 from insight_agent.routing.models import RetrievalSource
@@ -16,10 +21,52 @@ class Planner(Protocol):
         ...
 
 
+class UnknownResearchThread(LookupError):
+    """Raised when no checkpoint exists for a requested research thread."""
+
+
+def _thread_config(thread_id: str) -> RunnableConfig:
+    """Load research infrastructure only after package initialization."""
+    from insight_agent.research.persistence import thread_config
+
+    return thread_config(thread_id)
+
+
 class ResearchWorkflow(Protocol):
-    def run(self, state: ResearchState) -> ResearchState:
+    def run(
+        self,
+        state: ResearchState,
+        *,
+        config: RunnableConfig | None = None,
+    ) -> ResearchState:
         """Route every planned task and return the final workflow state."""
         ...
+
+    def get_state(self, config: RunnableConfig) -> StateSnapshot:
+        """Return the latest checkpoint for a logical research thread."""
+        ...
+
+    def state_from_snapshot(self, snapshot: StateSnapshot) -> ResearchState:
+        """Convert persisted graph values into canonical research state."""
+        ...
+
+    def resume(self, config: RunnableConfig) -> ResearchState:
+        """Continue a pending logical research thread."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class ResearchThreadSnapshot:
+    """Read-only business view of one persisted research thread."""
+
+    thread_id: str
+    state: ResearchState
+    next_nodes: tuple[str, ...]
+
+    @property
+    def completed(self) -> bool:
+        """Whether the graph has no pending nodes."""
+        return not self.next_nodes
 
 
 class ResearchCoordinator:
@@ -30,6 +77,8 @@ class ResearchCoordinator:
         planner: Planner,
         workflow: ResearchWorkflow,
         available_sources: set[RetrievalSource],
+        *,
+        thread_id_factory: Callable[[], str] | None = None,
     ) -> None:
         if not available_sources:
             raise ValueError("available_sources must not be empty")
@@ -38,20 +87,59 @@ class ResearchCoordinator:
         self.planner = planner
         self.workflow = workflow
         self.available_sources = set(available_sources)
+        self._thread_id_factory = thread_id_factory or (lambda: str(uuid4()))
         self.last_state: ResearchState | None = None
 
     def run(self, query: str) -> str:
-        """Create state, attach a validated plan, and delegate execution."""
+        """Run a new research thread and preserve the existing string API."""
+        snapshot = self.start_research(query)
+        if not snapshot.completed:
+            raise ValueError("research workflow did not complete")
+        if not isinstance(snapshot.state.final_output, str):
+            raise ValueError("research workflow did not produce final_output")
+        return snapshot.state.final_output
+
+    def start_research(self, query: str) -> ResearchThreadSnapshot:
+        """Create and execute a new independently checkpointed research thread."""
+        thread_id = self._thread_id_factory()
+        config = _thread_config(thread_id)
         state = ResearchState(
             query=query,
             plan=self.planner.plan(query),
             available_sources=set(self.available_sources),
         )
-        final_state = self.workflow.run(state)
-        self.last_state = final_state
-        if not isinstance(final_state.final_output, str):
-            raise ValueError("research workflow did not produce final_output")
-        return final_state.final_output
+        self.workflow.run(state, config=config)
+        snapshot = self._load_thread(thread_id)
+        self.last_state = snapshot.state
+        return snapshot
+
+    def get_research_state(self, thread_id: str) -> ResearchThreadSnapshot:
+        """Read a thread without executing or creating workflow state."""
+        return self._load_thread(thread_id)
+
+    def resume_research(self, thread_id: str) -> ResearchThreadSnapshot:
+        """Continue pending nodes, or return an already-completed thread."""
+        snapshot = self._load_thread(thread_id)
+        if snapshot.completed:
+            self.last_state = snapshot.state
+            return snapshot
+        self.workflow.resume(_thread_config(thread_id))
+        resumed = self._load_thread(thread_id)
+        self.last_state = resumed.state
+        return resumed
+
+    def _load_thread(self, thread_id: str) -> ResearchThreadSnapshot:
+        config = _thread_config(thread_id)
+        snapshot = self.workflow.get_state(config)
+        if snapshot.metadata is None:
+            raise UnknownResearchThread(
+                f"unknown research thread: {thread_id!r}"
+            )
+        return ResearchThreadSnapshot(
+            thread_id=thread_id,
+            state=self.workflow.state_from_snapshot(snapshot),
+            next_nodes=tuple(snapshot.next),
+        )
 
 
 def format_research_context(state: ResearchState) -> str:
