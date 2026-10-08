@@ -99,9 +99,14 @@ class ResearchCoordinator:
             raise ValueError("research workflow did not produce final_output")
         return snapshot.state.final_output
 
-    def start_research(self, query: str) -> ResearchThreadSnapshot:
+    def start_research(
+        self,
+        query: str,
+        *,
+        thread_id: str | None = None,
+    ) -> ResearchThreadSnapshot:
         """Create and execute a new independently checkpointed research thread."""
-        thread_id = self._thread_id_factory()
+        thread_id = thread_id or self._thread_id_factory()
         config = _thread_config(thread_id)
         state = ResearchState(
             query=query,

@@ -403,3 +403,48 @@ Local, Web, and Vision paths all converge on the same Advance Task node.”
 
 Chapter 10 does not add CLIP, a second vector store, OCR, crops, bounding boxes,
 a multi-turn Vision Agent, Evidence grading, citations, or report generation.
+
+## What Chapter 16 adds
+
+Chapter 16 wraps the existing checkpointed Research Workflow in a separate,
+single-process runtime:
+
+```text
+POST /v1/research/runs -> Redis Run Registry -> queued
+                       -> asyncio Semaphore -> running
+                       -> existing ResearchCoordinator / SQLite Checkpoint
+                       -> Redis Stream events -> SSE
+```
+
+The runtime keeps `request_id`, `run_id`, and LangGraph `thread_id` separate.
+Redis stores only runtime records and client-facing events; plans, evidence,
+reports, and the canonical `ResearchState` remain in the Chapter 15 SQLite
+checkpointer. A timed-out or interrupted run can be resumed explicitly with its
+original `run_id -> thread_id -> checkpoint` chain. Startup marks stale
+`running` records as `interrupted` but never resumes them automatically.
+
+Start a local Redis, configure the existing model/retrieval settings, then run:
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  uvicorn insight_agent.runtime.app:app
+```
+
+Create and observe a run:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/research/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"Compare the main Agent Memory designs"}'
+
+curl http://127.0.0.1:8000/v1/research/runs/<run_id>
+curl -N http://127.0.0.1:8000/v1/research/runs/<run_id>/events
+curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
+```
+
+Runtime policy is configured with `RUNTIME_REDIS_URL`,
+`RUNTIME_MAX_CONCURRENCY`, `RUNTIME_RUN_TIMEOUT_SECONDS`,
+`RUNTIME_EVENT_TTL_SECONDS`, `RUNTIME_INFRA_RETRY_ATTEMPTS`, and
+`RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`. This chapter intentionally does not add
+authentication, distributed workers, automatic resume, WebSockets, or
+exactly-once execution.

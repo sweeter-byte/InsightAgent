@@ -19,11 +19,15 @@ dependencies = [
     "jieba>=0.42.1",
     "langgraph>=1.0.0",
     "langgraph-checkpoint-sqlite>=3.1.1,<4.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "redis>=5.0.0,<7.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
 ]
 
 [tool.setuptools.packages.find]

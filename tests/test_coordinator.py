@@ -196,6 +196,23 @@ def test_start_research_returns_isolated_threads_for_same_query() -> None:
     ]
 
 
+def test_start_research_honors_caller_supplied_thread_id() -> None:
+    workflow = FakeWorkflow()
+    coordinator = ResearchCoordinator(
+        planner=FakePlanner(_plan()),  # type: ignore[arg-type]
+        workflow=workflow,  # type: ignore[arg-type]
+        available_sources={RetrievalSource.LOCAL},
+        thread_id_factory=lambda: "must-not-be-used",
+    )
+
+    snapshot = coordinator.start_research("query", thread_id="runtime-thread")
+
+    assert snapshot.thread_id == "runtime-thread"
+    assert workflow.configs == [
+        {"configurable": {"thread_id": "runtime-thread"}}
+    ]
+
+
 def test_get_research_state_reads_without_executing() -> None:
     workflow = FakeWorkflow()
     coordinator = ResearchCoordinator(

@@ -319,3 +319,44 @@ Retriever；每次路由不会重复扫描知识库。
 
 第十章不实现 CLIP、第二套向量库、OCR、裁剪、检测框、多轮 Vision Agent、
 Evidence 评分、引用或报告生成。
+
+## 第十六章新增：Research Runtime
+
+第十六章在已有、可持久化的 Research Workflow 外增加独立的单进程运行层：
+
+```text
+POST /v1/research/runs -> Redis Run Registry -> queued
+                       -> asyncio Semaphore -> running
+                       -> 既有 ResearchCoordinator / SQLite Checkpoint
+                       -> Redis Stream 事件 -> SSE
+```
+
+Runtime 严格区分 `request_id`、`run_id` 和 LangGraph `thread_id`。Redis 只保存
+运行记录与面向客户端的事件；Research Plan、Evidence、Report 和完整
+`ResearchState` 仍由第十五章 SQLite Checkpointer 管理。超时或中断的 Run 通过原
+`run_id -> thread_id -> checkpoint` 链显式恢复。服务启动时只把遗留的
+`running` 记录标记为 `interrupted`，不会自动继续消耗模型额度。
+
+启动本地 Redis、配置已有模型与检索参数后运行：
+
+```bash
+conda run --no-capture-output -n insight-agent \
+  uvicorn insight_agent.runtime.app:app
+```
+
+创建、查询、订阅和恢复 Run：
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/research/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"比较 Agent Memory 的主要设计思路"}'
+
+curl http://127.0.0.1:8000/v1/research/runs/<run_id>
+curl -N http://127.0.0.1:8000/v1/research/runs/<run_id>/events
+curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
+```
+
+运行策略由 `RUNTIME_REDIS_URL`、`RUNTIME_MAX_CONCURRENCY`、
+`RUNTIME_RUN_TIMEOUT_SECONDS`、`RUNTIME_EVENT_TTL_SECONDS`、
+`RUNTIME_INFRA_RETRY_ATTEMPTS` 与 `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`
+统一配置。本章不实现认证、分布式 Worker、自动恢复、WebSocket 或 Exactly-Once。
