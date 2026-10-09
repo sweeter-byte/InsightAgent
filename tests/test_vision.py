@@ -52,6 +52,57 @@ def test_optional_vision_config_is_absent_only_when_all_values_are_missing() -> 
     assert VisionModelConfig.from_env({}, required=False) is None
 
 
+@pytest.mark.parametrize("required", [True, False])
+def test_vision_config_loads_dotenv_when_reading_process_environment(
+    required: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from dotenv import load_dotenv
+
+    for name in _VISION_ENV:
+        monkeypatch.delenv(name, raising=False)
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        "VISION_API_KEY=dotenv-vision-secret\n"
+        "VISION_BASE_URL=https://dotenv-vision.example.invalid/v1\n"
+        "VISION_MODEL=dotenv-vision-model\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path))
+
+    assert VisionModelConfig.from_env(required=required) == VisionModelConfig(
+        "dotenv-vision-secret",
+        "https://dotenv-vision.example.invalid/v1",
+        "dotenv-vision-model",
+    )
+
+
+def test_vision_config_explicit_mapping_is_isolated_from_dotenv_and_process_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_vision_env(monkeypatch)
+    monkeypatch.setattr(
+        "insight_agent.llm.load_dotenv",
+        lambda: pytest.fail("explicit mapping must not load dotenv"),
+    )
+
+    assert VisionModelConfig.from_env(
+        {
+            "VISION_API_KEY": "mapping-vision-secret",
+            "VISION_BASE_URL": "https://mapping-vision.example.invalid/v1",
+            "VISION_MODEL": "mapping-vision-model",
+        }
+    ) == VisionModelConfig(
+        "mapping-vision-secret",
+        "https://mapping-vision.example.invalid/v1",
+        "mapping-vision-model",
+    )
+    assert VisionModelConfig.from_env({}, required=False) is None
+    with pytest.raises(RuntimeError, match="VISION_API_KEY"):
+        VisionModelConfig.from_env({})
+
+
 def test_vision_config_repr_does_not_expose_api_key() -> None:
     secret = "vision-secret-that-must-not-leak"
     config = VisionModelConfig.from_env(
@@ -244,6 +295,8 @@ def test_describe_image_empty_file_raises(tmp_path: Path, monkeypatch: pytest.Mo
 def test_describe_image_missing_env_raises_ingestion_error_with_cause(
     missing: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Exercise missing process values without reading a developer's .env.
+    monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: False)
     _set_vision_env(monkeypatch)
     monkeypatch.delenv(missing)
     img = _write_image(tmp_path)

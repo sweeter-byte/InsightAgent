@@ -33,6 +33,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from insight_agent import llm
 from insight_agent.ingestion.errors import IngestionError
 from insight_agent.llm import _require_env
 
@@ -86,6 +87,8 @@ class VisionModelConfig:
         *,
         required: bool = True,
     ) -> VisionModelConfig | None:
+        if environ is None:
+            llm.load_dotenv()
         values = os.environ if environ is None else environ
         names = ("VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL")
         configured = {name: values.get(name, "").strip() for name in names}
@@ -93,7 +96,7 @@ class VisionModelConfig:
             return None
 
         if environ is None:
-            resolved = {name: _require_env(name) for name in names}
+            resolved = {name: _require_env(name, values) for name in names}
         else:
             missing = [name for name in names if not configured[name]]
             if missing:

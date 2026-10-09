@@ -19,9 +19,6 @@ from typing import Any, Sequence
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
-
-
 # Single, shared registry of required environment variables and their hints.
 # Both the text LLM client and the vision client read from here so the project
 # keeps ONE config mechanism instead of a second, parallel one.
@@ -35,8 +32,13 @@ _ENV_VAR_HINTS: dict[str, str] = {
 }
 
 
-def _require_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
+def _require_env(name: str, environ: Mapping[str, str] | None = None) -> str:
+    if environ is None:
+        load_dotenv()
+        values = os.environ
+    else:
+        values = environ
+    value = values.get(name, "").strip()
     if not value:
         hint = _ENV_VAR_HINTS.get(name, "")
         raise RuntimeError(
@@ -68,6 +70,8 @@ class LLMConfig:
         environ: Mapping[str, str] | None = None,
     ) -> LLMConfig:
         """Resolve the existing ``LLM_*`` variables from a mapping."""
+        if environ is None:
+            load_dotenv()
         values = os.environ if environ is None else environ
         resolved: dict[str, str] = {}
         for name in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):

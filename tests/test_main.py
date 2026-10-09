@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+from dataclasses import replace
 
 import pytest
 
@@ -11,12 +12,14 @@ from insight_agent.agent import AgentStepsExceeded
 from insight_agent.application import AppConfig
 from insight_agent.app import InsightAgent
 from insight_agent.evidence import EvidenceGradingError
+from insight_agent.ingestion.vision import VisionModelConfig
+from insight_agent.llm import LLMConfig
 from insight_agent.planning import PlanningError
 from insight_agent.reporting import ReportGenerationError
 from insight_agent.routing import RoutingError
 from insight_agent.self_check import SelfCheckError
 from insight_agent.vision_retrieval import VisionRetrievalError
-from insight_agent.web_search import WebSearchError
+from insight_agent.web_search import WebSearchConfig, WebSearchError
 
 
 class FakeApp:
@@ -189,6 +192,86 @@ def test_main_redacts_short_secret_without_corrupting_diagnostics(
     message = capsys.readouterr().err
     assert "configuration validation failed" in message
     assert "API token: [redacted]; please retry" in message
+
+
+def test_main_redacts_normalized_environment_secret_before_config_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("SERVICE_TOKEN", " normalized-secret ")
+
+    def config_factory() -> AppConfig:
+        raise RuntimeError("configuration failed; token: normalized-secret; retry")
+
+    assert cli.main(["anything"], config_factory=config_factory) == 2
+    message = capsys.readouterr().err
+    assert "normalized-secret" not in message
+    assert "configuration failed; token: [redacted]; retry" in message
+
+
+def test_main_redacts_resolved_secret_from_whitespace_environment_value(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("LLM_API_KEY", " resolved-secret ")
+    config = AppConfig.from_env(
+        {
+            "LLM_API_KEY": " resolved-secret ",
+            "LLM_BASE_URL": "https://example.invalid/v1",
+            "LLM_MODEL": "test-model",
+            "RERANKER_MODEL": "test/reranker",
+        }
+    )
+
+    def application_factory(resolved: AppConfig) -> InsightAgent:
+        raise RuntimeError(f"configuration failed; API key: {resolved.llm.api_key}; retry")
+
+    assert cli.main(
+        ["anything"],
+        config_factory=lambda: config,
+        application_factory=application_factory,
+    ) == 2
+    message = capsys.readouterr().err
+    assert "resolved-secret" not in message
+    assert "configuration failed; API key: [redacted]; retry" in message
+
+
+@pytest.mark.parametrize("component", ["llm", "vision", "web_search"])
+def test_main_redacts_explicit_config_secrets_absent_from_environment(
+    component: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for name in ("LLM_API_KEY", "VISION_API_KEY", "TAVILY_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    config = AppConfig.from_env(
+        {
+            "LLM_API_KEY": "test-key",
+            "LLM_BASE_URL": "https://example.invalid/v1",
+            "LLM_MODEL": "test-model",
+            "RERANKER_MODEL": "test/reranker",
+        }
+    )
+    secret = "explicit-secret.with+regex[characters]"
+    credentials = {
+        "llm": LLMConfig(secret, "https://example.invalid/v1", "test-model"),
+        "vision": VisionModelConfig(secret, "https://example.invalid/v1", "vision-model"),
+        "web_search": WebSearchConfig(secret),
+    }
+    config = replace(config, **{component: credentials[component]})
+
+    def application_factory(resolved: AppConfig) -> InsightAgent:
+        api_key = getattr(resolved, component).api_key
+        raise RuntimeError(f"configuration failed; API key: {api_key}; retry")
+
+    assert cli.main(
+        ["anything"],
+        config_factory=lambda: config,
+        application_factory=application_factory,
+    ) == 2
+    message = capsys.readouterr().err
+    assert secret not in message
+    assert "configuration failed; API key: [redacted]; retry" in message
 
 
 def test_main_application_factory_unexpected_error_remains_visible() -> None:

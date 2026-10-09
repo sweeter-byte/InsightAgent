@@ -34,6 +34,26 @@ def _print_answer(answer: str) -> None:
     print(f"\n{answer.strip()}\n" if answer and answer.strip() else "\n[empty response]\n")
 
 
+def _redact_config_error(message: str, config: AppConfig | None) -> str:
+    """Hide startup credentials while preserving readable diagnostics."""
+    candidates: set[str] = set()
+    for name, value in os.environ.items():
+        if any(
+            marker in name.upper()
+            for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")
+        ):
+            candidates.update((value, value.strip()))
+    if config is not None:
+        for component in ("llm", "vision", "web_search"):
+            value = getattr(getattr(config, component, None), "api_key", None)
+            if isinstance(value, str):
+                candidates.update((value, value.strip()))
+    for value in sorted(candidates - {""}, key=len, reverse=True):
+        token = rf"(?<![^\W_]){re.escape(value)}(?![^\W_])"
+        message = re.sub(token, "[redacted]", message)
+    return message
+
+
 def _run_once(app: InsightAgent, query: str) -> Optional[int]:
     """Execute a single query. Returns an exit code, or ``None`` to keep going."""
     try:
@@ -74,19 +94,12 @@ def main(
 ) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
+    config = None
     try:
         config = config_factory()
         app = application_factory(config)
     except (RuntimeError, ValueError) as exc:
-        message = str(exc)
-        for name, value in os.environ.items():
-            contains_secret = any(
-                marker in name.upper()
-                for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")
-            )
-            if value and contains_secret:
-                token = rf"(?<![^\W_]){re.escape(value)}(?![^\W_])"
-                message = re.sub(token, "[redacted]", message)
+        message = _redact_config_error(str(exc), config)
         print(f"[config error] {message}", file=sys.stderr)
         return 2
 
