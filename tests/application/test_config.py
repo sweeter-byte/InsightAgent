@@ -88,14 +88,33 @@ def test_optional_vision_and_web_search_are_absent() -> None:
 
 
 def test_from_env_has_stable_component_defaults() -> None:
-    config = AppConfig.from_env(_required_env())
+    values = _required_env()
+    values.update(
+        {
+            "EMBEDDING_MODEL": "   ",
+            "CHECKPOINT_PATH": "   ",
+        }
+    )
+
+    config = AppConfig.from_env(values)
 
     assert DEFAULT_EMBEDDING_MODEL == "BAAI/bge-m3"
     assert config.embedding_model == "BAAI/bge-m3"
+    assert config.retrieval.dense_k == 20
+    assert config.retrieval.sparse_k == 20
+    assert config.retrieval.rerank_k == 20
+    assert config.retrieval.final_top_k == 5
+    assert config.retrieval.rrf_k == 60
+    assert config.retrieval.reranker_model == "example/reranker"
     assert config.qdrant.path == Path(".data/qdrant")
     assert config.qdrant.collection_name == "insight_documents"
     assert config.checkpoint.path == Path(".insight_agent/checkpoints.sqlite")
     assert config.runtime.redis_url == "redis://localhost:6379/0"
+    assert config.runtime.policy.max_concurrency == 2
+    assert config.runtime.policy.run_timeout_seconds == 900.0
+    assert config.runtime.policy.infra_retry_attempts == 3
+    assert config.runtime.policy.infra_retry_backoff_seconds == 0.2
+    assert config.runtime.policy.event_ttl_seconds == 86_400
 
 
 def test_repr_does_not_expose_provider_secrets() -> None:
