@@ -28,6 +28,7 @@ object.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from typing import Any
 
 from insight_agent.agent import ResearchAgent
@@ -85,10 +86,11 @@ class InsightAgent:
         self._close_callbacks.append(callback)
 
     def close(self) -> None:
-        """Release runtime-owned resources; repeated calls are harmless."""
+        """Attempt every cleanup in reverse order, at most once."""
         callbacks, self._close_callbacks = self._close_callbacks, []
-        for callback in reversed(callbacks):
-            callback()
+        with ExitStack() as stack:
+            for callback in callbacks:
+                stack.callback(callback)
 
     # ----------------------------------------------------------------- private
 

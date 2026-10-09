@@ -7,6 +7,7 @@ invoked: fakes capture every call for inspection.
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from types import SimpleNamespace
 from typing import Any
 
@@ -124,6 +125,32 @@ def test_close_releases_callbacks_once_in_reverse_registration_order() -> None:
     app.close()
 
     assert events == ["second", "first"]
+
+
+def test_close_attempts_all_callbacks_before_propagating_cleanup_error() -> None:
+    events: list[str] = []
+    app, *_ = _build(Intent.DIRECT)
+    owned_resources = ExitStack()
+    owned_resources.callback(lambda: events.append("llm"))
+    owned_resources.callback(lambda: events.append("checkpoint"))
+    failure = RuntimeError("cleanup failed")
+
+    def fail_cleanup() -> None:
+        events.append("failing")
+        raise failure
+
+    app.add_close_callback(owned_resources.close)
+    app.add_close_callback(lambda: events.append("middle"))
+    app.add_close_callback(fail_cleanup)
+    app.add_close_callback(lambda: events.append("last"))
+
+    with pytest.raises(RuntimeError, match="cleanup failed") as raised:
+        app.close()
+
+    assert raised.value is failure
+    assert events == ["last", "failing", "middle", "checkpoint", "llm"]
+    app.close()
+    assert events == ["last", "failing", "middle", "checkpoint", "llm"]
 
 
 # ---------------------------------------------------------------------------
