@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
-import os
 
 
 DEFAULT_REDIS_URL = "redis://localhost:6379/0"
@@ -19,15 +20,37 @@ class RuntimePolicy:
     event_ttl_seconds: int = 86_400
 
     def __post_init__(self) -> None:
-        if self.max_concurrency < 1:
+        if (
+            isinstance(self.max_concurrency, bool)
+            or not isinstance(self.max_concurrency, int)
+            or self.max_concurrency < 1
+        ):
             raise ValueError("max_concurrency must be at least 1")
-        if self.run_timeout_seconds <= 0:
+        if (
+            isinstance(self.run_timeout_seconds, bool)
+            or not isinstance(self.run_timeout_seconds, (int, float))
+            or not math.isfinite(self.run_timeout_seconds)
+            or self.run_timeout_seconds <= 0
+        ):
             raise ValueError("run_timeout_seconds must be greater than 0")
-        if self.infra_retry_attempts < 1:
+        if (
+            isinstance(self.infra_retry_attempts, bool)
+            or not isinstance(self.infra_retry_attempts, int)
+            or self.infra_retry_attempts < 1
+        ):
             raise ValueError("infra_retry_attempts must be at least 1")
-        if self.infra_retry_backoff_seconds < 0:
+        if (
+            isinstance(self.infra_retry_backoff_seconds, bool)
+            or not isinstance(self.infra_retry_backoff_seconds, (int, float))
+            or not math.isfinite(self.infra_retry_backoff_seconds)
+            or self.infra_retry_backoff_seconds < 0
+        ):
             raise ValueError("infra_retry_backoff_seconds must not be negative")
-        if self.event_ttl_seconds < 1:
+        if (
+            isinstance(self.event_ttl_seconds, bool)
+            or not isinstance(self.event_ttl_seconds, int)
+            or self.event_ttl_seconds < 1
+        ):
             raise ValueError("event_ttl_seconds must be at least 1")
 
     @classmethod
@@ -89,9 +112,11 @@ def _env_int(environ: Mapping[str, str], name: str, default: int) -> int:
     raw = environ.get(name)
     if raw is None:
         return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} must be an integer")
     try:
         return int(raw)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
 
 
@@ -99,7 +124,12 @@ def _env_float(environ: Mapping[str, str], name: str, default: float) -> float:
     raw = environ.get(name)
     if raw is None:
         return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} must be a number")
     try:
-        return float(raw)
-    except ValueError as exc:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be a number") from exc
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    return value

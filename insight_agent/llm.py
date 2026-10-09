@@ -1,7 +1,7 @@
 """Thin wrapper around the OpenAI-compatible Chat Completions client.
 
 `LLMClient` is intentionally minimal. It:
-  1. reads model configuration from environment variables;
+  1. accepts an explicit ``LLMConfig`` or falls back to environment variables;
   2. builds an `openai.OpenAI` client;
   3. exposes a single `chat(...)` method that forwards arguments to the SDK
      and returns the raw SDK response.

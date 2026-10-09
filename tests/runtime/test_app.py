@@ -76,6 +76,85 @@ def test_runtime_policy_reads_only_explicit_mapping(
     )
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("RUNTIME_RUN_TIMEOUT_SECONDS", "nan"),
+        ("RUNTIME_RUN_TIMEOUT_SECONDS", "inf"),
+        ("RUNTIME_INFRA_RETRY_BACKOFF_SECONDS", "nan"),
+        ("RUNTIME_INFRA_RETRY_BACKOFF_SECONDS", "inf"),
+    ],
+)
+def test_runtime_policy_mapping_rejects_non_finite_floats(
+    name: str,
+    value: str,
+) -> None:
+    with pytest.raises(ValueError, match=name):
+        RuntimePolicy.from_env({name: value})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "RUNTIME_MAX_CONCURRENCY",
+        "RUNTIME_RUN_TIMEOUT_SECONDS",
+        "RUNTIME_INFRA_RETRY_ATTEMPTS",
+        "RUNTIME_INFRA_RETRY_BACKOFF_SECONDS",
+        "RUNTIME_EVENT_TTL_SECONDS",
+    ],
+)
+def test_runtime_policy_mapping_rejects_boolean_numeric_values(
+    name: str,
+) -> None:
+    with pytest.raises(ValueError, match=name):
+        RuntimePolicy.from_env({name: True})  # type: ignore[dict-item]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("run_timeout_seconds", float("nan")),
+        ("run_timeout_seconds", float("inf")),
+        ("infra_retry_backoff_seconds", float("nan")),
+        ("infra_retry_backoff_seconds", float("inf")),
+    ],
+)
+def test_runtime_policy_direct_construction_rejects_non_finite_floats(
+    field: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        RuntimePolicy(**{field: value})
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_concurrency",
+        "run_timeout_seconds",
+        "infra_retry_attempts",
+        "infra_retry_backoff_seconds",
+        "event_ttl_seconds",
+    ],
+)
+def test_runtime_policy_direct_construction_rejects_booleans(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        RuntimePolicy(**{field: True})
+
+
+def test_runtime_policy_accepts_valid_numeric_values_and_zero_backoff() -> None:
+    policy = RuntimePolicy(
+        max_concurrency=1,
+        run_timeout_seconds=1,
+        infra_retry_attempts=1,
+        infra_retry_backoff_seconds=0,
+        event_ttl_seconds=1,
+    )
+
+    assert policy.run_timeout_seconds == 1
+    assert policy.infra_retry_backoff_seconds == 0
+
+
 def test_runtime_config_reads_explicit_mapping(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
