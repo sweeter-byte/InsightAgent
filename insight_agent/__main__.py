@@ -1,258 +1,32 @@
 """Command-line entry: ``python -m insight_agent``.
 
-Behavior:
-  * With no arguments — start an interactive REPL, one query per line.
-  * With arguments — run a single query built from ``sys.argv[1:]`` and exit.
-
-Nothing here is required by the agent itself; the CLI is just a thin wrapper
-that assembles the app — a shared ``LLMClient``, a default registry,
-``ResearchAgent``, both routers, the research workflow, reporting, and the ``InsightAgent``
-façade — and reads a line of user input.
+The CLI is a thin adapter consuming the shared application composition root.
+With no arguments it starts an interactive REPL; with arguments it runs one
+query formed from ``sys.argv[1:]`` and exits.
 """
 
 from __future__ import annotations
 
-import logging
+import os
 import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Optional
 
-from insight_agent.agent import AgentStepsExceeded, ResearchAgent
+from insight_agent.agent import AgentStepsExceeded
 from insight_agent.app import InsightAgent
-from insight_agent.evidence import EvidenceGrader, EvidenceGradingError
-from insight_agent.indexing import QdrantVectorStore
-from insight_agent.ingestion import (
-    IngestionError,
-    OpenAICompatibleVisionClient,
-    VisionModelConfig,
-    guess_mime_type,
-)
-from insight_agent.llm import LLMClient
-from insight_agent.planning import PlanningError, ResearchCoordinator, ResearchPlanner
-from insight_agent.research import ResearchRoutingWorkflow, SQLiteCheckpointStore
-from insight_agent.reporting import ReportGenerationError, ReportGenerator
-from insight_agent.retrieval import (
-    HybridRetrievalConfig,
-    HybridRetriever,
-    KnowledgeSearchTool,
-    build_default_hybrid_retriever,
-    build_default_knowledge_search_tool,
-)
-from insight_agent.router import IntentRouter
-from insight_agent.routing import RetrievalSource, RoutingError
-from insight_agent.routing.router import RetrievalRouter
-from insight_agent.self_check import ReportRepairer, ReportSelfChecker, SelfCheckError
-from insight_agent.tools.registry import build_default_registry, default_tool_schemas
-from insight_agent.web_search import (
-    TavilySearchProvider,
-    WebRetriever,
-    WebSearchConfig,
-    WebSearchError,
-)
-from insight_agent.vision_retrieval import (
-    VisionAnalyzer,
-    VisionRetrievalError,
-    VisionRetriever,
-)
+from insight_agent.application import AppConfig, build_application
+from insight_agent.evidence import EvidenceGradingError
+from insight_agent.planning import PlanningError
+from insight_agent.reporting import ReportGenerationError
+from insight_agent.routing import RoutingError
+from insight_agent.self_check import SelfCheckError
+from insight_agent.vision_retrieval import VisionRetrievalError
+from insight_agent.web_search import WebSearchError
 
 
 _BANNER = (
     "InsightAgent — minimal Research Agent. Type a request, or `exit`/Ctrl-D to quit."
 )
-logger = logging.getLogger(__name__)
-
-
-def _build_app() -> InsightAgent:
-    """Compose the full application object.
-
-    A single ``LLMClient`` instance is shared by both routers, the planner, the
-    direct-answer path, report generator, and ResearchAgent. We deliberately avoid a factory
-    or DI framework for this small object graph.
-    """
-    llm = LLMClient()
-    retrieval_config = HybridRetrievalConfig.from_env()
-    vision_retriever, shared_hybrid, vision_cleanup = _build_vision_runtime(
-        retrieval_config
-    )
-    checkpoint_store: SQLiteCheckpointStore | None = None
-    try:
-        checkpoint_store = SQLiteCheckpointStore()
-        return _compose_app(
-            llm=llm,
-            retrieval_config=retrieval_config,
-            vision_retriever=vision_retriever,
-            shared_hybrid=shared_hybrid,
-            vision_cleanup=vision_cleanup,
-            checkpoint_store=checkpoint_store,
-        )
-    except BaseException:
-        if checkpoint_store is not None:
-            checkpoint_store.close()
-        if vision_cleanup is not None:
-            try:
-                vision_cleanup()
-            except Exception:
-                logger.exception(
-                    "Failed to release Vision Retrieval resources after "
-                    "application composition failed."
-                )
-        raise
-
-
-def _compose_app(
-    *,
-    llm: LLMClient,
-    retrieval_config: HybridRetrievalConfig,
-    vision_retriever: VisionRetriever | None,
-    shared_hybrid: HybridRetriever | None,
-    vision_cleanup: Callable[[], None] | None,
-    checkpoint_store: SQLiteCheckpointStore,
-) -> InsightAgent:
-    """Wire collaborators after optional Vision resources have been acquired."""
-    knowledge_search_tool = (
-        KnowledgeSearchTool(
-            shared_hybrid,
-            default_top_k=retrieval_config.final_top_k,
-        )
-        if shared_hybrid is not None
-        else build_default_knowledge_search_tool(retrieval_config)
-    )
-    research_agent = ResearchAgent(
-        llm=llm,
-        registry=build_default_registry(
-            knowledge_search_tool=knowledge_search_tool,
-        ),
-        tool_schemas=default_tool_schemas(),
-    )
-    planner = ResearchPlanner(llm=llm)
-    retrieval_router = RetrievalRouter(llm=llm)
-    evidence_grader = EvidenceGrader(llm=llm)
-    report_generator = ReportGenerator(llm=llm)
-    self_checker = ReportSelfChecker(llm=llm)
-    report_repairer = ReportRepairer(llm=llm)
-    web_config = WebSearchConfig.from_env()
-    web_retriever: WebRetriever | None = None
-    available_sources = {
-        RetrievalSource.LOCAL,
-    }
-    if vision_retriever is not None:
-        available_sources.add(RetrievalSource.VISION)
-    if web_config is not None:
-        web_retriever = WebRetriever(
-            TavilySearchProvider(
-                api_key=web_config.api_key,
-                timeout=web_config.timeout,
-            ),
-            timeout=web_config.timeout,
-            search_limit=web_config.search_limit,
-            fetch_limit=web_config.fetch_limit,
-        )
-        available_sources.add(RetrievalSource.WEB)
-    research_workflow = ResearchRoutingWorkflow(
-        router=retrieval_router,
-        local_retriever=knowledge_search_tool,
-        web_retriever=web_retriever,
-        vision_retriever=vision_retriever,
-        grader=evidence_grader,
-        report_generator=report_generator,
-        self_checker=self_checker,
-        report_repairer=report_repairer,
-        checkpointer=checkpoint_store.checkpointer,
-    )
-    research_coordinator = ResearchCoordinator(
-        planner=planner,
-        workflow=research_workflow,
-        available_sources=available_sources,
-    )
-    router = IntentRouter(llm=llm)
-    return InsightAgent(
-        router=router,
-        llm=llm,
-        research_agent=research_agent,
-        research_coordinator=research_coordinator,
-        close_callbacks=[
-            checkpoint_store.close,
-            knowledge_search_tool.close,
-            *([vision_cleanup] if vision_cleanup is not None else []),
-        ],
-    )
-
-
-def _build_vision_runtime(
-    retrieval_config: HybridRetrievalConfig,
-) -> tuple[
-    VisionRetriever | None,
-    HybridRetriever | None,
-    Callable[[], None] | None,
-]:
-    """Probe Vision capability once and build its shared retrieval resources."""
-    vision_config = VisionModelConfig.from_env(required=False)
-    if vision_config is None:
-        return None, None, None
-
-    try:
-        vector_store = QdrantVectorStore()
-    except Exception as exc:
-        logger.warning("Vision Retrieval disabled: cannot open Qdrant: %s", exc)
-        return None, None, None
-    try:
-        if not vector_store.collection_exists():
-            vector_store.close()
-            return None, None, None
-        image_chunks = vector_store.iter_chunks(source_types={"image"})
-        if not any(_is_accessible_image(chunk.source) for chunk in image_chunks):
-            vector_store.close()
-            return None, None, None
-    except Exception as exc:
-        vector_store.close()
-        logger.warning(
-            "Vision Retrieval disabled: cannot inspect indexed images: %s",
-            exc,
-        )
-        return None, None, None
-
-    try:
-        hybrid_retriever = build_default_hybrid_retriever(
-            retrieval_config,
-            vector_store,
-        )
-    except Exception:
-        vector_store.close()
-        raise
-
-    try:
-        vision_client = OpenAICompatibleVisionClient(vision_config)
-    except Exception:
-        vector_store.close()
-        raise
-
-    def cleanup() -> None:
-        try:
-            vision_client.close()
-        finally:
-            vector_store.close()
-
-    return (
-        VisionRetriever(
-            hybrid_retriever=hybrid_retriever,
-            analyzer=VisionAnalyzer(image_request=vision_client.analyze_image),
-        ),
-        hybrid_retriever,
-        cleanup,
-    )
-
-
-def _is_accessible_image(source: str) -> bool:
-    path = Path(source)
-    if not path.is_file():
-        return False
-    try:
-        guess_mime_type(source)
-        with path.open("rb") as image_file:
-            return bool(image_file.read(1))
-    except (IngestionError, OSError):
-        return False
 
 
 def _print_answer(answer: str) -> None:
@@ -291,13 +65,27 @@ def _run_once(app: InsightAgent, query: str) -> Optional[int]:
     return None
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(
+    argv: Optional[list[str]] = None,
+    *,
+    config_factory: Callable[[], AppConfig] = AppConfig.from_env,
+    application_factory: Callable[[AppConfig], InsightAgent] = build_application,
+) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
 
     try:
-        app = _build_app()
-    except RuntimeError as exc:  # missing env vars
-        print(f"[config error] {exc}", file=sys.stderr)
+        config = config_factory()
+        app = application_factory(config)
+    except (RuntimeError, ValueError) as exc:
+        message = str(exc)
+        for name, value in os.environ.items():
+            contains_secret = any(
+                marker in name.upper()
+                for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")
+            )
+            if value and contains_secret:
+                message = message.replace(value, "[redacted]")
+        print(f"[config error] {message}", file=sys.stderr)
         return 2
 
     try:
