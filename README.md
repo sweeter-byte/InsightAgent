@@ -43,9 +43,41 @@ LLM_MODEL=gpt-4o-mini
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-`LLMClient` reads the first three at construction time. The knowledge-search
-builder reads `RERANKER_MODEL`; either component raises a clear `RuntimeError`
-when its required configuration is missing.
+`insight_agent.application.AppConfig` is the canonical startup configuration.
+`AppConfig.from_env()` loads `.env` and resolves the model, retrieval, optional
+Vision/Web, checkpoint, and Runtime settings before building the application.
+Missing required chat or reranker settings raise a clear configuration error.
+`CHECKPOINT_PATH` selects the LangGraph SQLite checkpoint file; its default is
+`.insight_agent/checkpoints.sqlite`, relative to the working directory.
+
+## Application startup (Chapter 18)
+
+`insight_agent.application.build_application(config)` is the single core
+composition root shared by the CLI and HTTP Runtime. It constructs the existing
+business graph from explicit configuration and returns an `InsightAgent` with
+one shared LLM client. The CLI is an input/output/error adapter: it reads a query,
+calls the application, prints the answer or diagnostic, and closes the application
+on exit. The HTTP Runtime builds the core application once per lifespan and shares
+its dependencies across requests.
+
+Local Qdrant opening and Hybrid Retriever construction stay lazy until the first
+local search. When Vision is configured, startup performs only the existing
+image-capability probe: open Qdrant and check for an indexed, readable supported
+original image. If enabled, Vision and the local knowledge tool share one Hybrid
+Retriever and the probed store. Embedding and reranker models still load on first
+use; startup adds no model warmup or per-request image scan.
+
+Resource ownership, cleanup after partial construction failure, and idempotent
+application close are centralized in the composition root and its owned
+resources. The Runtime lifespan also owns the Runtime service and Redis client,
+and releases them and the core application on shutdown or startup failure.
+
+Earlier-chapter standalone constructors retain environment-backed defaults as an
+explicit compatibility boundary for examples and direct component use. Official
+entrypoints resolve settings through `AppConfig` and pass them explicitly.
+`TextChunker` still uses the legacy `CHUNK_SIZE` and `CHUNK_OVERLAP` defaults;
+the indexing write pipeline is outside this phase. Chapter 18 changes startup
+assembly and ownership; the existing HTTP API and frontend behavior are unchanged.
 
 ## Run the CLI
 
@@ -82,6 +114,24 @@ pytest
 The default suite uses a scripted `FakeLLMClient` and **never** contacts a
 real endpoint, so it produces no API cost.
 
+In the local sandbox, the unchanged-main Starlette `TestClient` baseline hangs
+in `TestClient.__enter__`. For branch regression verification there, exclude
+`tests/runtime/test_api.py` and run the remaining suite outside the sandbox if
+asyncio event-loop teardown also stalls:
+
+```bash
+conda run --no-capture-output -n insight-agent python -m pytest \
+  --ignore=tests/runtime/test_api.py -q
+```
+
+The excluded API tests still belong to the normal suite. Reconfirm the sandbox
+limitation with the following command (exit `124` indicates the timeout):
+
+```bash
+timeout 10s conda run --no-capture-output -n insight-agent python -m pytest \
+  tests/runtime/test_api.py::test_create_returns_202_without_exposing_research_state -q
+```
+
 ## Manual smoke test against a real endpoint
 
 Not part of `pytest`. Once `.env` is configured, run the CLI with the example
@@ -106,9 +156,10 @@ answer. This is the fastest way to sanity-check that your `LLM_BASE_URL` and
 ## What Chapter 2 adds
 
 Chapter 2 introduces an **Intent Router** and a single application façade,
-`InsightAgent`, that the CLI now builds via `_build_app()` (composing
-`LLMClient` + `ToolRegistry` + `ResearchAgent` + `IntentRouter` + `InsightAgent`
-over one shared `LLMClient`). The control flow is:
+`InsightAgent`, composing `LLMClient` + `ToolRegistry` + `ResearchAgent` +
+`IntentRouter` over one shared `LLMClient`. The current CLI obtains this façade
+from `insight_agent.application.build_application`; the following flow describes
+the Chapter 2 behavior before later chapters add research orchestration:
 
 ```text
 User
@@ -423,6 +474,12 @@ checkpointer. A timed-out or interrupted run can be resumed explicitly with its
 original `run_id -> thread_id -> checkpoint` chain. Startup marks stale
 `running` records as `interrupted` but never resumes them automatically.
 
+The current HTTP entrypoint resolves `AppConfig` and calls the shared
+`build_application` once during FastAPI lifespan startup. All requests use that
+application's `ResearchCoordinator`; request handlers do not rebuild the core
+dependencies. The lifespan owns Redis and the Runtime service alongside the
+core application and closes them on shutdown or startup failure.
+
 Start a local Redis, configure the existing model/retrieval settings, then run:
 
 ```bash
@@ -442,10 +499,20 @@ curl -N http://127.0.0.1:8000/v1/research/runs/<run_id>/events
 curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 ```
 
-Runtime policy is configured with `RUNTIME_REDIS_URL`,
-`RUNTIME_MAX_CONCURRENCY`, `RUNTIME_RUN_TIMEOUT_SECONDS`,
-`RUNTIME_EVENT_TTL_SECONDS`, `RUNTIME_INFRA_RETRY_ATTEMPTS`, and
-`RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`. This chapter intentionally does not add
+`AppConfig.runtime` contains the Redis connection and execution policy;
+`AppConfig.checkpoint` contains the research checkpoint path:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `CHECKPOINT_PATH` | `.insight_agent/checkpoints.sqlite` | LangGraph research checkpoint database |
+| `RUNTIME_REDIS_URL` | `redis://localhost:6379/0` | Runtime records and event streams |
+| `RUNTIME_MAX_CONCURRENCY` | `2` | Concurrent research runs in this process |
+| `RUNTIME_RUN_TIMEOUT_SECONDS` | `900` | Run execution timeout in seconds |
+| `RUNTIME_EVENT_TTL_SECONDS` | `86400` | Event stream retention in seconds |
+| `RUNTIME_INFRA_RETRY_ATTEMPTS` | `3` | Maximum infrastructure operation attempts |
+| `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS` | `0.2` | Infrastructure retry backoff in seconds |
+
+This chapter intentionally does not add
 authentication, distributed workers, automatic resume, WebSockets, or
 exactly-once execution.
 

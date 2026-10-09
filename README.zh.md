@@ -34,8 +34,35 @@ LLM_MODEL=gpt-4o-mini
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-`LLMClient` 在构造时读取前三个环境变量；知识库搜索构建器读取
-`RERANKER_MODEL`。缺少各自必填配置时都会抛出提示清晰的 `RuntimeError`。
+`insight_agent.application.AppConfig` 是应用启动配置的统一入口。
+`AppConfig.from_env()` 加载 `.env`，在组装应用前解析模型、检索、可选
+Vision/Web、Checkpoint 与 Runtime 参数。缺少必填的聊天或 Reranker 参数时，
+会抛出明确的配置错误。`CHECKPOINT_PATH` 指定 LangGraph 的 SQLite Checkpoint
+文件，默认值为 `.insight_agent/checkpoints.sqlite`，相对于当前工作目录解析。
+
+## 应用启动（第十八章）
+
+`insight_agent.application.build_application(config)` 是 CLI 与 HTTP Runtime
+共用的唯一核心组装入口（composition root）。它接收显式配置，构建已有业务图，
+返回共享同一个 LLM Client 的 `InsightAgent`。CLI 只负责输入、输出与错误适配：
+读取 query、调用应用、打印答案或错误，并在退出时关闭应用。HTTP Runtime 在每次
+lifespan 启动时只构建一次核心应用，各请求共享其依赖。
+
+本地 Qdrant 与 Hybrid Retriever 仍在首次本地检索时才打开和构建。配置 Vision
+后，启动阶段只执行已有的图片能力探测：打开 Qdrant，检查索引中是否存在仍可读取
+的受支持原图。启用 Vision 时，视觉检索与本地知识库工具共享同一个 Hybrid
+Retriever 和探测时打开的 Store。Embedding 与 Reranker 模型仍在首次使用时加载；
+启动阶段不增加模型预热，也不在每次请求时重新扫描图片。
+
+资源所有权、构建中途失败后的清理与应用的幂等关闭，集中在核心组装入口及其持有的
+资源中。Runtime lifespan 另外持有 Runtime Service 与 Redis Client，在关闭或
+启动失败时一并释放这些资源与核心应用。
+
+早期章节的独立组件构造器保留基于环境变量的默认值，作为示例和直接使用组件时的
+显式兼容边界。正式入口通过 `AppConfig` 解析配置，再显式传入组件。
+`TextChunker` 的 `CHUNK_SIZE`、`CHUNK_OVERLAP` 仍保留旧机制，因为索引写入
+流水线不在本阶段范围内。第十八章调整启动组装和资源所有权，已有 HTTP API 与
+前端行为保持不变。
 
 ## 运行 CLI
 
@@ -65,6 +92,23 @@ pytest
 
 默认测试使用脚本化的 `FakeLLMClient`,**不会**访问任何真实 endpoint,不会产生 API 费用。
 
+本地沙箱中，未改动的 main 分支也会在 Starlette `TestClient.__enter__` 中阻塞。
+在该环境核验分支回归时，排除 `tests/runtime/test_api.py`；若其余 asyncio 测试
+在事件循环清理阶段也阻塞，则在沙箱外执行其余完整测试：
+
+```bash
+conda run --no-capture-output -n insight-agent python -m pytest \
+  --ignore=tests/runtime/test_api.py -q
+```
+
+被排除的 API 测试仍属于正常测试集。以下命令用于复核沙箱限制，退出码 `124`
+表示触发超时：
+
+```bash
+timeout 10s conda run --no-capture-output -n insight-agent python -m pytest \
+  tests/runtime/test_api.py::test_create_returns_202_without_exposing_research_state -q
+```
+
 ## 真实 endpoint 手动冒烟测试
 
 不属于 `pytest` 的一部分。配好 `.env` 后,用上面的示例 query 跑一遍 CLI,确认模型确实调用了 `read_file` 并返回正确答案。这是最快验证你配置的 `LLM_BASE_URL` 与 `LLM_MODEL` 是否真的支持 tool calling 的方式。
@@ -80,7 +124,10 @@ pytest
 
 ## 第二章新增
 
-第二章引入 **Intent Router** 与统一应用门面 `InsightAgent`。CLI 现在通过 `_build_app()` 组装(在一个共享的 `LLMClient` 上组合 `LLMClient` + `ToolRegistry` + `ResearchAgent` + `IntentRouter` + `InsightAgent`)。控制流程为:
+第二章引入 **Intent Router** 与统一应用门面 `InsightAgent`，在一个共享的
+`LLMClient` 上组合 `ToolRegistry`、`ResearchAgent` 与 `IntentRouter`。当前 CLI
+通过 `insight_agent.application.build_application` 获取该门面；以下流程描述
+后续章节加入研究编排之前的第二章行为：
 
 ```text
 用户
@@ -337,6 +384,11 @@ Runtime 严格区分 `request_id`、`run_id` 和 LangGraph `thread_id`。Redis �
 `run_id -> thread_id -> checkpoint` 链显式恢复。服务启动时只把遗留的
 `running` 记录标记为 `interrupted`，不会自动继续消耗模型额度。
 
+当前 HTTP 入口在 FastAPI lifespan 启动时解析 `AppConfig`，并调用共享的
+`build_application` 构建一次核心应用。各请求使用该应用的
+`ResearchCoordinator`，请求处理器不重新构建核心依赖。Lifespan 同时持有
+Redis、Runtime Service 与核心应用，在关闭或启动失败时清理。
+
 启动本地 Redis、配置已有模型与检索参数后运行：
 
 ```bash
@@ -356,10 +408,20 @@ curl -N http://127.0.0.1:8000/v1/research/runs/<run_id>/events
 curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 ```
 
-运行策略由 `RUNTIME_REDIS_URL`、`RUNTIME_MAX_CONCURRENCY`、
-`RUNTIME_RUN_TIMEOUT_SECONDS`、`RUNTIME_EVENT_TTL_SECONDS`、
-`RUNTIME_INFRA_RETRY_ATTEMPTS` 与 `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS`
-统一配置。本章不实现认证、分布式 Worker、自动恢复、WebSocket 或 Exactly-Once。
+`AppConfig.runtime` 统一保存 Redis 连接与执行策略，`AppConfig.checkpoint`
+保存研究 Checkpoint 路径：
+
+| 配置项 | 默认值 | 用途 |
+|---|---|---|
+| `CHECKPOINT_PATH` | `.insight_agent/checkpoints.sqlite` | LangGraph 研究 Checkpoint 数据库 |
+| `RUNTIME_REDIS_URL` | `redis://localhost:6379/0` | Runtime 记录与事件流 |
+| `RUNTIME_MAX_CONCURRENCY` | `2` | 当前进程内的研究并发数 |
+| `RUNTIME_RUN_TIMEOUT_SECONDS` | `900` | Run 执行超时，单位秒 |
+| `RUNTIME_EVENT_TTL_SECONDS` | `86400` | 事件流保留时间，单位秒 |
+| `RUNTIME_INFRA_RETRY_ATTEMPTS` | `3` | 基础设施操作最大尝试次数 |
+| `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS` | `0.2` | 基础设施重试退避时间，单位秒 |
+
+本章不实现认证、分布式 Worker、自动恢复、WebSocket 或 Exactly-Once。
 
 ## 第十七章新增：Evaluation Harness
 
