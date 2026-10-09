@@ -48,11 +48,12 @@ Vision/Web、Checkpoint 与 Runtime 参数。缺少必填的聊天或 Reranker �
 读取 query、调用应用、打印答案或错误，并在退出时关闭应用。HTTP Runtime 在每次
 lifespan 启动时只构建一次核心应用，各请求共享其依赖。
 
-本地 Qdrant 与 Hybrid Retriever 仍在首次本地检索时才打开和构建。配置 Vision
-后，启动阶段只执行已有的图片能力探测：打开 Qdrant，检查索引中是否存在仍可读取
-的受支持原图。启用 Vision 时，视觉检索与本地知识库工具共享同一个 Hybrid
-Retriever 和探测时打开的 Store。Embedding 与 Reranker 模型仍在首次使用时加载；
-启动阶段不增加模型预热，也不在每次请求时重新扫描图片。
+未配置 Vision 时，Qdrant 的打开与 Hybrid Retriever 的组装仍延迟到首次本地
+检索。配置 Vision 后，启动阶段会打开 Qdrant，执行已有的图片能力探测。只有发现
+索引中存在可用图片、且其受支持原图仍可读取时，才在启动阶段组装共享的 Hybrid
+Retriever；视觉检索与本地知识库工具随后共享该 Retriever 和探测时打开的 Store。
+Embedding 与 CrossEncoder 模型权重仍延迟到检索使用时加载。启动阶段不增加模型
+预热，也不在每次请求时重新扫描图片。
 
 资源所有权、构建中途失败后的清理与应用的幂等关闭，集中在核心组装入口及其持有的
 资源中。Runtime lifespan 另外持有 Runtime Service 与 Redis Client，在关闭或
@@ -91,23 +92,6 @@ pytest
 ```
 
 默认测试使用脚本化的 `FakeLLMClient`,**不会**访问任何真实 endpoint,不会产生 API 费用。
-
-本地沙箱中，未改动的 main 分支也会在 Starlette `TestClient.__enter__` 中阻塞。
-在该环境核验分支回归时，排除 `tests/runtime/test_api.py`；若其余 asyncio 测试
-在事件循环清理阶段也阻塞，则在沙箱外执行其余完整测试：
-
-```bash
-conda run --no-capture-output -n insight-agent python -m pytest \
-  --ignore=tests/runtime/test_api.py -q
-```
-
-被排除的 API 测试仍属于正常测试集。以下命令用于复核沙箱限制，退出码 `124`
-表示触发超时：
-
-```bash
-timeout 10s conda run --no-capture-output -n insight-agent python -m pytest \
-  tests/runtime/test_api.py::test_create_returns_202_without_exposing_research_state -q
-```
 
 ## 真实 endpoint 手动冒烟测试
 

@@ -60,12 +60,13 @@ calls the application, prints the answer or diagnostic, and closes the applicati
 on exit. The HTTP Runtime builds the core application once per lifespan and shares
 its dependencies across requests.
 
-Local Qdrant opening and Hybrid Retriever construction stay lazy until the first
-local search. When Vision is configured, startup performs only the existing
-image-capability probe: open Qdrant and check for an indexed, readable supported
-original image. If enabled, Vision and the local knowledge tool share one Hybrid
-Retriever and the probed store. Embedding and reranker models still load on first
-use; startup adds no model warmup or per-request image scan.
+When Vision is not configured, Qdrant opening and Hybrid Retriever composition
+remain lazy until the first local retrieval. When Vision is configured, startup
+opens Qdrant for the existing image-capability probe. Only if a usable indexed
+image with a readable supported original is found does startup compose the
+shared Hybrid Retriever; Vision and the local knowledge tool then share that
+retriever and the probed store. Embedding and CrossEncoder model weights remain
+lazy until retrieval use. Startup adds no model warmup or per-request image scan.
 
 Resource ownership, cleanup after partial construction failure, and idempotent
 application close are centralized in the composition root and its owned
@@ -113,24 +114,6 @@ pytest
 
 The default suite uses a scripted `FakeLLMClient` and **never** contacts a
 real endpoint, so it produces no API cost.
-
-In the local sandbox, the unchanged-main Starlette `TestClient` baseline hangs
-in `TestClient.__enter__`. For branch regression verification there, exclude
-`tests/runtime/test_api.py` and run the remaining suite outside the sandbox if
-asyncio event-loop teardown also stalls:
-
-```bash
-conda run --no-capture-output -n insight-agent python -m pytest \
-  --ignore=tests/runtime/test_api.py -q
-```
-
-The excluded API tests still belong to the normal suite. Reconfirm the sandbox
-limitation with the following command (exit `124` indicates the timeout):
-
-```bash
-timeout 10s conda run --no-capture-output -n insight-agent python -m pytest \
-  tests/runtime/test_api.py::test_create_returns_202_without_exposing_research_state -q
-```
 
 ## Manual smoke test against a real endpoint
 
