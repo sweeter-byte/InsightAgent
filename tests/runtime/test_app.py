@@ -18,6 +18,7 @@ from insight_agent.runtime.service import ResearchRuntimeService
 class FakeRedis:
     def __init__(self, close_order: list[str]) -> None:
         self.ping_calls = 0
+        self.scan_calls = 0
         self.close_calls = 0
         self.close_order = close_order
         self.fail_ping = False
@@ -31,6 +32,7 @@ class FakeRedis:
         return True
 
     async def scan_iter(self, *, match: str) -> AsyncIterator[bytes]:
+        self.scan_calls += 1
         del match
         if self.fail_scan:
             raise RuntimeError("reconciliation failed")
@@ -259,19 +261,27 @@ def test_runtime_creation_defers_environment_and_resources(
     monkeypatch: pytest.MonkeyPatch,
     module_level: bool,
 ) -> None:
+    calls: list[tuple[tuple, dict]] = []
+
     def unexpected_call(*_args, **_kwargs):
+        calls.append((_args, _kwargs))
         pytest.fail("runtime construction must defer config and resource calls")
 
-    monkeypatch.setattr(AppConfig, "from_env", unexpected_call)
-    monkeypatch.setattr(RuntimePolicy, "from_env", unexpected_call)
-    monkeypatch.setattr("insight_agent.application.build_application", unexpected_call)
-    monkeypatch.setattr(runtime_app.Redis, "from_url", unexpected_call)
-
     if module_level:
+        monkeypatch.setattr(AppConfig, "from_env", unexpected_call)
+        monkeypatch.setattr(RuntimePolicy, "from_env", unexpected_call)
+        monkeypatch.setattr("insight_agent.application.build_application", unexpected_call)
+        monkeypatch.setattr(runtime_app.Redis, "from_url", unexpected_call)
         namespace = runpy.run_path(runtime_app.__file__)
         assert namespace["app"] is not None
     else:
-        assert create_runtime_app() is not None
+        assert create_runtime_app(
+            config_factory=unexpected_call,
+            application_factory=unexpected_call,
+            redis_client_factory=unexpected_call,
+        ) is not None
+
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -284,6 +294,7 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
 
     assert resources.calls == []
     assert resources.redis.ping_calls == 0
+    assert resources.redis.scan_calls == 0
     assert not hasattr(app.state, "runtime_service")
     async with app.router.lifespan_context(app):
         assert resources.calls == [
@@ -302,6 +313,7 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
         assert service.events._event_ttl_seconds == service.policy.event_ttl_seconds
         assert service.runner.coordinator is resources.research_app.research_coordinator
         assert resources.redis.ping_calls == 1
+        assert resources.redis.scan_calls == 1
         assert resources.close_order == []
         request = Request({"type": "http", "app": app})
         assert _service(request) is service
@@ -309,6 +321,7 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
         assert len(resources.calls) == 3
 
     assert resources.close_order == ["service", "redis", "application"]
+    assert resources.redis.scan_calls == 1
     assert resources.redis.close_calls == 1
     assert resources.research_app.close_calls == 1
 
