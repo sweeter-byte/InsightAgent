@@ -8,6 +8,7 @@ query formed from ``sys.argv[1:]`` and exits.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections.abc import Callable
 from typing import Optional
@@ -84,7 +85,8 @@ def main(
                 for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")
             )
             if value and contains_secret:
-                message = message.replace(value, "[redacted]")
+                token = rf"(?<![^\W_]){re.escape(value)}(?![^\W_])"
+                message = re.sub(token, "[redacted]", message)
         print(f"[config error] {message}", file=sys.stderr)
         return 2
 

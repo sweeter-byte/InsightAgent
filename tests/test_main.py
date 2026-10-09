@@ -168,6 +168,29 @@ def test_main_application_factory_error_does_not_leak_secret(
     assert secret not in captured.err
 
 
+def test_main_redacts_short_secret_without_corrupting_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("LLM_API_KEY", "a")
+
+    def application_factory(_config: AppConfig) -> InsightAgent:
+        raise RuntimeError(
+            "configuration validation failed; API token: a; please retry"
+        )
+
+    rc = cli.main(
+        ["anything"],
+        config_factory=lambda: object(),  # type: ignore[arg-type,return-value]
+        application_factory=application_factory,
+    )
+
+    assert rc == 2
+    message = capsys.readouterr().err
+    assert "configuration validation failed" in message
+    assert "API token: [redacted]; please retry" in message
+
+
 def test_main_application_factory_unexpected_error_remains_visible() -> None:
     def application_factory(_config: AppConfig) -> InsightAgent:
         raise KeyError("unexpected factory failure")
