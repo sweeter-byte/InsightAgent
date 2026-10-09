@@ -513,6 +513,8 @@ def test_ingest_file_image_suffixes(tmp_path: Path, name: str) -> None:
 def test_ingest_file_missing_vision_config_raises_ingestion_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "true")
     for name in ("VISION_API_KEY", "VISION_BASE_URL", "VISION_MODEL"):
         monkeypatch.delenv(name, raising=False)
     image = _make_png(tmp_path)
