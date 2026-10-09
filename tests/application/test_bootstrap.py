@@ -8,8 +8,8 @@ import pytest
 
 import insight_agent.application as application
 from insight_agent.application import AppConfig, CheckpointConfig
-from insight_agent.indexing import QdrantConfig
-from insight_agent.ingestion import IngestionError, VisionModelConfig
+from insight_agent.indexing import Chunk, QdrantConfig, make_chunk_id, make_document_id
+from insight_agent.ingestion import Document, IngestionError, SourceType, VisionModelConfig
 from insight_agent.llm import LLMConfig
 from insight_agent.retrieval import HybridRetrievalConfig, KnowledgeSearchTool
 from insight_agent.routing import RetrievalSource
@@ -91,11 +91,33 @@ def resources():
     return factories, llm, checkpoint, hybrid, calls, events
 
 
+def image_chunk(source: Path) -> Chunk:
+    content = f"Indexed image description for {source.name}"
+    document = Document(
+        content=content,
+        source=str(source),
+        source_type=SourceType.IMAGE,
+        metadata={"file_name": source.name},
+    )
+    document_id = make_document_id(document)
+    return Chunk(
+        id=make_chunk_id(document_id, 0, content),
+        document_id=document_id,
+        content=content,
+        source=document.source,
+        source_type=document.source_type,
+        chunk_index=0,
+        start_char=0,
+        end_char=len(content),
+        metadata=document.metadata,
+    )
+
+
 class QdrantStore(Resource):
     def __init__(self, events: list[str], image: Path) -> None:
         super().__init__("qdrant", events)
         self.collection_present = True
-        self.chunks = [SimpleNamespace(source=str(image))]
+        self.chunks = [image_chunk(image)]
         self.inspections: list[tuple] = []
 
     def collection_exists(self):
@@ -103,6 +125,7 @@ class QdrantStore(Resource):
         return self.collection_present
 
     def iter_chunks(self, *, source_types):
+        assert source_types == {"image"}
         self.inspections.append(("iter_chunks", source_types))
         return iter(self.chunks)
 
@@ -409,9 +432,13 @@ def test_probe_inspection_failure_warns_and_closes_store(
     setup = vision_resources
 
     def fail_inspection(*args, **kwargs):
+        if boundary == "iter_chunks":
+            assert kwargs["source_types"] == {"image"}
         raise OSError("inspection failed")
 
     def fail_iteration(*, source_types):
+        assert source_types == {"image"}
+
         def chunks():
             raise OSError("inspection failed")
             yield
@@ -464,11 +491,39 @@ def test_no_accessible_images_closes_probe_and_omits_vision(
         "unreadable": [unreadable],
         "mixed": [missing, directory, empty, unsupported, unreadable],
     }[source_kind]
-    setup.store.chunks = [SimpleNamespace(source=str(source)) for source in sources]
+    setup.store.chunks = [image_chunk(source) for source in sources]
 
     app = application.build_application(setup.settings, factories=setup.factories)
 
     assert_probe_disabled_vision(setup, app)
+
+
+def test_probe_skips_unusable_chunks_before_enabling_vision(
+    vision_resources, tmp_path
+) -> None:
+    setup = vision_resources
+    empty = tmp_path / "empty.jpg"
+    empty.touch()
+    sources = [tmp_path / "missing.png", empty, setup.image]
+    setup.store.chunks = [image_chunk(source) for source in sources]
+
+    app = application.build_application(setup.settings, factories=setup.factories)
+    workflow = app.research_coordinator.workflow
+
+    assert app.research_coordinator.available_sources == {
+        RetrievalSource.LOCAL, RetrievalSource.VISION
+    }
+    assert workflow.vision_retriever.hybrid_retriever is setup.hybrid
+    assert workflow.local_retriever._get_retriever() is setup.hybrid
+    assert setup.store.inspections == [
+        ("collection_exists",), ("iter_chunks", {"image"})
+    ]
+    assert setup.store.close_calls == 0
+    app.close()
+    assert setup.events == ["checkpoint", "hybrid", "vision", "qdrant", "llm"]
+    assert [setup.hybrid.close_calls, setup.client.close_calls, setup.store.close_calls] == [
+        1, 1, 1
+    ]
 
 
 def test_hybrid_construction_failure_closes_probed_store(vision_resources, caplog) -> None:
