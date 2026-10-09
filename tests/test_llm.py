@@ -15,6 +15,28 @@ import pytest
 
 from insight_agent.llm import LLMClient, LLMConfig, _require_env
 
+_MODEL_ENV_KEYS = (
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
+    "VISION_API_KEY",
+    "VISION_BASE_URL",
+    "VISION_MODEL",
+)
+
+
+def _snapshot_model_env() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in _MODEL_ENV_KEYS}
+
+
+def _restore_model_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    assert _snapshot_model_env() == snapshot
+
 
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Missing-variable tests must not refill values from a developer's .env.
@@ -64,19 +86,25 @@ def test_llm_config_loads_dotenv_only_when_reading_process_environment(
 ) -> None:
     from dotenv import load_dotenv
 
-    _clear_env(monkeypatch)
-    dotenv_path = tmp_path / ".env"
-    dotenv_path.write_text(
-        "LLM_API_KEY=dotenv-secret\n"
-        "LLM_BASE_URL=https://dotenv.example.invalid/v1\n"
-        "LLM_MODEL=dotenv-model\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path))
+    original_env = _snapshot_model_env()
+    try:
+        _clear_env(monkeypatch)
+        dotenv_path = tmp_path / ".env"
+        dotenv_path.write_text(
+            "LLM_API_KEY=dotenv-secret\n"
+            "LLM_BASE_URL=https://dotenv.example.invalid/v1\n"
+            "LLM_MODEL=dotenv-model\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path)
+        )
 
-    assert LLMConfig.from_env() == LLMConfig(
-        "dotenv-secret", "https://dotenv.example.invalid/v1", "dotenv-model"
-    )
+        assert LLMConfig.from_env() == LLMConfig(
+            "dotenv-secret", "https://dotenv.example.invalid/v1", "dotenv-model"
+        )
+    finally:
+        _restore_model_env(original_env)
 
 
 def test_llm_config_explicit_mapping_is_isolated_from_dotenv_and_process_env(
@@ -110,12 +138,20 @@ def test_legacy_require_env_loads_dotenv_before_reading_process_environment(
 ) -> None:
     from dotenv import load_dotenv
 
-    monkeypatch.delenv("VISION_API_KEY", raising=False)
-    dotenv_path = tmp_path / ".env"
-    dotenv_path.write_text("VISION_API_KEY=legacy-dotenv-secret\n", encoding="utf-8")
-    monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path))
+    original_env = _snapshot_model_env()
+    try:
+        monkeypatch.delenv("VISION_API_KEY", raising=False)
+        dotenv_path = tmp_path / ".env"
+        dotenv_path.write_text(
+            "VISION_API_KEY=legacy-dotenv-secret\n", encoding="utf-8"
+        )
+        monkeypatch.setattr(
+            "insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path)
+        )
 
-    assert _require_env("VISION_API_KEY") == "legacy-dotenv-secret"
+        assert _require_env("VISION_API_KEY") == "legacy-dotenv-secret"
+    finally:
+        _restore_model_env(original_env)
 
 
 def test_llm_config_reads_mapping_without_exposing_secret() -> None:

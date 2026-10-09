@@ -9,6 +9,7 @@ SDK itself.
 from __future__ import annotations
 
 import base64
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,6 +31,27 @@ _VISION_ENV = {
     "VISION_BASE_URL": "https://vision.example.invalid/v1",
     "VISION_MODEL": "vision-test-model",
 }
+_MODEL_ENV_KEYS = (
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_MODEL",
+    "VISION_API_KEY",
+    "VISION_BASE_URL",
+    "VISION_MODEL",
+)
+
+
+def _snapshot_model_env() -> dict[str, str | None]:
+    return {name: os.environ.get(name) for name in _MODEL_ENV_KEYS}
+
+
+def _restore_model_env(snapshot: dict[str, str | None]) -> None:
+    for name, value in snapshot.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    assert _snapshot_model_env() == snapshot
 
 
 def _set_vision_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -60,22 +82,28 @@ def test_vision_config_loads_dotenv_when_reading_process_environment(
 ) -> None:
     from dotenv import load_dotenv
 
-    for name in _VISION_ENV:
-        monkeypatch.delenv(name, raising=False)
-    dotenv_path = tmp_path / ".env"
-    dotenv_path.write_text(
-        "VISION_API_KEY=dotenv-vision-secret\n"
-        "VISION_BASE_URL=https://dotenv-vision.example.invalid/v1\n"
-        "VISION_MODEL=dotenv-vision-model\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path))
+    original_env = _snapshot_model_env()
+    try:
+        for name in _VISION_ENV:
+            monkeypatch.delenv(name, raising=False)
+        dotenv_path = tmp_path / ".env"
+        dotenv_path.write_text(
+            "VISION_API_KEY=dotenv-vision-secret\n"
+            "VISION_BASE_URL=https://dotenv-vision.example.invalid/v1\n"
+            "VISION_MODEL=dotenv-vision-model\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "insight_agent.llm.load_dotenv", lambda: load_dotenv(dotenv_path)
+        )
 
-    assert VisionModelConfig.from_env(required=required) == VisionModelConfig(
-        "dotenv-vision-secret",
-        "https://dotenv-vision.example.invalid/v1",
-        "dotenv-vision-model",
-    )
+        assert VisionModelConfig.from_env(required=required) == VisionModelConfig(
+            "dotenv-vision-secret",
+            "https://dotenv-vision.example.invalid/v1",
+            "dotenv-vision-model",
+        )
+    finally:
+        _restore_model_env(original_env)
 
 
 def test_vision_config_explicit_mapping_is_isolated_from_dotenv_and_process_env(
