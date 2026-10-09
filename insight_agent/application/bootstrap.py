@@ -132,7 +132,6 @@ def _build_vision_runtime(
             )
             return None
 
-        vision_client = _own(stack, factories.vision_client(config.vision))
         with ExitStack() as pending_hybrid:
             shared_hybrid = _own(
                 pending_hybrid,
@@ -143,6 +142,7 @@ def _build_vision_runtime(
                     vector_store,
                 ),
             )
+            vision_client = _own(stack, factories.vision_client(config.vision))
             knowledge = _own(
                 stack,
                 KnowledgeSearchTool(

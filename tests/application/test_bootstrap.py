@@ -2,13 +2,14 @@
 
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import insight_agent.application as application
 from insight_agent.application import AppConfig, CheckpointConfig
 from insight_agent.indexing import QdrantConfig
-from insight_agent.ingestion import VisionModelConfig
+from insight_agent.ingestion import IngestionError, VisionModelConfig
 from insight_agent.llm import LLMConfig
 from insight_agent.retrieval import HybridRetrievalConfig, KnowledgeSearchTool
 from insight_agent.routing import RetrievalSource
@@ -88,6 +89,88 @@ def resources():
         hybrid=create_hybrid,
     )
     return factories, llm, checkpoint, hybrid, calls, events
+
+
+class QdrantStore(Resource):
+    def __init__(self, events: list[str], image: Path) -> None:
+        super().__init__("qdrant", events)
+        self.collection_present = True
+        self.chunks = [SimpleNamespace(source=str(image))]
+        self.inspections: list[tuple] = []
+
+    def collection_exists(self):
+        self.inspections.append(("collection_exists",))
+        return self.collection_present
+
+    def iter_chunks(self, *, source_types):
+        self.inspections.append(("iter_chunks", source_types))
+        return iter(self.chunks)
+
+
+class VisionClient(Resource):
+    def analyze_image(self, *args, **kwargs):
+        pytest.fail("Vision model must not run during composition")
+
+
+@pytest.fixture
+def vision_resources(tmp_path):
+    factories, llm, checkpoint, hybrid, calls, events = resources()
+    image = tmp_path / "indexed.png"
+    image.write_bytes(b"image")
+    store = QdrantStore(events, image)
+    client = VisionClient("vision", events)
+    settings = replace(
+        config(),
+        vision=VisionModelConfig(
+            api_key="vision-secret", base_url="https://vision.example/v1", model="vision"
+        ),
+    )
+
+    def create_qdrant(value):
+        calls.append(("qdrant", value))
+        return store
+
+    def create_vision(value):
+        calls.append(("vision", value))
+        return client
+
+    return SimpleNamespace(
+        settings=settings,
+        factories=replace(factories, qdrant=create_qdrant, vision_client=create_vision),
+        llm=llm,
+        checkpoint=checkpoint,
+        hybrid=hybrid,
+        store=store,
+        client=client,
+        calls=calls,
+        events=events,
+        image=image,
+    )
+
+
+def test_vision_client_failure_closes_pending_hybrid_and_store(
+    vision_resources, caplog
+) -> None:
+    setup = vision_resources
+
+    def fail_client(value):
+        assert value is setup.settings.vision
+        setup.calls.append(("vision", value))
+        raise RuntimeError("Vision client failed")
+
+    with pytest.raises(RuntimeError, match="Vision client failed"):
+        application.build_application(
+            setup.settings,
+            factories=replace(setup.factories, vision_client=fail_client),
+        )
+
+    assert setup.events == ["hybrid", "qdrant", "llm"]
+    assert [call[0] for call in setup.calls] == ["llm", "qdrant", "hybrid", "vision"]
+    assert [setup.hybrid.close_calls, setup.store.close_calls, setup.llm.close_calls] == [
+        1, 1, 1
+    ]
+    assert setup.checkpoint.close_calls == setup.client.close_calls == 0
+    assert not caplog.records
 
 
 def test_composition_shares_one_llm_and_keeps_local_retrieval_lazy() -> None:
@@ -205,48 +288,360 @@ def test_factories_are_frozen_and_slotted() -> None:
     assert not hasattr(factories, "__dict__")
 
 
-def test_vision_shares_hybrid_and_closes_each_resource_once(tmp_path) -> None:
-    factories, llm, checkpoint, hybrid, calls, events = resources()
-    image = tmp_path / "indexed.png"
-    image.write_bytes(b"image")
-
-    class Store(Resource):
-        def collection_exists(self):
-            return True
-
-        def iter_chunks(self, *, source_types):
-            assert source_types == {"image"}
-            return [type("Chunk", (), {"source": str(image)})()]
-
-    class VisionClient(Resource):
-        def analyze_image(self, *args, **kwargs):
-            pytest.fail("Vision model must not run during composition")
-
-    store = Store("qdrant", events)
-    client = VisionClient("vision", events)
-    vision = VisionModelConfig(
-        api_key="vision-secret", base_url="https://vision.example/v1", model="vision"
-    )
-    settings = replace(config(), vision=vision)
-    factories = replace(
-        factories, qdrant=lambda value: store, vision_client=lambda value: client
-    )
-
-    app = application.build_application(settings, factories=factories)
+def test_vision_shares_hybrid_and_closes_each_resource_once(vision_resources) -> None:
+    setup = vision_resources
+    app = application.build_application(setup.settings, factories=setup.factories)
     workflow = app.research_coordinator.workflow
 
-    assert workflow.local_retriever._get_retriever() is hybrid
-    assert workflow.vision_retriever.hybrid_retriever is hybrid
+    assert workflow.local_retriever is app.research_agent.registry.get(
+        "search_knowledge_base"
+    )
+    assert workflow.local_retriever._get_retriever() is setup.hybrid
+    assert workflow.vision_retriever.hybrid_retriever is setup.hybrid
+    assert workflow.vision_retriever.analyzer.image_request == setup.client.analyze_image
     assert app.research_coordinator.available_sources == {
         RetrievalSource.LOCAL, RetrievalSource.VISION
     }
-    assert (
-        "hybrid", settings.retrieval, settings.qdrant, settings.embedding_model, store
-    ) in calls
+    assert [call[0] for call in setup.calls] == [
+        "llm", "qdrant", "hybrid", "vision", "checkpoint"
+    ]
+    assert setup.calls[1][1] is setup.settings.qdrant
+    hybrid_arguments = setup.calls[2][1:]
+    assert hybrid_arguments[0] is setup.settings.retrieval
+    assert hybrid_arguments[1] is setup.settings.qdrant
+    assert hybrid_arguments[2] is setup.settings.embedding_model
+    assert hybrid_arguments[3] is setup.store
+    assert setup.calls[3][1] is setup.settings.vision
+    assert setup.store.inspections == [
+        ("collection_exists",), ("iter_chunks", {"image"})
+    ]
     app.close()
     app.close()
-    assert events == ["checkpoint", "hybrid", "vision", "qdrant", "llm"]
-    assert [hybrid.close_calls, client.close_calls, store.close_calls] == [1, 1, 1]
+    assert setup.events == ["checkpoint", "hybrid", "vision", "qdrant", "llm"]
+    assert [
+        setup.hybrid.close_calls, setup.client.close_calls, setup.store.close_calls,
+        setup.checkpoint.close_calls, setup.llm.close_calls,
+    ] == [1, 1, 1, 1, 1]
+
+
+def assert_probe_disabled_vision(setup, app) -> None:
+    workflow = app.research_coordinator.workflow
+    assert workflow.vision_retriever is None
+    assert workflow.local_retriever is not None
+    expected_sources = {RetrievalSource.LOCAL}
+    if setup.settings.web_search is not None:
+        expected_sources.add(RetrievalSource.WEB)
+    assert app.research_coordinator.available_sources == expected_sources
+    assert setup.store.close_calls == 1
+    assert setup.events == ["qdrant"]
+    assert [call[0] for call in setup.calls] == ["llm", "qdrant", "checkpoint"]
+    assert setup.hybrid.close_calls == setup.client.close_calls == 0
+    app.close()
+    app.close()
+    assert setup.events == ["qdrant", "checkpoint", "llm"]
+    assert [
+        setup.store.close_calls, setup.checkpoint.close_calls, setup.llm.close_calls
+    ] == [1, 1, 1]
+
+
+def test_disabled_vision_never_constructs_vision_resources(vision_resources) -> None:
+    setup = vision_resources
+    app = application.build_application(
+        replace(setup.settings, vision=None), factories=setup.factories
+    )
+
+    assert [call[0] for call in setup.calls] == ["llm", "checkpoint"]
+    assert app.research_coordinator.available_sources == {RetrievalSource.LOCAL}
+    assert app.research_coordinator.workflow.vision_retriever is None
+    app.close()
+    assert [setup.store.close_calls, setup.hybrid.close_calls, setup.client.close_calls] == [
+        0, 0, 0
+    ]
+
+
+def test_qdrant_open_failure_warns_and_keeps_application_available(
+    vision_resources, caplog
+) -> None:
+    setup = vision_resources
+
+    def fail_qdrant(value):
+        assert value is setup.settings.qdrant
+        setup.calls.append(("qdrant", value))
+        raise OSError("store cannot open")
+
+    app = application.build_application(
+        setup.settings, factories=replace(setup.factories, qdrant=fail_qdrant)
+    )
+
+    assert app.research_coordinator.available_sources == {RetrievalSource.LOCAL}
+    assert app.research_coordinator.workflow.vision_retriever is None
+    assert [call[0] for call in setup.calls] == ["llm", "qdrant", "checkpoint"]
+    assert "cannot open Qdrant: store cannot open" in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+    app.close()
+    assert setup.events == ["checkpoint", "llm"]
+    assert [setup.store.close_calls, setup.hybrid.close_calls, setup.client.close_calls] == [
+        0, 0, 0
+    ]
+
+
+@pytest.mark.parametrize("web_enabled", [False, True])
+def test_missing_collection_closes_probe_without_inspecting_chunks(
+    vision_resources, web_enabled
+) -> None:
+    setup = vision_resources
+    setup.store.collection_present = False
+    if web_enabled:
+        setup.settings = replace(
+            setup.settings, web_search=WebSearchConfig(api_key="web-secret")
+        )
+
+    app = application.build_application(setup.settings, factories=setup.factories)
+
+    assert setup.store.inspections == [("collection_exists",)]
+    assert_probe_disabled_vision(setup, app)
+
+
+@pytest.mark.parametrize("boundary", ["collection_exists", "iter_chunks", "iteration"])
+def test_probe_inspection_failure_warns_and_closes_store(
+    vision_resources, monkeypatch, caplog, boundary
+) -> None:
+    setup = vision_resources
+
+    def fail_inspection(*args, **kwargs):
+        raise OSError("inspection failed")
+
+    def fail_iteration(*, source_types):
+        def chunks():
+            raise OSError("inspection failed")
+            yield
+
+        return chunks()
+
+    if boundary == "iteration":
+        monkeypatch.setattr(setup.store, "iter_chunks", fail_iteration)
+    else:
+        monkeypatch.setattr(setup.store, boundary, fail_inspection)
+
+    app = application.build_application(setup.settings, factories=setup.factories)
+
+    assert "cannot inspect indexed images: inspection failed" in caplog.text
+    assert any(record.levelname == "WARNING" for record in caplog.records)
+    assert_probe_disabled_vision(setup, app)
+
+
+@pytest.mark.parametrize(
+    "source_kind",
+    ["no_chunks", "missing", "directory", "empty", "unsupported", "unreadable", "mixed"],
+)
+def test_no_accessible_images_closes_probe_and_omits_vision(
+    vision_resources, tmp_path, monkeypatch, source_kind
+) -> None:
+    setup = vision_resources
+    missing = tmp_path / "missing.png"
+    directory = tmp_path / "directory.png"
+    directory.mkdir()
+    empty = tmp_path / "empty.jpg"
+    empty.touch()
+    unsupported = tmp_path / "unsupported.txt"
+    unsupported.write_bytes(b"data")
+    unreadable = tmp_path / "unreadable.webp"
+    unreadable.write_bytes(b"image")
+    original_open = Path.open
+
+    def open_image(path, *args, **kwargs):
+        if path == unreadable:
+            raise PermissionError("image cannot be read")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_image)
+    sources = {
+        "no_chunks": [],
+        "missing": [missing],
+        "directory": [directory],
+        "empty": [empty],
+        "unsupported": [unsupported],
+        "unreadable": [unreadable],
+        "mixed": [missing, directory, empty, unsupported, unreadable],
+    }[source_kind]
+    setup.store.chunks = [SimpleNamespace(source=str(source)) for source in sources]
+
+    app = application.build_application(setup.settings, factories=setup.factories)
+
+    assert_probe_disabled_vision(setup, app)
+
+
+def test_hybrid_construction_failure_closes_probed_store(vision_resources, caplog) -> None:
+    setup = vision_resources
+
+    def fail_hybrid(*values):
+        setup.calls.append(("hybrid", *values))
+        raise ValueError("hybrid configuration failed")
+
+    with pytest.raises(ValueError, match="hybrid configuration failed"):
+        application.build_application(
+            setup.settings, factories=replace(setup.factories, hybrid=fail_hybrid)
+        )
+
+    assert [call[0] for call in setup.calls] == ["llm", "qdrant", "hybrid"]
+    assert setup.events == ["qdrant", "llm"]
+    assert setup.store.close_calls == setup.llm.close_calls == 1
+    assert [
+        setup.hybrid.close_calls, setup.client.close_calls, setup.checkpoint.close_calls
+    ] == [0, 0, 0]
+    assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "boundary", ["KnowledgeSearchTool", "VisionAnalyzer", "VisionRetriever"]
+)
+def test_vision_consumer_construction_failure_closes_all_acquired_resources(
+    vision_resources, monkeypatch, caplog, boundary
+) -> None:
+    from insight_agent.application import bootstrap
+
+    setup = vision_resources
+
+    def fail_consumer(*args, **kwargs):
+        raise RuntimeError(f"{boundary} failed")
+
+    monkeypatch.setattr(bootstrap, boundary, fail_consumer)
+
+    with pytest.raises(RuntimeError, match=f"{boundary} failed"):
+        application.build_application(setup.settings, factories=setup.factories)
+
+    assert setup.events == ["hybrid", "vision", "qdrant", "llm"]
+    assert [
+        setup.hybrid.close_calls, setup.client.close_calls, setup.store.close_calls,
+        setup.llm.close_calls,
+    ] == [1, 1, 1, 1]
+    assert setup.checkpoint.close_calls == 0
+    assert not caplog.records
+
+
+def test_checkpoint_failure_closes_transferred_vision_runtime(vision_resources) -> None:
+    setup = vision_resources
+
+    def fail_checkpoint(value):
+        assert value is setup.settings.checkpoint
+        raise RuntimeError("checkpoint failed")
+
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        application.build_application(
+            setup.settings, factories=replace(setup.factories, checkpoint=fail_checkpoint)
+        )
+
+    assert setup.events == ["hybrid", "vision", "qdrant", "llm"]
+    assert [
+        setup.hybrid.close_calls, setup.client.close_calls, setup.store.close_calls,
+        setup.llm.close_calls,
+    ] == [1, 1, 1, 1]
+    assert setup.checkpoint.close_calls == 0
+
+
+@pytest.mark.parametrize(
+    "boundary", ["ResearchRoutingWorkflow", "ResearchCoordinator", "InsightAgent"]
+)
+def test_later_composition_failure_closes_checkpoint_before_vision_runtime(
+    vision_resources, monkeypatch, boundary
+) -> None:
+    from insight_agent.application import bootstrap
+
+    setup = vision_resources
+
+    class TrackedKnowledgeTool(KnowledgeSearchTool):
+        def close(self):
+            setup.events.append("knowledge")
+            super().close()
+
+    def fail_composition(*args, **kwargs):
+        raise RuntimeError(f"{boundary} failed")
+
+    monkeypatch.setattr(bootstrap, "KnowledgeSearchTool", TrackedKnowledgeTool)
+    monkeypatch.setattr(bootstrap, boundary, fail_composition)
+
+    with pytest.raises(RuntimeError, match=f"{boundary} failed"):
+        application.build_application(setup.settings, factories=setup.factories)
+
+    assert setup.events == [
+        "checkpoint", "knowledge", "hybrid", "vision", "qdrant", "llm"
+    ]
+    assert [
+        setup.checkpoint.close_calls, setup.hybrid.close_calls, setup.client.close_calls,
+        setup.store.close_calls, setup.llm.close_calls,
+    ] == [1, 1, 1, 1, 1]
+
+
+def test_hybrid_cleanup_error_still_closes_every_resource_once(
+    vision_resources, monkeypatch
+) -> None:
+    setup = vision_resources
+    app = application.build_application(setup.settings, factories=setup.factories)
+    close_hybrid = setup.hybrid.close
+
+    def fail_hybrid_close():
+        close_hybrid()
+        raise RuntimeError("hybrid cleanup failed")
+
+    monkeypatch.setattr(setup.hybrid, "close", fail_hybrid_close)
+
+    with pytest.raises(RuntimeError, match="hybrid cleanup failed"):
+        app.close()
+
+    assert setup.events == ["checkpoint", "hybrid", "vision", "qdrant", "llm"]
+    app.close()
+    assert setup.events == ["checkpoint", "hybrid", "vision", "qdrant", "llm"]
+    assert [
+        setup.checkpoint.close_calls, setup.hybrid.close_calls, setup.client.close_calls,
+        setup.store.close_calls, setup.llm.close_calls,
+    ] == [1, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("extension", ["png", "jpg", "jpeg", "webp"])
+def test_accessible_image_accepts_nonempty_supported_files(tmp_path, extension) -> None:
+    from insight_agent.application.bootstrap import _is_accessible_image
+
+    image = tmp_path / f"image.{extension}"
+    image.write_bytes(b"image")
+
+    assert _is_accessible_image(str(image))
+
+
+@pytest.mark.parametrize("source_kind", ["missing", "directory", "empty", "unsupported"])
+def test_accessible_image_rejects_unusable_sources(tmp_path, source_kind) -> None:
+    from insight_agent.application.bootstrap import _is_accessible_image
+
+    image = tmp_path / ("image.txt" if source_kind == "unsupported" else "image.png")
+    if source_kind == "directory":
+        image.mkdir()
+    elif source_kind == "empty":
+        image.touch()
+    elif source_kind == "unsupported":
+        image.write_bytes(b"data")
+
+    assert not _is_accessible_image(str(image))
+
+
+@pytest.mark.parametrize(
+    "error", [PermissionError("unreadable"), IngestionError("invalid image")]
+)
+def test_accessible_image_handles_os_and_ingestion_errors(
+    tmp_path, monkeypatch, error
+) -> None:
+    from insight_agent.application import bootstrap
+
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+
+    def fail_open(*args, **kwargs):
+        raise error
+
+    if isinstance(error, IngestionError):
+        monkeypatch.setattr(bootstrap, "guess_mime_type", fail_open)
+    else:
+        monkeypatch.setattr(Path, "open", fail_open)
+
+    assert not bootstrap._is_accessible_image(str(image))
 
 
 def test_app_close_hook_runs_once() -> None:
