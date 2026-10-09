@@ -154,6 +154,45 @@ def test_close_attempts_all_callbacks_before_propagating_cleanup_error() -> None
 
 
 # ---------------------------------------------------------------------------
+# Public synchronous branch operations
+# ---------------------------------------------------------------------------
+
+
+def test_route_exposes_existing_router_without_dispatch() -> None:
+    app, router, llm, research, coordinator = _build(Intent.ANALYZE)
+
+    assert app.route("inspect notes") is Intent.ANALYZE
+    assert router.calls == ["inspect notes"]
+    assert llm.calls == []
+    assert research.calls == []
+    assert coordinator.calls == []
+
+
+def test_answer_direct_exposes_one_shot_branch_only() -> None:
+    app, router, llm, research, coordinator = _build(
+        Intent.RESEARCH, direct_reply="plain answer"
+    )
+
+    assert app.answer_direct("hello") == "plain answer"
+    assert router.calls == []
+    assert len(llm.calls) == 1
+    assert research.calls == []
+    assert coordinator.calls == []
+
+
+def test_analyze_exposes_research_agent_branch_only() -> None:
+    app, router, llm, research, coordinator = _build(
+        Intent.DIRECT, research_reply="analysis"
+    )
+
+    assert app.analyze("inspect notes") == "analysis"
+    assert router.calls == []
+    assert llm.calls == []
+    assert research.calls == ["inspect notes"]
+    assert coordinator.calls == []
+
+
+# ---------------------------------------------------------------------------
 # 1. DIRECT path — plain chat, no tools, no ResearchAgent
 # ---------------------------------------------------------------------------
 

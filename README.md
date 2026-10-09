@@ -78,7 +78,56 @@ explicit compatibility boundary for examples and direct component use. Official
 entrypoints resolve settings through `AppConfig` and pass them explicitly.
 `TextChunker` still uses the legacy `CHUNK_SIZE` and `CHUNK_OVERLAP` defaults;
 the indexing write pipeline is outside this phase. Chapter 18 changes startup
-assembly and ownership; the existing HTTP API and frontend behavior are unchanged.
+assembly and ownership while preserving the existing Research Runtime protocol.
+
+### Unified query API
+
+The existing FastAPI application also accepts every intent through one endpoint:
+
+```http
+POST /v1/query
+Content-Type: application/json
+
+{"query":"研究近期 Agent Memory 方案"}
+```
+
+The Intent Router is always consulted first. A `direct` or `analyze` request
+finishes synchronously with HTTP 200:
+
+```json
+{
+  "request_id": "7f6f...",
+  "intent": "analyze",
+  "status": "completed",
+  "answer": "...",
+  "run_id": null
+}
+```
+
+A `research` request is submitted to the existing Research Runtime and returns
+HTTP 202 without waiting for the workflow:
+
+```json
+{
+  "request_id": "7f6f...",
+  "intent": "research",
+  "status": "queued",
+  "answer": null,
+  "run_id": "55a1..."
+}
+```
+
+Use the unchanged `/v1/research/runs/{run_id}` endpoint to inspect the run,
+`/v1/research/runs/{run_id}/events` for SSE progress, and
+`/v1/research/runs/{run_id}/resume` to resume an eligible run. `request_id`
+correlates one HTTP request, `run_id` identifies the Runtime run, and
+`thread_id` remains the distinct checkpoint identifier returned by the Runtime
+API.
+
+There is not yet a material-import HTTP endpoint. The local Retriever currently
+queries the global knowledge base and does not support a proven
+`material_id`-scoped filter, so `/v1/query` does not advertise material-level
+isolation.
 
 ## Run the CLI
 

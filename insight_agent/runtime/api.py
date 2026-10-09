@@ -7,10 +7,19 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, FastAPI, Header, Request, status
+from fastapi import APIRouter, FastAPI, Header, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from insight_agent.runtime.errors import InvalidRunState, RunNotFound
+from insight_agent.application.query import (
+    QueryExecutionError,
+    QueryRequest,
+    QueryResponse,
+    QueryRoutingError,
+    QueryRuntimeError,
+    QueryService,
+)
+from insight_agent.router import Intent
+from insight_agent.runtime.errors import InvalidRunState, RunNotFound, RuntimeUnavailable
 from insight_agent.runtime.models import (
     CreateResearchRunRequest,
     RunRecord,
@@ -28,12 +37,16 @@ TERMINAL_EVENT_TYPES = frozenset(
 def create_api(
     service: ResearchRuntimeService | None = None,
     *,
+    query_service: QueryService | None = None,
     lifespan: Any = None,
 ) -> FastAPI:
     """Build a thin HTTP application around one shared runtime service."""
     app = FastAPI(title="InsightAgent Research Runtime", lifespan=lifespan)
     if service is not None:
         app.state.runtime_service = service
+    if query_service is not None:
+        app.state.query_service = query_service
+    app.include_router(_query_router())
     app.include_router(_router())
 
     @app.middleware("http")
@@ -56,7 +69,58 @@ def create_api(
     ) -> JSONResponse:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
+    @app.exception_handler(QueryRoutingError)
+    async def query_routing_error_handler(
+        _request: Request,
+        _exc: QueryRoutingError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"detail": "unable to route query"},
+        )
+
+    @app.exception_handler(QueryExecutionError)
+    async def query_execution_error_handler(
+        _request: Request,
+        _exc: QueryExecutionError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"detail": "unable to execute query"},
+        )
+
+    @app.exception_handler(QueryRuntimeError)
+    @app.exception_handler(RuntimeUnavailable)
+    async def query_runtime_error_handler(
+        _request: Request,
+        _exc: QueryRuntimeError | RuntimeUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "research runtime unavailable"},
+        )
+
     return app
+
+
+def _query_router() -> APIRouter:
+    router = APIRouter(tags=["application"])
+
+    @router.post("/v1/query", response_model=QueryResponse)
+    async def query(
+        payload: QueryRequest,
+        request: Request,
+        response: Response,
+    ) -> QueryResponse:
+        result = await _query_service(request).query(
+            payload.query,
+            request_id=request.state.request_id,
+        )
+        if result.intent is Intent.RESEARCH:
+            response.status_code = status.HTTP_202_ACCEPTED
+        return result
+
+    return router
 
 
 def _router() -> APIRouter:
@@ -106,6 +170,13 @@ def _router() -> APIRouter:
 
 def _service(request: Request) -> ResearchRuntimeService:
     return request.app.state.runtime_service
+
+
+def _query_service(request: Request) -> QueryService:
+    service = getattr(request.app.state, "query_service", None)
+    if service is None:
+        raise RuntimeUnavailable("query service unavailable")
+    return service
 
 
 async def _event_stream(

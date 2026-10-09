@@ -71,15 +71,27 @@ class InsightAgent:
 
     def run(self, query: str) -> str:
         """Classify *query* then dispatch to the matching execution path."""
-        intent = self.router.route(query)
+        intent = self.route(query)
 
         if intent is Intent.DIRECT:
-            return self._answer_direct(query)
+            return self.answer_direct(query)
 
         if intent is Intent.ANALYZE:
-            return self.research_agent.run(query)
+            return self.analyze(query)
 
         return self.research_coordinator.run(query)
+
+    def route(self, query: str) -> Intent:
+        """Classify one query without dispatching it."""
+        return self.router.route(query)
+
+    def answer_direct(self, query: str) -> str:
+        """Answer one query without tools or an agent loop."""
+        return self._answer_direct(query)
+
+    def analyze(self, query: str) -> str:
+        """Analyze one query with the existing local-tool agent."""
+        return self.research_agent.run(query)
 
     def add_close_callback(self, callback: Callable[[], None]) -> None:
         """Take ownership of one resource cleanup callback."""

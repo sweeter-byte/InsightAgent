@@ -7,9 +7,9 @@ import runpy
 import pytest
 from starlette.requests import Request
 
-from insight_agent.application import AppConfig
+from insight_agent.application import AppConfig, QueryService
 import insight_agent.runtime.app as runtime_app
-from insight_agent.runtime.api import _service
+from insight_agent.runtime.api import _query_service, _service
 from insight_agent.runtime.app import create_runtime_app
 from insight_agent.runtime.policies import RuntimeConfig, RuntimePolicy
 from insight_agent.runtime.service import ResearchRuntimeService
@@ -296,6 +296,7 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
     assert resources.redis.ping_calls == 0
     assert resources.redis.scan_calls == 0
     assert not hasattr(app.state, "runtime_service")
+    assert not hasattr(app.state, "query_service")
     async with app.router.lifespan_context(app):
         assert resources.calls == [
             ("config", None),
@@ -306,7 +307,11 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
         assert app.state.redis is resources.redis
         assert app.state.research_app is resources.research_app
         service = app.state.runtime_service
+        query_service = app.state.query_service
         assert isinstance(service, ResearchRuntimeService)
+        assert isinstance(query_service, QueryService)
+        assert query_service.application is resources.research_app
+        assert query_service.runtime is service
         assert service.policy is resources.config.runtime.policy
         assert service.registry._redis is resources.redis
         assert service.events._redis is resources.redis
@@ -318,6 +323,7 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
         request = Request({"type": "http", "app": app})
         assert _service(request) is service
         assert _service(request) is service
+        assert _query_service(request) is query_service
         assert len(resources.calls) == 3
 
     assert resources.close_order == ["service", "redis", "application"]
@@ -507,6 +513,7 @@ async def test_service_close_failure_still_closes_redis_and_application(
 async def test_each_lifespan_builds_one_distinct_shared_resource_set() -> None:
     lifetimes: list[StartupResources] = []
     services: list[ResearchRuntimeService] = []
+    query_services: list[QueryService] = []
 
     def resolve_config() -> AppConfig:
         resources = StartupResources()
@@ -523,8 +530,11 @@ async def test_each_lifespan_builds_one_distinct_shared_resource_set() -> None:
         async with app.router.lifespan_context(app):
             resources = lifetimes[-1]
             services.append(app.state.runtime_service)
+            query_services.append(app.state.query_service)
             assert app.state.research_app is resources.research_app
             assert app.state.redis is resources.redis
+            assert query_services[-1].application is resources.research_app
+            assert query_services[-1].runtime is services[-1]
             request = Request({"type": "http", "app": app})
             assert _service(request) is services[-1]
             assert _service(request) is services[-1]
@@ -535,5 +545,6 @@ async def test_each_lifespan_builds_one_distinct_shared_resource_set() -> None:
 
     assert len(lifetimes) == 2
     assert services[0] is not services[1]
+    assert query_services[0] is not query_services[1]
     assert lifetimes[0].research_app is not lifetimes[1].research_app
     assert lifetimes[0].redis is not lifetimes[1].redis

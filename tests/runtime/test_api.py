@@ -2,8 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from fastapi.testclient import TestClient
+import pytest
 
+from insight_agent.application import (
+    QueryExecutionError,
+    QueryResponse,
+    QueryRoutingError,
+    QueryRuntimeError,
+    QueryStatus,
+)
+from insight_agent.router import Intent
 from insight_agent.runtime.api import _event_stream, create_api
+from insight_agent.runtime.errors import RuntimeUnavailable
 from insight_agent.runtime.events import InMemoryRuntimeEventStore
 from insight_agent.runtime.models import RunRecord, RunStatus, RuntimeEvent
 from insight_agent.runtime.policies import RuntimePolicy
@@ -23,6 +33,37 @@ class InstantRunner:
         del query, resume
         await on_progress("retrieval", {"task_id": "T1"})
         return f"output:{thread_id}"
+
+
+class FakeQueryService:
+    def __init__(self, intent: Intent) -> None:
+        self.intent = intent
+        self.calls: list[tuple[str, str]] = []
+
+    async def query(self, query: str, *, request_id: str) -> QueryResponse:
+        self.calls.append((query, request_id))
+        if self.intent is Intent.RESEARCH:
+            return QueryResponse(
+                request_id=request_id,
+                intent=self.intent,
+                status=QueryStatus.QUEUED,
+                run_id="run-from-query",
+            )
+        return QueryResponse(
+            request_id=request_id,
+            intent=self.intent,
+            status=QueryStatus.COMPLETED,
+            answer=f"{self.intent.value} answer",
+        )
+
+
+class FailingQueryService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def query(self, query: str, *, request_id: str) -> QueryResponse:
+        del query, request_id
+        raise self.error
 
 
 def _runtime() -> tuple[
@@ -51,6 +92,98 @@ def test_create_returns_202_without_exposing_research_state() -> None:
     assert response.json()["thread_id"] == "thread-1"
     assert response.json()["status"] == "queued"
     assert "plan" not in response.json()
+    assert response.headers["x-request-id"]
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected_status", "expected_answer", "expected_run_id"),
+    [
+        (Intent.DIRECT, 200, "direct answer", None),
+        (Intent.ANALYZE, 200, "analyze answer", None),
+        (Intent.RESEARCH, 202, None, "run-from-query"),
+    ],
+)
+def test_unified_query_has_stable_response_contract(
+    intent: Intent,
+    expected_status: int,
+    expected_answer: str | None,
+    expected_run_id: str | None,
+) -> None:
+    runtime, _, _ = _runtime()
+    query_service = FakeQueryService(intent)
+    with TestClient(create_api(runtime, query_service=query_service)) as client:
+        response = client.post("/v1/query", json={"query": "  hello  "})
+
+    request_id = response.headers["x-request-id"]
+    assert response.status_code == expected_status
+    assert response.json() == {
+        "request_id": request_id,
+        "intent": intent.value,
+        "status": "queued" if intent is Intent.RESEARCH else "completed",
+        "answer": expected_answer,
+        "run_id": expected_run_id,
+    }
+    assert query_service.calls == [("hello", request_id)]
+
+
+def test_unified_query_rejects_blank_input_before_dispatch() -> None:
+    runtime, _, _ = _runtime()
+    query_service = FakeQueryService(Intent.DIRECT)
+    with TestClient(create_api(runtime, query_service=query_service)) as client:
+        response = client.post("/v1/query", json={"query": "  "})
+
+    assert response.status_code == 422
+    assert query_service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_detail"),
+    [
+        (QueryRoutingError("secret-key-value"), 502, "unable to route query"),
+        (
+            QueryExecutionError("secret-key-value"),
+            502,
+            "unable to execute query",
+        ),
+        (
+            QueryRuntimeError("secret-key-value"),
+            503,
+            "research runtime unavailable",
+        ),
+        (
+            RuntimeUnavailable("secret-key-value"),
+            503,
+            "research runtime unavailable",
+        ),
+    ],
+)
+def test_unified_query_errors_are_sanitized(
+    error: Exception,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    runtime, _, _ = _runtime()
+    app = create_api(
+        runtime,
+        query_service=FailingQueryService(error),  # type: ignore[arg-type]
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/query", json={"query": "hello"})
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+    assert response.headers["x-request-id"]
+    assert "secret-key-value" not in response.text
+    assert "Traceback" not in response.text
+
+
+def test_unified_query_without_composed_service_returns_503() -> None:
+    runtime, _, _ = _runtime()
+    with TestClient(create_api(runtime)) as client:
+        response = client.post("/v1/query", json={"query": "hello"})
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "research runtime unavailable"}
     assert response.headers["x-request-id"]
 
 

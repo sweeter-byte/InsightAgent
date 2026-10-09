@@ -9,7 +9,7 @@ from typing import Any, Protocol
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from insight_agent.application import AppConfig, build_application
+from insight_agent.application import AppConfig, QueryService, build_application
 from insight_agent.runtime.api import create_api
 from insight_agent.runtime.events import RedisRuntimeEventStore
 from insight_agent.runtime.policies import RuntimeConfig
@@ -63,9 +63,11 @@ def create_runtime_app(
                 ),
                 policy=resolved_runtime.policy,
             )
+            query_service = QueryService(research_app, service)  # type: ignore[arg-type]
             application.state.redis = redis_client
             application.state.research_app = research_app
             application.state.runtime_service = service
+            application.state.query_service = query_service
             await service.reconcile_interrupted_runs()
             yield
         finally:
