@@ -80,6 +80,10 @@ class InsightAgent:
 
         return self.research_coordinator.run(query)
 
+    def add_close_callback(self, callback: Callable[[], None]) -> None:
+        """Take ownership of one resource cleanup callback."""
+        self._close_callbacks.append(callback)
+
     def close(self) -> None:
         """Release runtime-owned resources; repeated calls are harmless."""
         callbacks, self._close_callbacks = self._close_callbacks, []

@@ -11,7 +11,7 @@ from insight_agent.retrieval.hybrid import HybridRetriever
 from insight_agent.retrieval.models import RetrievalResult
 
 if TYPE_CHECKING:
-    from insight_agent.indexing import QdrantVectorStore
+    from insight_agent.indexing import QdrantConfig, QdrantVectorStore
 
 
 SEARCH_KNOWLEDGE_BASE_SCHEMA: dict[str, Any] = {
@@ -116,6 +116,9 @@ def build_default_knowledge_search_tool(
 def build_default_hybrid_retriever(
     config: HybridRetrievalConfig,
     vector_store: QdrantVectorStore | None = None,
+    *,
+    qdrant_config: QdrantConfig | None = None,
+    embedding_model: str | None = None,
 ) -> HybridRetriever:
     """Compose the project Hybrid Retriever, optionally over a shared store."""
     from insight_agent.indexing import QdrantVectorStore, SentenceTransformerEmbedder
@@ -124,11 +127,11 @@ def build_default_hybrid_retriever(
     from insight_agent.retrieval.sparse import BM25Retriever
 
     owns_store = vector_store is None
-    store = QdrantVectorStore() if owns_store else vector_store
+    store = QdrantVectorStore(config=qdrant_config) if owns_store else vector_store
     assert store is not None
     try:
         dense_retriever = VectorRetriever(
-            embedder=SentenceTransformerEmbedder(),
+            embedder=SentenceTransformerEmbedder(embedding_model),
             vector_store=store,
         )
         sparse_retriever = BM25Retriever(store.load_chunks)

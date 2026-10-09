@@ -92,6 +92,45 @@ def _hybrid_config() -> HybridRetrievalConfig:
     )
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_default_hybrid_accepts_explicit_qdrant_and_embedding_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    explicit: bool,
+) -> None:
+    from insight_agent.indexing import QdrantConfig
+
+    calls: list[tuple[str, Any]] = []
+    store = SimpleNamespace(load_chunks=lambda: [], close=lambda: None)
+
+    def create_store(*, config=None):
+        calls.append(("qdrant", config))
+        return store
+
+    def create_embedder(model_name=None):
+        calls.append(("embedding", model_name))
+        return object()
+
+    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", create_store)
+    monkeypatch.setattr("insight_agent.indexing.SentenceTransformerEmbedder", create_embedder)
+    monkeypatch.setattr("insight_agent.retrieval.sparse.BM25Retriever", lambda loader: object())
+    monkeypatch.setattr("insight_agent.retrieval.reranker.CrossEncoderReranker", lambda model: object())
+    qdrant_config = QdrantConfig(path="custom/qdrant", collection_name="custom")
+
+    hybrid = (
+        build_default_hybrid_retriever(
+            _hybrid_config(), qdrant_config=qdrant_config, embedding_model="custom/embedder"
+        )
+        if explicit
+        else build_default_hybrid_retriever(_hybrid_config())
+    )
+
+    assert calls == [
+        ("qdrant", qdrant_config if explicit else None),
+        ("embedding", "custom/embedder" if explicit else None),
+    ]
+    hybrid.close()
+
+
 def test_knowledge_tool_closes_constructed_retriever() -> None:
     retriever = CloseableRetriever()
     tool = KnowledgeSearchTool(retriever)
@@ -115,9 +154,9 @@ def test_default_hybrid_closes_its_owned_store_once(
             self.close_calls += 1
 
     store = FakeStore()
-    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda: store)
+    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda *, config=None: store)
     monkeypatch.setattr(
-        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda model_name=None: object()
     )
     monkeypatch.setattr(
         "insight_agent.retrieval.sparse.BM25Retriever",
@@ -149,9 +188,9 @@ def test_default_hybrid_closes_owned_store_when_construction_fails(
             self.close_calls += 1
 
     store = FakeStore()
-    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda: store)
+    monkeypatch.setattr("insight_agent.indexing.QdrantVectorStore", lambda *, config=None: store)
     monkeypatch.setattr(
-        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda model_name=None: object()
     )
     monkeypatch.setattr(
         "insight_agent.retrieval.sparse.BM25Retriever",
@@ -183,7 +222,7 @@ def test_default_hybrid_does_not_close_injected_store(
 
     store = FakeStore()
     monkeypatch.setattr(
-        "insight_agent.indexing.SentenceTransformerEmbedder", lambda: object()
+        "insight_agent.indexing.SentenceTransformerEmbedder", lambda model_name=None: object()
     )
     monkeypatch.setattr(
         "insight_agent.retrieval.sparse.BM25Retriever",
@@ -541,6 +580,9 @@ def test_default_knowledge_tool_factory_builds_hybrid_without_loading_model(
     import insight_agent.indexing as indexing
 
     class FakeStore:
+        def __init__(self, *, config=None) -> None:
+            pass
+
         def load_chunks(self):  # noqa: ANN201
             return []
 
@@ -551,6 +593,9 @@ def test_default_knowledge_tool_factory_builds_hybrid_without_loading_model(
             pass
 
     class FakeEmbedder:
+        def __init__(self, model_name=None) -> None:
+            pass
+
         def embed_documents(self, texts):  # noqa: ANN001, ANN201, ARG002
             return [[1.0]]
 
