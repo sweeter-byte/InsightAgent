@@ -1,7 +1,11 @@
 """Public API for InsightAgent's document indexing layer."""
 
 from insight_agent.indexing.chunker import TextChunker
-from insight_agent.indexing.embedder import Embedder, SentenceTransformerEmbedder
+from insight_agent.indexing.embedder import (
+    DEFAULT_EMBEDDING_MODEL,
+    Embedder,
+    SentenceTransformerEmbedder,
+)
 from insight_agent.indexing.models import Chunk, make_chunk_id, make_document_id
 from insight_agent.indexing.pipeline import index_documents
 from insight_agent.indexing.vector_store import (
@@ -12,6 +16,7 @@ from insight_agent.indexing.vector_store import (
 
 __all__ = [
     "Chunk",
+    "DEFAULT_EMBEDDING_MODEL",
     "Embedder",
     "QdrantConfig",
     "QdrantVectorStore",
