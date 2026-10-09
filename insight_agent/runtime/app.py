@@ -1,24 +1,21 @@
-"""Production composition root for ``uvicorn insight_agent.runtime.app:app``."""
+"""HTTP lifespan adapter for the shared application composition root."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-import os
 from typing import Any, Protocol
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
+from insight_agent.application import AppConfig, build_application
 from insight_agent.runtime.api import create_api
 from insight_agent.runtime.events import RedisRuntimeEventStore
-from insight_agent.runtime.policies import RuntimePolicy
+from insight_agent.runtime.policies import RuntimeConfig
 from insight_agent.runtime.registry import RedisRunRegistry
 from insight_agent.runtime.runner import LangGraphResearchRunner
 from insight_agent.runtime.service import ResearchRuntimeService
-
-
-DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
 
 class ComposedResearchApp(Protocol):
@@ -27,34 +24,26 @@ class ComposedResearchApp(Protocol):
     def close(self) -> None: ...
 
 
-def _build_research_app() -> ComposedResearchApp:
-    from insight_agent.__main__ import _build_app
-
-    return _build_app()
-
-
 def _redis_from_url(url: str) -> Redis:
     return Redis.from_url(url)
 
 
 def create_runtime_app(
     *,
-    research_app_factory: Callable[[], ComposedResearchApp] = _build_research_app,
+    config: AppConfig | None = None,
+    config_factory: Callable[[], AppConfig] = AppConfig.from_env,
+    application_factory: Callable[[AppConfig], ComposedResearchApp] = build_application,
     redis_client_factory: Callable[[str], Any] = _redis_from_url,
-    redis_url: str | None = None,
-    policy: RuntimePolicy | None = None,
+    runtime_config: RuntimeConfig | None = None,
 ) -> FastAPI:
     """Create the HTTP app without acquiring resources until lifespan startup."""
-    runtime_policy = policy or RuntimePolicy.from_env()
-    configured_redis_url = redis_url or os.getenv(
-        "RUNTIME_REDIS_URL", DEFAULT_REDIS_URL
-    )
-
     @asynccontextmanager
     async def lifespan(application: FastAPI):
-        research_app = research_app_factory()
+        resolved_config = config or config_factory()
+        resolved_runtime = runtime_config or resolved_config.runtime
+        research_app = application_factory(resolved_config)
         try:
-            redis_client = redis_client_factory(configured_redis_url)
+            redis_client = redis_client_factory(resolved_runtime.redis_url)
         except BaseException:
             research_app.close()
             raise
@@ -64,7 +53,7 @@ def create_runtime_app(
             registry = RedisRunRegistry(redis_client)
             events = RedisRuntimeEventStore(
                 redis_client,
-                event_ttl_seconds=runtime_policy.event_ttl_seconds,
+                event_ttl_seconds=resolved_runtime.policy.event_ttl_seconds,
             )
             service = ResearchRuntimeService(
                 registry=registry,
@@ -72,7 +61,7 @@ def create_runtime_app(
                 runner=LangGraphResearchRunner(
                     research_app.research_coordinator
                 ),
-                policy=runtime_policy,
+                policy=resolved_runtime.policy,
             )
             application.state.redis = redis_client
             application.state.research_app = research_app
