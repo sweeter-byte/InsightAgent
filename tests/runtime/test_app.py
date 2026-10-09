@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from insight_agent.runtime.app import create_runtime_app
-from insight_agent.runtime.policies import RuntimePolicy
+from insight_agent.runtime.policies import RuntimeConfig, RuntimePolicy
 
 
 class FakeRedis:
@@ -49,6 +49,55 @@ def test_runtime_policy_reads_environment(monkeypatch: pytest.MonkeyPatch) -> No
     assert policy.max_concurrency == 4
     assert policy.run_timeout_seconds == 12.5
     assert policy.event_ttl_seconds == 123
+
+
+def test_runtime_policy_reads_only_explicit_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_MAX_CONCURRENCY", "99")
+    monkeypatch.setenv("RUNTIME_EVENT_TTL_SECONDS", "999")
+
+    policy = RuntimePolicy.from_env(
+        {
+            "RUNTIME_MAX_CONCURRENCY": "4",
+            "RUNTIME_RUN_TIMEOUT_SECONDS": "12.5",
+            "RUNTIME_INFRA_RETRY_ATTEMPTS": "5",
+            "RUNTIME_INFRA_RETRY_BACKOFF_SECONDS": "0.75",
+            "RUNTIME_EVENT_TTL_SECONDS": "123",
+        }
+    )
+
+    assert policy == RuntimePolicy(
+        max_concurrency=4,
+        run_timeout_seconds=12.5,
+        infra_retry_attempts=5,
+        infra_retry_backoff_seconds=0.75,
+        event_ttl_seconds=123,
+    )
+
+
+def test_runtime_config_reads_explicit_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUNTIME_REDIS_URL", "redis://ignored.example/0")
+    monkeypatch.setenv("RUNTIME_MAX_CONCURRENCY", "99")
+
+    config = RuntimeConfig.from_env(
+        {
+            "RUNTIME_REDIS_URL": " redis://runtime.example/8 ",
+            "RUNTIME_MAX_CONCURRENCY": "4",
+            "RUNTIME_RUN_TIMEOUT_SECONDS": "12.5",
+        }
+    )
+
+    assert config.redis_url == "redis://runtime.example/8"
+    assert config.policy.max_concurrency == 4
+    assert config.policy.run_timeout_seconds == 12.5
+
+
+def test_runtime_config_rejects_empty_direct_redis_url() -> None:
+    with pytest.raises(ValueError, match="redis_url"):
+        RuntimeConfig(redis_url="   ")
 
 
 def test_lifespan_builds_shared_resources_and_closes_them() -> None:

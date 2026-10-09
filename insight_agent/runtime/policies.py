@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import os
+
+
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,22 +31,62 @@ class RuntimePolicy:
             raise ValueError("event_ttl_seconds must be at least 1")
 
     @classmethod
-    def from_env(cls) -> RuntimePolicy:
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> RuntimePolicy:
+        values = os.environ if environ is None else environ
         return cls(
-            max_concurrency=_env_int("RUNTIME_MAX_CONCURRENCY", 2),
+            max_concurrency=_env_int(values, "RUNTIME_MAX_CONCURRENCY", 2),
             run_timeout_seconds=_env_float(
-                "RUNTIME_RUN_TIMEOUT_SECONDS", 900.0
+                values,
+                "RUNTIME_RUN_TIMEOUT_SECONDS",
+                900.0,
             ),
-            infra_retry_attempts=_env_int("RUNTIME_INFRA_RETRY_ATTEMPTS", 3),
+            infra_retry_attempts=_env_int(
+                values,
+                "RUNTIME_INFRA_RETRY_ATTEMPTS",
+                3,
+            ),
             infra_retry_backoff_seconds=_env_float(
-                "RUNTIME_INFRA_RETRY_BACKOFF_SECONDS", 0.2
+                values,
+                "RUNTIME_INFRA_RETRY_BACKOFF_SECONDS",
+                0.2,
             ),
-            event_ttl_seconds=_env_int("RUNTIME_EVENT_TTL_SECONDS", 86_400),
+            event_ttl_seconds=_env_int(
+                values,
+                "RUNTIME_EVENT_TTL_SECONDS",
+                86_400,
+            ),
         )
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
+@dataclass(frozen=True, slots=True)
+class RuntimeConfig:
+    """Redis connection and execution policy for one runtime instance."""
+
+    redis_url: str = DEFAULT_REDIS_URL
+    policy: RuntimePolicy = RuntimePolicy()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.redis_url, str) or not self.redis_url.strip():
+            raise ValueError("redis_url must not be empty")
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> RuntimeConfig:
+        values = os.environ if environ is None else environ
+        redis_url = values.get("RUNTIME_REDIS_URL", DEFAULT_REDIS_URL).strip()
+        return cls(
+            redis_url=redis_url or DEFAULT_REDIS_URL,
+            policy=RuntimePolicy.from_env(values),
+        )
+
+
+def _env_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name)
     if raw is None:
         return default
     try:
@@ -51,8 +95,8 @@ def _env_int(name: str, default: int) -> int:
         raise ValueError(f"{name} must be an integer") from exc
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
+def _env_float(environ: Mapping[str, str], name: str, default: float) -> float:
+    raw = environ.get(name)
     if raw is None:
         return default
     try:

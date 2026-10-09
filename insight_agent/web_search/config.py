@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from insight_agent.web_search.errors import WebSearchConfigurationError
 
@@ -19,7 +19,7 @@ DEFAULT_WEB_FETCH_LIMIT = 3
 class WebSearchConfig:
     """Validated Tavily and page-fetch settings for one application runtime."""
 
-    api_key: str
+    api_key: str = field(repr=False)
     timeout: float = DEFAULT_WEB_SEARCH_TIMEOUT
     search_limit: int = DEFAULT_WEB_SEARCH_LIMIT
     fetch_limit: int = DEFAULT_WEB_FETCH_LIMIT

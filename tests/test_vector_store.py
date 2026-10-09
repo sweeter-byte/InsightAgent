@@ -8,7 +8,7 @@ import pytest
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 from insight_agent.ingestion import Document, SourceType
-from insight_agent.indexing import QdrantVectorStore, TextChunker
+from insight_agent.indexing import QdrantConfig, QdrantVectorStore, TextChunker
 
 
 def _chunk():
@@ -26,6 +26,77 @@ def _store(tmp_path: Path) -> QdrantVectorStore:
         path=tmp_path / "qdrant",
         collection_name="test_documents",
     )
+
+
+def test_qdrant_config_reads_explicit_mapping() -> None:
+    config = QdrantConfig.from_env(
+        {
+            "QDRANT_PATH": " /tmp/configured-qdrant ",
+            "QDRANT_COLLECTION": " configured_collection ",
+        }
+    )
+
+    assert config.path == Path("/tmp/configured-qdrant")
+    assert config.collection_name == "configured_collection"
+
+
+def test_qdrant_config_mapping_uses_current_defaults() -> None:
+    assert QdrantConfig.from_env({}) == QdrantConfig()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"path": Path("   ")}, "QDRANT_PATH"),
+        ({"collection_name": "   "}, "QDRANT_COLLECTION"),
+    ],
+)
+def test_qdrant_config_rejects_empty_direct_values(
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        QdrantConfig(**kwargs)
+
+
+def test_qdrant_store_uses_explicit_config_without_opening_real_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths: list[str] = []
+
+    class FakeQdrantClient:
+        def __init__(self, *, path: str) -> None:
+            paths.append(path)
+
+    monkeypatch.setattr(
+        "insight_agent.indexing.vector_store.QdrantClient",
+        FakeQdrantClient,
+    )
+    config = QdrantConfig(Path("/tmp/configured-qdrant"), "configured")
+
+    store = QdrantVectorStore(config=config)
+
+    assert store.path == Path("/tmp/configured-qdrant")
+    assert store.collection_name == "configured"
+    assert paths == ["/tmp/configured-qdrant"]
+
+
+@pytest.mark.parametrize(
+    "legacy_kwargs",
+    [
+        {"path": "/tmp/legacy-qdrant"},
+        {"collection_name": "legacy_collection"},
+        {"path": "/tmp/legacy-qdrant", "collection_name": "legacy_collection"},
+    ],
+)
+def test_qdrant_store_rejects_config_with_legacy_arguments(
+    legacy_kwargs: dict[str, str],
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="config cannot be combined with path or collection_name",
+    ):
+        QdrantVectorStore(config=QdrantConfig(), **legacy_kwargs)
 
 
 def test_ensure_collection_creates_cosine_collection(tmp_path: Path) -> None:

@@ -70,6 +70,14 @@ def test_web_search_config_uses_defaults() -> None:
     )
 
 
+def test_web_search_config_repr_does_not_expose_api_key() -> None:
+    secret = "tavily-secret-that-must-not-leak"
+    config = WebSearchConfig.from_env({"TAVILY_API_KEY": secret})
+
+    assert config is not None
+    assert secret not in repr(config)
+
+
 def test_web_search_config_parses_explicit_values() -> None:
     config = WebSearchConfig.from_env(
         {

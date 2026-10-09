@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -25,6 +26,41 @@ from insight_agent.ingestion.models import normalize_source_types
 
 DEFAULT_QDRANT_PATH = ".data/qdrant"
 DEFAULT_QDRANT_COLLECTION = "insight_documents"
+
+
+@dataclass(frozen=True, slots=True)
+class QdrantConfig:
+    """Validated local Qdrant location and collection name."""
+
+    path: Path = Path(DEFAULT_QDRANT_PATH)
+    collection_name: str = DEFAULT_QDRANT_COLLECTION
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, (str, Path)) or not str(self.path).strip():
+            raise ValueError("QDRANT_PATH must not be empty")
+        if (
+            not isinstance(self.collection_name, str)
+            or not self.collection_name.strip()
+        ):
+            raise ValueError("QDRANT_COLLECTION must not be empty")
+        object.__setattr__(self, "path", Path(self.path))
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> QdrantConfig:
+        """Resolve the existing Qdrant variables from a mapping."""
+        values = os.environ if environ is None else environ
+        path = values.get("QDRANT_PATH", DEFAULT_QDRANT_PATH).strip()
+        collection = values.get(
+            "QDRANT_COLLECTION",
+            DEFAULT_QDRANT_COLLECTION,
+        ).strip()
+        return cls(
+            path=Path(path or DEFAULT_QDRANT_PATH),
+            collection_name=collection or DEFAULT_QDRANT_COLLECTION,
+        )
 
 
 class VectorStore(Protocol):
@@ -56,15 +92,18 @@ class QdrantVectorStore:
         self,
         path: str | Path | None = None,
         collection_name: str | None = None,
+        *,
+        config: QdrantConfig | None = None,
     ) -> None:
-        configured_path = os.getenv("QDRANT_PATH", DEFAULT_QDRANT_PATH).strip()
-        configured_collection = os.getenv(
-            "QDRANT_COLLECTION", DEFAULT_QDRANT_COLLECTION
-        ).strip()
-        self.path = Path(path or configured_path or DEFAULT_QDRANT_PATH)
-        self.collection_name = (
-            collection_name or configured_collection or DEFAULT_QDRANT_COLLECTION
-        )
+        if config is not None and (
+            path is not None or collection_name is not None
+        ):
+            raise ValueError(
+                "config cannot be combined with path or collection_name"
+            )
+        resolved = config if config is not None else QdrantConfig.from_env()
+        self.path = Path(path) if path else resolved.path
+        self.collection_name = collection_name or resolved.collection_name
         self.client = QdrantClient(path=str(self.path))
 
     def ensure_collection(self, vector_size: int) -> None:

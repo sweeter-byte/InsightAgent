@@ -27,7 +27,7 @@ from __future__ import annotations
 import base64
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +75,7 @@ VISION_SYSTEM_PROMPT = (
 class VisionModelConfig:
     """The existing ``VISION_*`` settings as one reusable value object."""
 
-    api_key: str
+    api_key: str = field(repr=False)
     base_url: str
     model: str
 

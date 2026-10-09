@@ -52,6 +52,20 @@ def test_optional_vision_config_is_absent_only_when_all_values_are_missing() -> 
     assert VisionModelConfig.from_env({}, required=False) is None
 
 
+def test_vision_config_repr_does_not_expose_api_key() -> None:
+    secret = "vision-secret-that-must-not-leak"
+    config = VisionModelConfig.from_env(
+        {
+            "VISION_API_KEY": secret,
+            "VISION_BASE_URL": "https://vision.example.invalid/v1",
+            "VISION_MODEL": "vision-model",
+        }
+    )
+
+    assert config is not None
+    assert secret not in repr(config)
+
+
 def test_optional_vision_config_rejects_partial_configuration() -> None:
     with pytest.raises(RuntimeError, match="VISION_BASE_URL.*VISION_MODEL"):
         VisionModelConfig.from_env(
