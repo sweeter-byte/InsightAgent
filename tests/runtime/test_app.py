@@ -7,7 +7,12 @@ import runpy
 import pytest
 from starlette.requests import Request
 
-from insight_agent.application import AppConfig, QueryService
+from insight_agent.application import (
+    AppConfig,
+    MaterialStorage,
+    QueryService,
+    ReadinessService,
+)
 import insight_agent.runtime.app as runtime_app
 from insight_agent.runtime.api import _query_service, _service
 from insight_agent.runtime.app import create_runtime_app
@@ -46,11 +51,19 @@ class FakeRedis:
             raise RuntimeError("redis close failed")
 
 
+class ReadyProbe:
+    def check_ready(self) -> None:
+        return None
+
+
 class FakeResearchApp:
     def __init__(self, close_order: list[str]) -> None:
         self.research_coordinator = object()
         self.close_calls = 0
         self.close_order = close_order
+        self.knowledge_service = object()
+        self.vector_store = ReadyProbe()
+        self.checkpoint_store = ReadyProbe()
 
     def close(self) -> None:
         self.close_calls += 1
@@ -310,6 +323,9 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
         query_service = app.state.query_service
         assert isinstance(service, ResearchRuntimeService)
         assert isinstance(query_service, QueryService)
+        assert isinstance(app.state.material_storage, MaterialStorage)
+        assert app.state.knowledge_service is resources.research_app.knowledge_service
+        assert isinstance(app.state.readiness_service, ReadinessService)
         assert query_service.application is resources.research_app
         assert query_service.runtime is service
         assert service.policy is resources.config.runtime.policy
@@ -328,6 +344,25 @@ async def test_lifespan_builds_shared_resources_and_closes_them(
 
     assert resources.close_order == ["service", "redis", "application"]
     assert resources.redis.scan_calls == 1
+    assert resources.redis.close_calls == 1
+    assert resources.research_app.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_readiness_factory_failure_closes_redis_and_application() -> None:
+    resources = StartupResources()
+
+    def fail_readiness(**kwargs):
+        del kwargs
+        raise RuntimeError("readiness construction failed")
+
+    app = resources.create_app(readiness_service_factory=fail_readiness)
+
+    with pytest.raises(RuntimeError, match="readiness construction failed"):
+        async with app.router.lifespan_context(app):
+            pytest.fail("startup must fail")
+
+    assert resources.close_order == ["redis", "application"]
     assert resources.redis.close_calls == 1
     assert resources.research_app.close_calls == 1
 

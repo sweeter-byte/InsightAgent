@@ -394,6 +394,21 @@ def test_ingest_explicit_image(tmp_path: Path) -> None:
     assert docs[0].content == "a bar chart"
 
 
+def test_ingest_file_image_can_borrow_vision_client(tmp_path: Path) -> None:
+    png = _make_png(tmp_path)
+
+    class Client:
+        def analyze_image(self, path: str, *, system_prompt: str, user_prompt: str) -> str:
+            assert path == str(png)
+            assert system_prompt
+            assert user_prompt
+            return "shared client description"
+
+    docs = ingest_file(str(png), vision_client=Client())
+
+    assert docs[0].content == "shared client description"
+
+
 def test_ingest_unknown_source_type_raises() -> None:
     with pytest.raises(IngestionError, match="Unknown source_type"):
         ingest("audio", "some payload")

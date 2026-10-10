@@ -239,6 +239,34 @@ def test_default_hybrid_does_not_close_injected_store(
     assert store.close_calls == 0
 
 
+def test_default_hybrid_uses_injected_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeStore:
+        def load_chunks(self) -> list[Any]:
+            return []
+
+    injected_embedder = object()
+    monkeypatch.setattr(
+        "insight_agent.indexing.SentenceTransformerEmbedder",
+        lambda model_name=None: pytest.fail("must not construct another embedder"),
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.sparse.BM25Retriever",
+        lambda chunk_loader: object(),
+    )
+    monkeypatch.setattr(
+        "insight_agent.retrieval.reranker.CrossEncoderReranker",
+        lambda model_name: object(),
+    )
+
+    hybrid = build_default_hybrid_retriever(
+        _hybrid_config(), FakeStore(), embedder=injected_embedder
+    )
+
+    assert hybrid.dense_retriever.embedder is injected_embedder
+
+
 def test_retriever_embeds_one_query_and_restores_complete_result() -> None:
     embedder = FakeEmbedder()
     store = FakeVectorStore()

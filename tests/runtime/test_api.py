@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from fastapi.testclient import TestClient
 import pytest
 
 from insight_agent.application import (
+    ComponentReadiness,
+    ComponentStatus,
+    MaterialImportResult,
+    ImageIngestionUnavailableError,
+    MaterialProcessingError,
+    MaterialStatus,
+    MaterialTooLargeError,
+    MaterialValidationError,
     QueryExecutionError,
     QueryResponse,
     QueryRoutingError,
     QueryRuntimeError,
     QueryStatus,
+    ReadinessResult,
+    ReadinessStatus,
+    StoredMaterial,
 )
 from insight_agent.router import Intent
 from insight_agent.runtime.api import _event_stream, create_api
@@ -66,6 +78,53 @@ class FailingQueryService:
         raise self.error
 
 
+class FakeMaterialStorage:
+    def __init__(self, *, error: Exception | None = None, duplicate: bool = False) -> None:
+        self.error = error
+        self.duplicate = duplicate
+        self.filenames: list[str | None] = []
+
+    async def store(self, upload):
+        self.filenames.append(upload.filename)
+        if self.error is not None:
+            raise self.error
+        return StoredMaterial("material-1", Path("/controlled/material-1.txt"), self.duplicate)
+
+
+class FakeKnowledgeService:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.error = error
+        self.paths: list[Path] = []
+
+    def import_material(self, material: StoredMaterial) -> MaterialImportResult:
+        self.paths.append(material.path)
+        if self.error is not None:
+            raise self.error
+        return MaterialImportResult(
+            material_id=material.material_id,
+            document_ids=["document-1"],
+            status=MaterialStatus.INDEXED,
+            chunk_count=2,
+            deduplicated=material.deduplicated,
+        )
+
+
+class FakeReadiness:
+    def __init__(self, ready: bool) -> None:
+        status = ReadinessStatus.READY if ready else ReadinessStatus.NOT_READY
+        component = ComponentReadiness(
+            status=ComponentStatus.READY if ready else ComponentStatus.UNAVAILABLE
+        )
+        self.result = ReadinessResult(
+            status=status,
+            required={"redis": component},
+            optional={"web": ComponentReadiness(status=ComponentStatus.UNCONFIGURED)},
+        )
+
+    async def check(self) -> ReadinessResult:
+        return self.result
+
+
 def _runtime() -> tuple[
     ResearchRuntimeService, InMemoryRunRegistry, InMemoryRuntimeEventStore
 ]:
@@ -80,6 +139,110 @@ def _runtime() -> tuple[
         thread_id_factory=lambda: "thread-1",
     )
     return service, registry, events
+
+
+def test_health_is_liveness_only() -> None:
+    with TestClient(create_api()) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert response.headers["x-request-id"]
+
+
+@pytest.mark.parametrize(("ready", "status_code"), [(True, 200), (False, 503)])
+def test_ready_maps_required_component_state(ready: bool, status_code: int) -> None:
+    with TestClient(create_api(readiness_service=FakeReadiness(ready))) as client:
+        response = client.get("/ready")
+
+    assert response.status_code == status_code
+    assert response.json()["status"] == ("ready" if ready else "not_ready")
+
+
+@pytest.mark.parametrize(("duplicate", "status_code"), [(False, 201), (True, 200)])
+def test_material_upload_returns_traceable_result(
+    duplicate: bool, status_code: int
+) -> None:
+    storage = FakeMaterialStorage(duplicate=duplicate)
+    knowledge = FakeKnowledgeService()
+    app = create_api(material_storage=storage, knowledge_service=knowledge)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/materials",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+
+    assert response.status_code == status_code
+    assert response.json() == {
+        "material_id": "material-1",
+        "document_ids": ["document-1"],
+        "status": "indexed",
+        "chunk_count": 2,
+        "deduplicated": duplicate,
+    }
+    assert storage.filenames == ["notes.txt"]
+    assert knowledge.paths == [Path("/controlled/material-1.txt")]
+    assert response.headers["x-request-id"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code", "detail"),
+    [
+        (MaterialValidationError("unsafe private value"), 422, "invalid material upload"),
+        (MaterialTooLargeError("unsafe private value"), 413, "material upload too large"),
+        (
+            ImageIngestionUnavailableError("unsafe private value"),
+            422,
+            "image ingestion unavailable; configure VISION_*",
+        ),
+        (
+            MaterialProcessingError("ingestion", material_id="secret-id"),
+            422,
+            "unable to ingest material",
+        ),
+        (
+            MaterialProcessingError("indexing", material_id="secret-id"),
+            503,
+            "knowledge service unavailable",
+        ),
+    ],
+)
+def test_material_upload_errors_are_sanitized(
+    error: Exception, status_code: int, detail: str
+) -> None:
+    if isinstance(error, MaterialProcessingError):
+        storage = FakeMaterialStorage()
+        knowledge = FakeKnowledgeService(error=error)
+    else:
+        storage = FakeMaterialStorage(error=error)
+        knowledge = FakeKnowledgeService()
+    app = create_api(material_storage=storage, knowledge_service=knowledge)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/materials",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+    assert "unsafe" not in response.text
+    assert "secret-id" not in response.text
+
+
+def test_material_endpoint_accepts_only_multipart_file() -> None:
+    app = create_api(
+        material_storage=FakeMaterialStorage(),
+        knowledge_service=FakeKnowledgeService(),
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/materials",
+            json={"url": "http://169.254.169.254", "path": "/etc/passwd"},
+        )
+
+    assert response.status_code == 422
 
 
 def test_create_returns_202_without_exposing_research_state() -> None:

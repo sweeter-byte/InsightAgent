@@ -19,10 +19,19 @@ from pathlib import Path
 
 from insight_agent.ingestion.errors import IngestionError
 from insight_agent.ingestion.models import Document, SourceType
-from insight_agent.ingestion.vision import describe_image, guess_mime_type
+from insight_agent.ingestion.vision import (
+    OpenAICompatibleVisionClient,
+    describe_image,
+    describe_image_with_client,
+    guess_mime_type,
+)
 
 
-def load_image(path: str) -> list[Document]:
+def load_image(
+    path: str,
+    *,
+    vision_client: OpenAICompatibleVisionClient | None = None,
+) -> list[Document]:
     """Load an image and return its visual description as a single Document.
 
     Args:
@@ -46,7 +55,11 @@ def load_image(path: str) -> list[Document]:
     mime_type = guess_mime_type(path)
     # describe_image owns the actual VLM call and raises IngestionError on
     # failure; an empty description still yields a structurally valid Document.
-    description = describe_image(str(p))
+    description = (
+        describe_image(str(p))
+        if vision_client is None
+        else describe_image_with_client(str(p), vision_client)
+    )
 
     return [
         Document(

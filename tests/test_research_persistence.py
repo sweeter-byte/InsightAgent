@@ -419,3 +419,11 @@ def test_checkpoint_can_resume_in_a_new_python_process(tmp_path: Path) -> None:
         check=False,
     )
     assert second.returncode == 0, second.stderr
+
+
+def test_checkpoint_readiness_uses_existing_connection(tmp_path: Path) -> None:
+    store = SQLiteCheckpointStore(tmp_path / "ready.sqlite")
+    try:
+        assert store.check_ready() is None
+    finally:
+        store.close()

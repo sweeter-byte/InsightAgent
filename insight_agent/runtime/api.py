@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 import json
+import logging
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, FastAPI, Header, Request, Response, status
+from fastapi import APIRouter, FastAPI, File, Header, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from insight_agent.application.query import (
@@ -17,6 +19,20 @@ from insight_agent.application.query import (
     QueryRoutingError,
     QueryRuntimeError,
     QueryService,
+)
+from insight_agent.application.knowledge import (
+    ImageIngestionUnavailableError,
+    KnowledgeService,
+    MaterialImportResult,
+    MaterialProcessingError,
+    MaterialStorage,
+    MaterialTooLargeError,
+    MaterialValidationError,
+)
+from insight_agent.application.readiness import (
+    ReadinessResult,
+    ReadinessService,
+    ReadinessStatus,
 )
 from insight_agent.router import Intent
 from insight_agent.runtime.errors import InvalidRunState, RunNotFound, RuntimeUnavailable
@@ -32,12 +48,16 @@ from insight_agent.runtime.service import ResearchRuntimeService
 TERMINAL_EVENT_TYPES = frozenset(
     {"run.completed", "run.failed", "run.timed_out", "run.interrupted"}
 )
+logger = logging.getLogger(__name__)
 
 
 def create_api(
     service: ResearchRuntimeService | None = None,
     *,
     query_service: QueryService | None = None,
+    material_storage: MaterialStorage | None = None,
+    knowledge_service: KnowledgeService | None = None,
+    readiness_service: ReadinessService | None = None,
     lifespan: Any = None,
 ) -> FastAPI:
     """Build a thin HTTP application around one shared runtime service."""
@@ -46,6 +66,14 @@ def create_api(
         app.state.runtime_service = service
     if query_service is not None:
         app.state.query_service = query_service
+    if material_storage is not None:
+        app.state.material_storage = material_storage
+    if knowledge_service is not None:
+        app.state.knowledge_service = knowledge_service
+    if readiness_service is not None:
+        app.state.readiness_service = readiness_service
+    app.include_router(_operations_router())
+    app.include_router(_materials_router())
     app.include_router(_query_router())
     app.include_router(_router())
 
@@ -100,7 +128,106 @@ def create_api(
             content={"detail": "research runtime unavailable"},
         )
 
+    @app.exception_handler(MaterialTooLargeError)
+    async def material_too_large_handler(
+        _request: Request, _exc: MaterialTooLargeError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            content={"detail": "material upload too large"},
+        )
+
+    @app.exception_handler(ImageIngestionUnavailableError)
+    async def image_ingestion_unavailable_handler(
+        _request: Request, _exc: ImageIngestionUnavailableError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": "image ingestion unavailable; configure VISION_*"
+            },
+        )
+
+    @app.exception_handler(MaterialValidationError)
+    async def material_validation_handler(
+        _request: Request, _exc: MaterialValidationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "invalid material upload"},
+        )
+
+    @app.exception_handler(MaterialProcessingError)
+    async def material_processing_handler(
+        request: Request, exc: MaterialProcessingError
+    ) -> JSONResponse:
+        logger.error(
+            "material processing failed",
+            exc_info=exc,
+            extra={"request_id": request.state.request_id, "stage": exc.stage},
+        )
+        if exc.stage == "ingestion":
+            return JSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                content={"detail": "unable to ingest material"},
+            )
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": "knowledge service unavailable"},
+        )
+
     return app
+
+
+def _operations_router() -> APIRouter:
+    router = APIRouter(tags=["operations"])
+
+    @router.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @router.get("/ready", response_model=ReadinessResult)
+    async def ready(request: Request, response: Response) -> ReadinessResult:
+        service = getattr(request.app.state, "readiness_service", None)
+        if service is None:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return ReadinessResult(
+                status=ReadinessStatus.NOT_READY,
+                required={},
+                optional={},
+            )
+        result = await service.check()
+        if result.status is ReadinessStatus.NOT_READY:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return result
+
+    return router
+
+
+def _materials_router() -> APIRouter:
+    router = APIRouter(prefix="/v1/materials", tags=["materials"])
+
+    @router.post("", response_model=MaterialImportResult)
+    async def upload_material(
+        request: Request,
+        response: Response,
+        file: UploadFile = File(...),
+    ) -> MaterialImportResult:
+        storage = _material_storage(request)
+        knowledge = _knowledge_service(request)
+        try:
+            stored = await storage.store(file)
+            result = await asyncio.to_thread(knowledge.import_material, stored)
+        finally:
+            await file.close()
+        response.status_code = (
+            status.HTTP_200_OK
+            if result.deduplicated
+            else status.HTTP_201_CREATED
+        )
+        return result
+
+    return router
 
 
 def _query_router() -> APIRouter:
@@ -176,6 +303,20 @@ def _query_service(request: Request) -> QueryService:
     service = getattr(request.app.state, "query_service", None)
     if service is None:
         raise RuntimeUnavailable("query service unavailable")
+    return service
+
+
+def _material_storage(request: Request) -> MaterialStorage:
+    service = getattr(request.app.state, "material_storage", None)
+    if service is None:
+        raise MaterialProcessingError("service")
+    return service
+
+
+def _knowledge_service(request: Request) -> KnowledgeService:
+    service = getattr(request.app.state, "knowledge_service", None)
+    if service is None:
+        raise MaterialProcessingError("service")
     return service
 
 

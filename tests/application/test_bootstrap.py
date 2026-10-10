@@ -229,6 +229,71 @@ def test_composition_shares_one_llm_and_keeps_local_retrieval_lazy() -> None:
     assert hybrid.close_calls == 0
 
 
+def test_eager_backend_composition_shares_knowledge_resources() -> None:
+    factories, llm, checkpoint, hybrid, calls, events = resources()
+    store = QdrantStore(events, Path("missing.png"))
+    store.collection_present = False
+    embedder = object()
+    chunker = object()
+
+    def create_qdrant(value):
+        calls.append(("qdrant", value))
+        return store
+
+    eager_factories = replace(
+        factories,
+        qdrant=create_qdrant,
+        embedder=lambda model: calls.append(("embedder", model)) or embedder,
+        chunker=lambda: calls.append(("chunker",)) or chunker,
+    )
+
+    app = application.build_application(
+        config(), factories=eager_factories, eager_knowledge=True
+    )
+    tool = app.research_coordinator.workflow.local_retriever
+
+    assert tool._get_retriever() is hybrid
+    assert app.knowledge_service.embedder is embedder
+    assert app.knowledge_service.chunker is chunker
+    assert app.knowledge_service.vector_store is store
+    assert app.vector_store is store
+    assert app.checkpoint_store is checkpoint
+    assert [call[0] for call in calls] == [
+        "llm", "qdrant", "embedder", "hybrid", "chunker", "checkpoint"
+    ]
+    hybrid_args = next(call[1:] for call in calls if call[0] == "hybrid")
+    assert hybrid_args[-2:] == (store, embedder)
+
+    app.close()
+    assert events == ["checkpoint", "hybrid", "qdrant", "llm"]
+
+
+def test_eager_hybrid_failure_closes_qdrant_then_llm() -> None:
+    factories, llm, checkpoint, hybrid, calls, events = resources()
+    store = QdrantStore(events, Path("missing.png"))
+    store.collection_present = False
+
+    def fail_hybrid(*values):
+        calls.append(("hybrid", *values))
+        raise RuntimeError("shared hybrid failed")
+
+    with pytest.raises(RuntimeError, match="shared hybrid failed"):
+        application.build_application(
+            config(),
+            factories=replace(
+                factories,
+                qdrant=lambda value: store,
+                embedder=lambda model: object(),
+                hybrid=fail_hybrid,
+            ),
+            eager_knowledge=True,
+        )
+
+    assert events == ["qdrant", "llm"]
+    assert store.close_calls == llm.close_calls == 1
+    assert checkpoint.close_calls == hybrid.close_calls == 0
+
+
 def test_lazy_local_search_uses_explicit_settings_and_closes_once() -> None:
     factories, llm, checkpoint, hybrid, calls, events = resources()
     settings = config()

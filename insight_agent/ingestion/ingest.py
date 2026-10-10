@@ -26,6 +26,7 @@ from insight_agent.ingestion.loaders.pdf_loader import load_pdf
 from insight_agent.ingestion.loaders.text_loader import load_text, load_text_file
 from insight_agent.ingestion.loaders.url_loader import load_url
 from insight_agent.ingestion.models import Document, SourceType
+from insight_agent.ingestion.vision import OpenAICompatibleVisionClient
 
 #: Accepted values for the ``source_type`` argument — the enum itself or its
 #: string value (``SourceType`` is a ``str`` enum, so ``"pdf"`` works too).
@@ -91,7 +92,11 @@ def ingest(source_type: SourceTypeLike, source: str) -> list[Document]:
     raise IngestionError(f"Unsupported source_type: {st.value!r}")
 
 
-def ingest_file(path: str) -> list[Document]:
+def ingest_file(
+    path: str,
+    *,
+    vision_client: OpenAICompatibleVisionClient | None = None,
+) -> list[Document]:
     """Ingest a local file, picking the loader from its extension.
 
     Text files go to :func:`load_text_file`, so the file's *contents* become the
@@ -115,7 +120,7 @@ def ingest_file(path: str) -> list[Document]:
     if st is SourceType.PDF:
         return load_pdf(path)
     if st is SourceType.IMAGE:
-        return load_image(path)
+        return load_image(path, vision_client=vision_client)
 
     # SourceType.URL has no file-extension representation.
     raise IngestionError(f"Cannot ingest {path!r} as a file (type {st.value!r})")

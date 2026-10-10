@@ -43,6 +43,12 @@ class SQLiteCheckpointStore:
         self.connection.close()
         self._closed = True
 
+    def check_ready(self) -> None:
+        """Verify the already-open SQLite connection without mutating state."""
+        row = self.connection.execute("SELECT 1").fetchone()
+        if row != (1,):
+            raise RuntimeError("checkpoint readiness query returned no result")
+
     def __enter__(self) -> SQLiteCheckpointStore:
         return self
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,6 +105,7 @@ class QdrantVectorStore:
         resolved = config if config is not None else QdrantConfig.from_env()
         self.path = Path(path) if path else resolved.path
         self.collection_name = collection_name or resolved.collection_name
+        self._client_lock = threading.RLock()
         self.client = QdrantClient(path=str(self.path))
 
     def ensure_collection(self, vector_size: int) -> None:
@@ -111,17 +113,18 @@ class QdrantVectorStore:
         if vector_size <= 0:
             raise ValueError("vector_size must be greater than 0")
 
-        if not self.client.collection_exists(self.collection_name):
-            self.client.create_collection(
-                collection_name=self.collection_name,
-                vectors_config=VectorParams(
-                    size=vector_size,
-                    distance=Distance.COSINE,
-                ),
-            )
-            return
+        with self._client_lock:
+            if not self.client.collection_exists(self.collection_name):
+                self.client.create_collection(
+                    collection_name=self.collection_name,
+                    vectors_config=VectorParams(
+                        size=vector_size,
+                        distance=Distance.COSINE,
+                    ),
+                )
+                return
 
-        collection = self.client.get_collection(self.collection_name)
+            collection = self.client.get_collection(self.collection_name)
         vectors_config = collection.config.params.vectors
         if isinstance(vectors_config, dict):
             raise ValueError(
@@ -145,7 +148,8 @@ class QdrantVectorStore:
 
     def collection_exists(self) -> bool:
         """Return whether this store's configured collection already exists."""
-        return self.client.collection_exists(self.collection_name)
+        with self._client_lock:
+            return self.client.collection_exists(self.collection_name)
 
     def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
         """Upsert one Qdrant point per Chunk without positional truncation."""
@@ -165,11 +169,12 @@ class QdrantVectorStore:
             )
             for index in range(len(chunks))
         ]
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=points,
-            wait=True,
-        )
+        with self._client_lock:
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True,
+            )
 
     def search(
         self,
@@ -185,14 +190,15 @@ class QdrantVectorStore:
             raise ValueError("search limit must be a positive integer")
         normalized_types = normalize_source_types(source_types)
 
-        response = self.client.query_points(
-            collection_name=self.collection_name,
-            query=vector,
-            query_filter=_source_type_filter(normalized_types),
-            limit=limit,
-            with_payload=True,
-            with_vectors=False,
-        )
+        with self._client_lock:
+            response = self.client.query_points(
+                collection_name=self.collection_name,
+                query=vector,
+                query_filter=_source_type_filter(normalized_types),
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
         return list(response.points)
 
     def load_chunks(
@@ -202,12 +208,25 @@ class QdrantVectorStore:
         source_types: set[str] | None = None,
     ) -> list[Chunk]:
         """Restore every stored point as a project-owned ``Chunk``."""
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+        ):
+            raise ValueError("batch_size must be a positive integer")
+        if not self.collection_exists():
+            return []
         return list(
             self.iter_chunks(
                 batch_size=batch_size,
                 source_types=source_types,
             )
         )
+
+    def check_ready(self) -> None:
+        """Run a lightweight local metadata operation without creating data."""
+        with self._client_lock:
+            self.client.get_collections()
 
     def iter_chunks(
         self,
@@ -224,24 +243,26 @@ class QdrantVectorStore:
             raise ValueError("batch_size must be a positive integer")
         normalized_types = normalize_source_types(source_types)
 
-        offset: Any | None = None
-        while True:
-            points, next_offset = self.client.scroll(
-                collection_name=self.collection_name,
-                scroll_filter=_source_type_filter(normalized_types),
-                limit=batch_size,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
-            )
-            yield from (self._chunk_from_point(point) for point in points)
-            if next_offset is None:
-                return
-            offset = next_offset
+        with self._client_lock:
+            offset: Any | None = None
+            while True:
+                points, next_offset = self.client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=_source_type_filter(normalized_types),
+                    limit=batch_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                yield from (self._chunk_from_point(point) for point in points)
+                if next_offset is None:
+                    return
+                offset = next_offset
 
     def close(self) -> None:
         """Release local storage resources held by the Qdrant client."""
-        self.client.close()
+        with self._client_lock:
+            self.client.close()
 
     @staticmethod
     def _payload(chunk: Chunk) -> dict[str, object]:

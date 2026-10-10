@@ -112,6 +112,15 @@ def test_ensure_collection_creates_cosine_collection(tmp_path: Path) -> None:
         store.close()
 
 
+def test_load_chunks_before_collection_exists_is_empty(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    try:
+        assert store.load_chunks() == []
+        assert store.check_ready() is None
+    finally:
+        store.close()
+
+
 def test_existing_collection_accepts_same_dimension(tmp_path: Path) -> None:
     store = _store(tmp_path)
     try:

@@ -9,7 +9,13 @@ from typing import Any, Protocol
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from insight_agent.application import AppConfig, QueryService, build_application
+from insight_agent.application import (
+    AppConfig,
+    MaterialStorage,
+    QueryService,
+    ReadinessService,
+    build_application,
+)
 from insight_agent.runtime.api import create_api
 from insight_agent.runtime.events import RedisRuntimeEventStore
 from insight_agent.runtime.policies import RuntimeConfig
@@ -20,6 +26,9 @@ from insight_agent.runtime.service import ResearchRuntimeService
 
 class ComposedResearchApp(Protocol):
     research_coordinator: Any
+    knowledge_service: Any
+    vector_store: Any
+    checkpoint_store: Any
 
     def close(self) -> None: ...
 
@@ -28,12 +37,32 @@ def _redis_from_url(url: str) -> Redis:
     return Redis.from_url(url)
 
 
+def _build_runtime_application(config: AppConfig) -> ComposedResearchApp:
+    return build_application(config, eager_knowledge=True)
+
+
+def _material_storage(config: AppConfig) -> MaterialStorage:
+    return MaterialStorage(
+        config.materials.upload_dir,
+        max_bytes=config.materials.max_bytes,
+        image_ingestion_enabled=config.vision is not None,
+    )
+
+
+def _readiness_service(**kwargs: Any) -> ReadinessService:
+    return ReadinessService(**kwargs)
+
+
 def create_runtime_app(
     *,
     config: AppConfig | None = None,
     config_factory: Callable[[], AppConfig] = AppConfig.from_env,
-    application_factory: Callable[[AppConfig], ComposedResearchApp] = build_application,
+    application_factory: Callable[
+        [AppConfig], ComposedResearchApp
+    ] = _build_runtime_application,
     redis_client_factory: Callable[[str], Any] = _redis_from_url,
+    material_storage_factory: Callable[[AppConfig], MaterialStorage] = _material_storage,
+    readiness_service_factory: Callable[..., ReadinessService] = _readiness_service,
     runtime_config: RuntimeConfig | None = None,
 ) -> FastAPI:
     """Create the HTTP app without acquiring resources until lifespan startup."""
@@ -50,6 +79,14 @@ def create_runtime_app(
         service: ResearchRuntimeService | None = None
         try:
             await redis_client.ping()
+            material_storage = material_storage_factory(resolved_config)
+            readiness = readiness_service_factory(
+                redis=redis_client,
+                qdrant=research_app.vector_store,
+                checkpoint=research_app.checkpoint_store,
+                web_available=resolved_config.web_search is not None,
+                vision_available=resolved_config.vision is not None,
+            )
             registry = RedisRunRegistry(redis_client)
             events = RedisRuntimeEventStore(
                 redis_client,
@@ -68,6 +105,9 @@ def create_runtime_app(
             application.state.research_app = research_app
             application.state.runtime_service = service
             application.state.query_service = query_service
+            application.state.material_storage = material_storage
+            application.state.knowledge_service = research_app.knowledge_service
+            application.state.readiness_service = readiness
             await service.reconcile_interrupted_runs()
             yield
         finally:

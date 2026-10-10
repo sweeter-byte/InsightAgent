@@ -519,6 +519,41 @@ conda run --no-capture-output -n insight-agent \
   uvicorn insight_agent.runtime.app:app
 ```
 
+For a disposable development Redis, only Redis needs a container; the
+application and Qdrant Local Mode continue to run in the Conda environment:
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+### Material preparation and operational checks
+
+The controlled upload entry point accepts Markdown, TXT, and PDF. PNG, JPEG,
+and WEBP are accepted only when all `VISION_*` settings are present. The server
+streams the file into `MATERIAL_UPLOAD_DIR`, enforces `MATERIAL_MAX_BYTES`,
+generates the stored name from SHA-256, then runs ingestion, chunking,
+embedding, Qdrant upsert, and BM25 refresh.
+
+```bash
+curl -F 'file=@./notes.md' http://127.0.0.1:8000/v1/materials
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/ready
+```
+
+`material_id` is a content/import tracking identifier, not a retrieval scope;
+local queries still search the shared collection. No URL ingestion endpoint is
+exposed. Qdrant remains in Local Mode and the process owns one client for
+`QDRANT_PATH`, avoiding competing embedded-store locks.
+
+`/health` checks HTTP liveness only. `/ready` checks the existing Redis,
+Qdrant, SQLite checkpoint, and validated configuration. Optional Web/Vision
+configuration is reported separately without model calls or network searches.
+
+This backend still has no authentication, authorization, tenant isolation, or
+rate limiting. Because it accepts files, do not expose it directly to an
+untrusted public network; use a trusted interface or an authenticated,
+upload-limiting gateway.
+
 Create and observe a run:
 
 ```bash
@@ -543,6 +578,8 @@ curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 | `RUNTIME_EVENT_TTL_SECONDS` | `86400` | Event stream retention in seconds |
 | `RUNTIME_INFRA_RETRY_ATTEMPTS` | `3` | Maximum infrastructure operation attempts |
 | `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS` | `0.2` | Infrastructure retry backoff in seconds |
+| `MATERIAL_UPLOAD_DIR` | `.data/materials` | Controlled server-side material storage |
+| `MATERIAL_MAX_BYTES` | `20971520` | Maximum bytes accepted per upload |
 
 This chapter intentionally does not add
 authentication, distributed workers, automatic resume, WebSockets, or

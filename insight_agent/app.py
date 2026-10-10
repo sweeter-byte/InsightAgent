@@ -59,12 +59,18 @@ class InsightAgent:
         research_coordinator: ResearchCoordinator,
         direct_system_prompt: str = DIRECT_SYSTEM_PROMPT,
         close_callbacks: Sequence[Callable[[], None]] = (),
+        knowledge_service: Any | None = None,
+        vector_store: Any | None = None,
+        checkpoint_store: Any | None = None,
     ) -> None:
         self.router = router
         self.llm = llm
         self.research_agent = research_agent
         self.research_coordinator = research_coordinator
         self.direct_system_prompt = direct_system_prompt
+        self.knowledge_service = knowledge_service
+        self.vector_store = vector_store
+        self.checkpoint_store = checkpoint_store
         self._close_callbacks = list(close_callbacks)
 
     # ------------------------------------------------------------------ public

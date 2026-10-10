@@ -380,6 +380,38 @@ conda run --no-capture-output -n insight-agent \
   uvicorn insight_agent.runtime.app:app
 ```
 
+开发环境如需临时 Redis，只需容器化 Redis；应用与 Qdrant Local Mode 仍直接
+运行在 Conda 环境中：
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine
+```
+
+### 资料准备与运行状态检查
+
+受控上传入口默认接受 Markdown、TXT 和 PDF；只有完整配置 `VISION_*` 后才接受
+PNG、JPEG 和 WEBP。服务端把文件流式写入 `MATERIAL_UPLOAD_DIR`，执行
+`MATERIAL_MAX_BYTES` 限制，用 SHA-256 生成存储文件名，再依次执行摄取、分块、
+Embedding、Qdrant Upsert 和 BM25 刷新。
+
+```bash
+curl -F 'file=@./notes.md' http://127.0.0.1:8000/v1/materials
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/ready
+```
+
+`material_id` 只是内容/导入追踪标识，不代表资料级检索作用域；本地检索仍查询
+共享 Collection。后端没有 URL 摄取接口。Qdrant 继续使用 Local Mode，进程为
+`QDRANT_PATH` 持有唯一客户端，避免索引与读取争抢嵌入式存储文件锁。
+
+`/health` 只检查 HTTP 进程存活；`/ready` 检查现有 Redis、Qdrant、SQLite
+Checkpoint 和已校验配置，并单独报告可选 Web/Vision 状态，不调用模型或外部
+搜索服务。
+
+当前后端仍未实现身份认证、权限控制、租户隔离或限流。由于服务能够接收文件，
+不得直接暴露到不受信任的公网；应限制在可信网络，或在前方部署带认证和上传
+限制的网关。
+
 创建、查询、订阅和恢复 Run：
 
 ```bash
@@ -404,6 +436,8 @@ curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 | `RUNTIME_EVENT_TTL_SECONDS` | `86400` | 事件流保留时间，单位秒 |
 | `RUNTIME_INFRA_RETRY_ATTEMPTS` | `3` | 基础设施操作最大尝试次数 |
 | `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS` | `0.2` | 基础设施重试退避时间，单位秒 |
+| `MATERIAL_UPLOAD_DIR` | `.data/materials` | 服务端受控资料存储目录 |
+| `MATERIAL_MAX_BYTES` | `20971520` | 单个上传文件最大字节数 |
 
 本章不实现认证、分布式 Worker、自动恢复、WebSocket 或 Exactly-Once。
 

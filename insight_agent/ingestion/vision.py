@@ -288,3 +288,15 @@ def describe_image(path: str) -> str:
         system_prompt=VISION_SYSTEM_PROMPT,
         user_prompt=_VISION_USER_TEXT,
     )
+
+
+def describe_image_with_client(
+    path: str,
+    client: OpenAICompatibleVisionClient,
+) -> str:
+    """Describe an image through one application-owned Vision client."""
+    return client.analyze_image(
+        path,
+        system_prompt=VISION_SYSTEM_PROMPT,
+        user_prompt=_VISION_USER_TEXT,
+    )

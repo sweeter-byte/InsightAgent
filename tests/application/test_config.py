@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from insight_agent.application import AppConfig, CheckpointConfig
+from insight_agent.application import AppConfig, CheckpointConfig, MaterialConfig
 from insight_agent.indexing import DEFAULT_EMBEDDING_MODEL
 
 
@@ -47,6 +47,8 @@ def test_from_env_populates_complete_explicit_mapping() -> None:
             "RUNTIME_INFRA_RETRY_ATTEMPTS": "5",
             "RUNTIME_INFRA_RETRY_BACKOFF_SECONDS": "0.75",
             "RUNTIME_EVENT_TTL_SECONDS": "123",
+            "MATERIAL_UPLOAD_DIR": " custom/materials ",
+            "MATERIAL_MAX_BYTES": "42",
         }
     )
 
@@ -78,6 +80,9 @@ def test_from_env_populates_complete_explicit_mapping() -> None:
     assert config.runtime.policy.infra_retry_attempts == 5
     assert config.runtime.policy.infra_retry_backoff_seconds == 0.75
     assert config.runtime.policy.event_ttl_seconds == 123
+    assert config.materials == MaterialConfig(
+        upload_dir=Path("custom/materials"), max_bytes=42
+    )
 
 
 def test_optional_vision_and_web_search_are_absent() -> None:
@@ -115,6 +120,9 @@ def test_from_env_has_stable_component_defaults() -> None:
     assert config.runtime.policy.infra_retry_attempts == 3
     assert config.runtime.policy.infra_retry_backoff_seconds == 0.2
     assert config.runtime.policy.event_ttl_seconds == 86_400
+    assert config.materials == MaterialConfig(
+        upload_dir=Path(".data/materials"), max_bytes=20 * 1024 * 1024
+    )
 
 
 def test_repr_does_not_expose_provider_secrets() -> None:
@@ -204,3 +212,26 @@ def test_application_configs_are_frozen_and_slotted() -> None:
         config.embedding_model = "other/model"  # type: ignore[misc]
     assert not hasattr(checkpoint, "__dict__")
     assert not hasattr(config, "__dict__")
+
+
+@pytest.mark.parametrize("path", ["", "   ", None])
+def test_material_config_rejects_empty_upload_dir(path: object) -> None:
+    with pytest.raises(ValueError, match="MATERIAL_UPLOAD_DIR"):
+        MaterialConfig(upload_dir=path)  # type: ignore[arg-type]
+
+
+def test_material_config_mapping_rejects_empty_upload_dir() -> None:
+    with pytest.raises(ValueError, match="MATERIAL_UPLOAD_DIR"):
+        AppConfig.from_env({**_required_env(), "MATERIAL_UPLOAD_DIR": "   "})
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "invalid"])
+def test_material_config_rejects_invalid_max_bytes(value: object) -> None:
+    with pytest.raises(ValueError, match="MATERIAL_MAX_BYTES"):
+        MaterialConfig(max_bytes=value)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_material_config_mapping_rejects_invalid_max_bytes(value: str) -> None:
+    with pytest.raises(ValueError, match="MATERIAL_MAX_BYTES"):
+        AppConfig.from_env({**_required_env(), "MATERIAL_MAX_BYTES": value})
