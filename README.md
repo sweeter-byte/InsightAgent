@@ -1,703 +1,335 @@
 # InsightAgent
 
-A minimal, hand-rolled **Research Agent** built directly on the OpenAI-compatible
-Chat Completions API. Chapter 1 verifies the smallest thing that deserves to be
-called an agent loop — LLM decides → runtime executes a tool → result is
-written back into messages → LLM decides again. Chapter 2 wraps that loop in an
-`InsightAgent` façade fronted by an **Intent Router** that picks the execution
-path for every query. Chapter 3 stands up an independent **Multimodal
-Ingestion** layer that turns Text / Markdown / PDF / URL / Image inputs into a
-unified `list[Document]`.
+InsightAgent is a backend research agent with one HTTP query entry point,
+controlled local-material ingestion, hybrid retrieval, and asynchronous research
+runs. The research workflow uses **LangGraph** with SQLite checkpoints; Redis
+stores public run status and SSE events. A separate top-level `evals` package
+provides deterministic offline Evaluation, baseline registration, and regression
+comparison.
 
-No LangChain, no LangGraph, no OpenAI Agents SDK, no other agent framework.
+The current delivery is backend-only. It supports three intent paths:
 
-## Requirements
+- `direct`: one normal answer, completed in the request; no Research Run.
+- `analyze`: synchronous analysis using tools and the shared local knowledge
+  index; no Research Run.
+- `research`: immediate `202 Accepted` with a `run_id`, followed by status/SSE
+  observation and a final Research Report.
 
-- Python **3.11+**
-- An OpenAI-compatible chat-completions endpoint (OpenAI itself, or any
-  gateway that speaks the same `/v1/chat/completions` protocol with tool
-  calling, e.g. vLLM, DeepSeek, Qwen, Moonshot, …).
+## Architecture
+
+```text
+POST /v1/materials -> controlled storage -> ingestion -> chunk/embed -> Qdrant
+                                                       -> refresh hybrid retrieval
+
+POST /v1/query -> IntentRouter
+                 |- direct  -> one-shot LLM answer
+                 |- analyze -> ResearchAgent + local tools
+                 `- research -> ResearchRuntimeService -> LangGraph workflow
+                                 |- Redis status + SSE events
+                                 `- SQLite checkpoint + resume
+
+python -m evals -> versioned Dataset + recorded Fixture -> Evaluation Result
+                  -> explicit Baseline -> Regression report
+```
+
+The composition root is `insight_agent.application.build_application`. The
+FastAPI lifespan in `insight_agent.runtime.app` creates shared resources once,
+reuses them for every request, and closes them in reverse ownership order.
 
 ## Install
 
-The project uses a dedicated conda environment named `insight-agent`:
+Python 3.11 or newer is required. This repository uses Conda; do not create a
+project `.venv`.
 
 ```bash
-conda activate insight-agent
-pip install -e ".[dev]"
+conda env list
+conda create -n insight-agent python=3.11
+conda run --no-capture-output -n insight-agent python -m pip install -e ".[dev]"
 ```
 
-## Configure `.env`
+If the named environment already exists, keep it and update packages only when
+needed.
 
-Copy the template and fill in the required variables. In addition to the chat
-endpoint, Hybrid Retrieval requires an explicit cross-encoder model:
+## Configure
 
 ```bash
 cp .env.example .env
 ```
 
-```text
-LLM_API_KEY=your-api-key
-LLM_BASE_URL=https://api.openai.com/v1
-LLM_MODEL=gpt-4o-mini
+At minimum, set:
+
+```dotenv
+LLM_API_KEY=replace-me
+LLM_BASE_URL=https://your-openai-compatible-host/v1
+LLM_MODEL=your-tool-capable-model
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
-`insight_agent.application.AppConfig` is the canonical startup configuration.
-`AppConfig.from_env()` loads `.env` and resolves the model, retrieval, optional
-Vision/Web, checkpoint, and Runtime settings before building the application.
-Missing required chat or reranker settings raise a clear configuration error.
-`CHECKPOINT_PATH` selects the LangGraph SQLite checkpoint file; its default is
-`.insight_agent/checkpoints.sqlite`, relative to the working directory.
+`LLM_BASE_URL` must expose an OpenAI-compatible Chat Completions API. The model
+must support the tool-calling behavior used by Analyze and the structured
+decisions used by Research. `VISION_*` and `TAVILY_API_KEY` are optional.
 
-## Application startup (Chapter 18)
+Embedding and reranker models may download on first use. Pre-provision their
+caches for offline deployment. Never commit `.env`.
 
-`insight_agent.application.build_application(config)` is the single core
-composition root shared by the CLI and HTTP Runtime. It constructs the existing
-business graph from explicit configuration and returns an `InsightAgent` with
-one shared LLM client. The CLI is an input/output/error adapter: it reads a query,
-calls the application, prints the answer or diagnostic, and closes the application
-on exit. The HTTP Runtime builds the core application once per lifespan and shares
-its dependencies across requests.
+## Start Redis and InsightAgent
 
-When Vision is not configured, Qdrant opening and Hybrid Retriever composition
-remain lazy until the first local retrieval. When Vision is configured, startup
-opens Qdrant for the existing image-capability probe. Only if a usable indexed
-image with a readable supported original is found does startup compose the
-shared Hybrid Retriever; Vision and the local knowledge tool then share that
-retriever and the probed store. Embedding and CrossEncoder model weights remain
-lazy until retrieval use. Startup adds no model warmup or per-request image scan.
+Use two terminals:
 
-Resource ownership, cleanup after partial construction failure, and idempotent
-application close are centralized in the composition root and its owned
-resources. The Runtime lifespan also owns the Runtime service and Redis client,
-and releases them and the core application on shutdown or startup failure.
-
-Earlier-chapter standalone constructors retain environment-backed defaults as an
-explicit compatibility boundary for examples and direct component use. Official
-entrypoints resolve settings through `AppConfig` and pass them explicitly.
-`TextChunker` still uses the legacy `CHUNK_SIZE` and `CHUNK_OVERLAP` defaults;
-the indexing write pipeline is outside this phase. Chapter 18 changes startup
-assembly and ownership while preserving the existing Research Runtime protocol.
-
-### Unified query API
-
-The existing FastAPI application also accepts every intent through one endpoint:
-
-```http
-POST /v1/query
-Content-Type: application/json
-
-{"query":"研究近期 Agent Memory 方案"}
+```bash
+redis-server --port 6379
 ```
 
-The Intent Router is always consulted first. A `direct` or `analyze` request
-finishes synchronously with HTTP 200:
+```bash
+conda run --no-capture-output -n insight-agent \
+  python -m uvicorn insight_agent.runtime.app:app \
+  --host 127.0.0.1 --port 8000
+```
+
+FastAPI lifespan opens Redis, local Qdrant, model clients, hybrid retrieval, and
+the SQLite checkpoint store once. Startup fails when a required resource cannot
+be initialized.
+
+## Health and readiness
+
+```bash
+curl --fail http://127.0.0.1:8000/health
+curl --fail http://127.0.0.1:8000/ready
+```
+
+`GET /health` is process liveness. `GET /ready` checks the already-owned Redis,
+Qdrant, checkpoint, and configuration resources. Web and Vision are optional;
+a required component failure returns HTTP 503.
+
+## Import demo material
+
+The endpoint accepts `.md`, `.markdown`, `.txt`, and `.pdf`. Image types also
+require complete `VISION_*` configuration. Uploads are streamed into
+`MATERIAL_UPLOAD_DIR`, bounded by `MATERIAL_MAX_BYTES`, content-addressed, and
+indexed before the response is returned.
+
+```bash
+curl --fail \
+  -F 'file=@examples/chapter18_demo_material.md;type=text/markdown' \
+  http://127.0.0.1:8000/v1/materials
+```
 
 ```json
 {
-  "request_id": "7f6f...",
-  "intent": "analyze",
+  "material_id": "<sha256>",
+  "document_ids": ["<document-id>"],
+  "status": "indexed",
+  "chunk_count": 1,
+  "deduplicated": false
+}
+```
+
+New content returns HTTP 201. Repeated content returns HTTP 200 with
+`deduplicated: true`. The API never accepts a server-local path or URL.
+
+## Unified Query
+
+### Direct
+
+```bash
+curl --fail -H 'Content-Type: application/json' \
+  -d '{"query":"Direct answer only: what is 2 + 2?"}' \
+  http://127.0.0.1:8000/v1/query
+```
+
+Direct and Analyze return HTTP 200 with the same stable fields:
+
+```json
+{
+  "request_id": "<request-id>",
+  "intent": "direct",
   "status": "completed",
-  "answer": "...",
+  "answer": "4",
   "run_id": null
 }
 ```
 
-A `research` request is submitted to the existing Research Runtime and returns
-HTTP 202 without waiting for the workflow:
+### Analyze imported knowledge
+
+```bash
+curl --fail -H 'Content-Type: application/json' \
+  -d '{"query":"Analyze the imported Chapter 18 demo notes and report the exact acceptance marker."}' \
+  http://127.0.0.1:8000/v1/query
+```
+
+The expected answer is grounded in the shared index and includes
+`IA-CH18-READY`. The current Query contract has no material-level filter.
+
+### Research through the unified entry point
+
+```bash
+curl --fail -H 'Content-Type: application/json' \
+  -d '{"query":"Research and compare three approaches to agent memory, including trade-offs and sources."}' \
+  http://127.0.0.1:8000/v1/query
+```
+
+Research immediately returns HTTP 202:
 
 ```json
 {
-  "request_id": "7f6f...",
+  "request_id": "<request-id>",
   "intent": "research",
   "status": "queued",
   "answer": null,
-  "run_id": "55a1..."
+  "run_id": "<run-id>"
 }
 ```
 
-Use the unchanged `/v1/research/runs/{run_id}` endpoint to inspect the run,
-`/v1/research/runs/{run_id}/events` for SSE progress, and
-`/v1/research/runs/{run_id}/resume` to resume an eligible run. `request_id`
-correlates one HTTP request, `run_id` identifies the Runtime run, and
-`thread_id` remains the distinct checkpoint identifier returned by the Runtime
-API.
+Intent classification is model-driven. Use the explicit Runtime endpoint below
+when an integration must deterministically request Research.
 
-There is not yet a material-import HTTP endpoint. The local Retriever currently
-queries the global knowledge base and does not support a proven
-`material_id`-scoped filter, so `/v1/query` does not advertise material-level
-isolation.
+## Research Run, status, and SSE
 
-## Run the CLI
+Create a run:
 
 ```bash
-python -m insight_agent
+curl --fail -H 'Content-Type: application/json' \
+  -d '{"query":"Compare direct answering, document analysis, and multi-step research."}' \
+  http://127.0.0.1:8000/v1/research/runs
 ```
 
-This opens an interactive REPL:
-
-```text
->> 什么是 Agent Loop？
-```
-
-You never pick a mode by hand — the Intent Router classifies each query and
-decides whether it is answered directly or handed to the ResearchAgent. For a
-general-knowledge question the router chooses `direct` and the answer comes
-from a single LLM call; for a file-reading request like the Chapter 1 example
-below, it chooses `analyze`/`research` and the `ResearchAgent` calls
-`read_file`, receives the file contents as a tool message, asks the LLM again,
-and prints the final answer. Type `exit` or press Ctrl-D to quit.
-
-A one-shot form is also supported:
+The HTTP 202 response contains `run_id`, `thread_id`, `status`, timestamps,
+`error`, and `final_output`. Inspect status and the final report:
 
 ```bash
-python -m insight_agent "读取 README.md，并概括项目当前实现范围"
+curl --fail http://127.0.0.1:8000/v1/research/runs/<run_id>
 ```
 
-## Run the tests
+Statuses are `queued`, `running`, `completed`, `failed`, `timed_out`, and
+`interrupted`. `final_output` contains the Research Report after completion.
+
+Stream progress until a terminal event:
 
 ```bash
-pytest
+curl -N --fail \
+  http://127.0.0.1:8000/v1/research/runs/<run_id>/events
 ```
 
-The default suite uses a scripted `FakeLLMClient` and **never** contacts a
-real endpoint, so it produces no API cost.
+Reconnect exclusively after a previous SSE id:
 
-## Manual smoke test against a real endpoint
-
-Not part of `pytest`. Once `.env` is configured, run the CLI with the example
-query above and confirm the assistant calls `read_file` and returns the right
-answer. This is the fastest way to sanity-check that your `LLM_BASE_URL` and
-`LLM_MODEL` actually support tool calling.
-
-## What Chapter 1 implements
-
-- `LLMClient`: reads env config, wraps `openai.OpenAI`, exposes a single
-  `chat(messages, tools=None)` that returns the raw SDK response.
-- `read_file(path) -> str`: reads a UTF-8 text file, returns an error string
-  instead of raising on missing / unreadable files.
-- `READ_FILE_SCHEMA`: the OpenAI tool-calling schema for `read_file`.
-- `ToolRegistry`: `name -> callable` dispatch, plus `build_default_registry()`
-  and `default_tool_schemas()`.
-- `ResearchAgent`: the actual agent loop, `max_steps` guard, message-history
-  handling for tool calls / tool results, and safe error handling for unknown
-  tools, malformed JSON arguments, and tool-side exceptions.
-- `python -m insight_agent` CLI (REPL + one-shot).
-
-## What Chapter 2 adds
-
-Chapter 2 introduces an **Intent Router** and a single application façade,
-`InsightAgent`, composing `LLMClient` + `ToolRegistry` + `ResearchAgent` +
-`IntentRouter` over one shared `LLMClient`. The current CLI obtains this façade
-from `insight_agent.application.build_application`; the following flow describes
-the Chapter 2 behavior before later chapters add research orchestration:
-
-```text
-User
-  ↓
-Intent Router
-  ├─ direct   → single LLM call   (no tools, no agent loop)
-  ├─ analyze  → ResearchAgent
-  └─ research → ResearchAgent
+```bash
+curl -N --fail -H 'Last-Event-ID: <event-id>' \
+  http://127.0.0.1:8000/v1/research/runs/<run_id>/events
 ```
 
-Details:
+Events include `run.queued`, `run.started`, `workflow.progress`,
+`run.completed`, `run.failed`, `run.timed_out`, and `run.interrupted`.
 
-- `Intent`: a three-value enum (`direct` / `analyze` / `research`), priority
-  `research > analyze > direct`.
-- `IntentRouter`: one LLM call with a classification prompt, string→enum parse,
-  and a safe fallback to `research` on empty/invalid output. No structured
-  output, no keyword heuristics, no confidence score, no hybrid routing.
-- `InsightAgent`: intent dispatch only. `direct` answers with a plain chat
-  completion (never enters the agent loop, so it cannot raise
-  `AgentStepsExceeded`); `analyze` and `research` delegate to `ResearchAgent`.
-- `analyze` and `research` **currently share the same `ResearchAgent` on
-  purpose** — this is the Chapter 2 design, not a bug. The intent label is kept
-  so later chapters can fork them into a Document / Multimodal Analysis Pipeline
-  and a Research Workflow respectively.
-- The CLI (`python -m insight_agent`) keeps both modes unchanged; the router
-  decides the path automatically and the intent is not printed to normal output.
+## Resume interrupted work
 
-## What Chapter 2 does NOT implement
+Resume is valid only for `interrupted` or `timed_out` runs. It preserves the
+original `run_id` and LangGraph `thread_id` and continues from the SQLite
+checkpoint without submitting the initial query again.
 
-Still deliberately out of scope until later chapters:
-
-- Document / Multimodal Analysis Pipeline and Research Workflow as separate
-  handlers (the intents exist but share one handler)
-- PDF parsing and vision were added in **Chapter 3** (Multimodal Ingestion); see
-  "What Chapter 3 adds" below. RAG, embeddings, and vector databases remain out
-  of scope through Chapter 3.
-- Web search, Research Planner, Workflow orchestration, LangGraph
-- Memory, MCP
-- Router confidence scores, hybrid routing, intent-evaluation benchmarks
-
-## What Chapter 3 adds
-
-Chapter 3 introduces an **independent Multimodal Ingestion layer**
-(`insight_agent/ingestion/`). It is a data-processing layer, *not* part of the
-agent's decision loop. Three concept layers stay cleanly separated:
-
-```text
-Intent Router        → decides which high-level path a request takes
-Multimodal Ingestion → decides how material becomes a unified Document
-Agent Loop / Tools   → decides which external capability to call next
+```bash
+curl --fail -X POST \
+  http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
 ```
 
-Five input formats normalize into one shape — `list[Document]`:
+To reproduce a restart safely, submit a long Research Run, stop the service
+while it is `running`, and start it with the same Redis database and
+`CHECKPOINT_PATH`. Startup reconciles a leftover `running` record to
+`interrupted`; call Resume afterward. Other states return HTTP 409 rather than
+starting duplicate work.
 
-| Input | Entry | Documents produced |
-|---------|---------------------------------------|--------------------------------------------------|
-| Text | `ingest("text", inline_text)` | 1 — inline text as content |
-| Markdown | `ingest_file("x.md")` | 1 — raw markdown preserved |
-| PDF | `ingest_file("x.pdf")` | 1 per non-empty page (`metadata.page`/`page_count`) |
-| URL | `ingest("url", "https://…")` | 1 — cleaned visible text (`metadata.title`/`final_url`/`content_type`) |
-| Image (PNG / JPG / JPEG / WEBP) | `ingest_file("x.png")` | 1 — VLM description as content; original path kept in `source` |
+## Fixed five-scenario demo
 
-- `Document`: a plain dataclass with `content` / `source` / `source_type` /
-  `metadata` (see `ingestion.models`).
-- Public API — import from `insight_agent.ingestion`, never from
-  `ingestion.loaders.*`: `ingest`, `ingest_file`, `ingest_text_file`,
-  `infer_file_type`, `safe_ingest`, plus per-format `load_*` escape hatches.
-- Local files are dispatched **by the program** from their extension
-  (`infer_file_type`); the LLM never picks a loader and loaders are **not**
-  registered as Agent tools.
-- Single error type `IngestionError` (a `RuntimeError`); `safe_ingest` wraps any
-  lower-level or third-party exception into it while preserving `__cause__`.
-
-Vision config (images only) reuses the project's single env-var mechanism:
-`VISION_API_KEY`, `VISION_BASE_URL`, `VISION_MODEL` (see `.env.example`). Text /
-Markdown / PDF ingestion needs no API; URL ingestion needs network but no key.
-
-Basic file ingestion:
-
-```python
-from insight_agent.ingestion import documents_to_context, ingest_file
-
-documents = ingest_file("path/to/paper.pdf")
-
-for document in documents:
-    print("source_type:", document.source_type.value)
-    print("source:", document.source)
-    print("metadata:", document.metadata)
-    print("content preview:", document.content[:200])
-
-context = documents_to_context(documents)
-print(context[:500])
-```
-
-Text, Markdown, and PDF files work without API configuration. Image ingestion,
-for example `ingest_file("path/to/chart.png")`, requires `VISION_API_KEY`,
-`VISION_BASE_URL`, and `VISION_MODEL`.
-
-### Temporary context adapter (**not** RAG)
-
-`documents_to_context(documents)` (in `ingestion.context`) renders a
-`list[Document]` into a single `[Document N] / source / source_type / metadata /
-<content>` text block, so the current LLM/Agent stack can consume ingested
-material in small integration tests. It is **not RAG** and does nothing beyond
-string formatting: no chunking, embedding, vector store, retrieval, or ranking;
-no token budget and no context compression (content is dumped verbatim). Do not
-push large Document sets into an Agent context through it.
-
-## What Chapter 3 does NOT implement
-
-Still deliberately out of scope until later chapters:
-
-- Chunking / text splitting
-- Embedding and any vector database
-- Retrieval / a RAG pipeline, token budgets, or context compression
-- OCR and scanned-PDF handling
-- SSRF protection, JS rendering, or login/JS-heavy extraction in the URL loader
-- Registering loaders as LLM tools, or letting the model choose a loader
-- Wiring ingestion into the CLI / `InsightAgent` façade (integration is future work)
-
-## What Chapter 1 does NOT implement
-
-Deliberately out of scope until later chapters:
-
-- RAG, embeddings, vector databases
-- Web search / browsing
-- Vision / multimodal input
-- Planner, multi-agent orchestration
-- Long-term memory, context compaction
-- MCP, hooks, permission system, workspace sandbox
-- Path-traversal protection, file size limits, binary files
-- Retry / timeout / fallback / checkpoint
-- FastAPI or any server component
-- LangGraph, LangChain, OpenAI Agents SDK
-
-## What Chapter 5 adds
-
-Chapter 5 turns the persisted Chapter 4 index into a minimal local Vector RAG
-capability while keeping indexing and querying separate:
-
-```text
-query → embed_documents([query]) → Qdrant top-k search
-      → RetrievalResult → formatted observation → search_knowledge_base
-      → existing ResearchAgent loop
-```
-
-- `insight_agent.retrieval.VectorRetriever` reuses the same configured
-  `SentenceTransformerEmbedder` and `QdrantVectorStore` as indexing.
-- `RetrievalResult` is a query-time model with `score`; the index-time `Chunk`
-  model is unchanged.
-- Qdrant searches request payloads but not stored vectors. Invalid/missing
-  provenance payloads fail explicitly rather than producing partial results.
-- `search_knowledge_base(query, top_k=5)` is registered in the original flat
-  `ToolRegistry` (`1 <= top_k <= 8`) and returns source-aware observations.
-- The Intent Router remains unaware of embeddings and retrieval. It still only
-  selects `direct` / `analyze` / `research`; the ResearchAgent chooses the tool.
-
-The normal query path searches the existing collection and never ingests or
-indexes documents. For a standalone ingestion → indexing → retrieval demo:
+After the real service is ready:
 
 ```bash
 conda run --no-capture-output -n insight-agent \
-  python examples/try_vector_rag.py notes/rag.md "为什么分块需要 overlap？" --top-k 5
+  bash examples/chapter18_demo.sh
 ```
 
-The first sentence-transformer use may download the configured model. Chapter 5
-does not add sparse/hybrid retrieval, reranking, query rewriting, citations,
-web fallback, LangChain, or LangGraph.
-
-## What Chapter 6 adds
-
-Chapter 6 upgrades the same `search_knowledge_base` Tool to Hybrid Retrieval:
-
-```text
-query
-├── dense retrieval ─┐
-└── BM25 retrieval ──┴→ RRF → candidate cutoff → cross-encoder → final top-k
-```
-
-- Qdrant remains the source of truth. At first Tool use, its Chunk payloads are
-  loaded once to build an in-memory BM25 snapshot; queries reuse that snapshot.
-- `HybridRetriever.refresh()` explicitly rebuilds BM25 from Qdrant after
-  indexing. It builds the replacement first and swaps it under a short lock, so
-  a failed refresh leaves the old snapshot usable.
-- BM25 uses the same `jieba`-aware tokenizer for corpus and query text while
-  preserving technical identifiers such as `DEEPSEEK_API_KEY` and file paths.
-  Its positive `log(1 + RSJ)` IDF keeps unique terms useful in very small
-  corpora; Chunks with no searchable tokens remain available to Dense retrieval.
-- RRF uses ranks only and deduplicates by stable `chunk_id`; raw dense and BM25
-  scores are never added together.
-- Only the fused `HYBRID_RERANK_K` candidates reach the configured cross-encoder.
-  `RERANKER_MODEL` is required and has no code fallback. A recommended bilingual
-  choice is `BAAI/bge-reranker-v2-m3`.
-- Stage depths are configured with `HYBRID_DENSE_K`, `HYBRID_SPARSE_K`,
-  `HYBRID_RERANK_K`, `HYBRID_FINAL_TOP_K`, and `HYBRID_RRF_K`. Internal recall
-  depths may exceed eight; only the final Agent-facing Tool argument remains
-  bounded to `1 <= top_k <= 8`. An explicit Tool argument overrides
-  `HYBRID_FINAL_TOP_K`.
-- DEBUG logging and an optional trace callback expose dense, sparse, fused,
-  reranked, and final rankings without adding internal scores to the Agent
-  observation.
-
-The Tool name/schema, Registry, Intent Router, and Agent Loop remain unchanged.
-Query rewriting, citations, web fallback, automatic index-change detection,
-LangChain, and LangGraph remain out of scope.
-
-To manually inspect the dense, sparse, fused, reranked, and final rankings for
-the exact-identifier and semantic example queries:
+The script covers Health/Readiness, material import, Direct, Analyze, explicit
+Research, status, SSE, and offline Evaluation. Resume is opt-in because it needs
+a real interrupted or timed-out run:
 
 ```bash
+INTERRUPTED_RUN_ID=<run-id> \
 conda run --no-capture-output -n insight-agent \
-  python examples/try_hybrid_rag.py notes/config.md notes/chunking.md
+  bash examples/chapter18_demo.sh
 ```
 
-## What Chapter 9 adds
+Provider-backed steps are a manual Smoke Test. An offline pass does not prove
+that a configured external model is reachable.
 
-Chapter 9 turns the Chapter 8 `web_entry` destination into a minimal public-Web
-retrieval path:
+## Offline Evaluation
 
-```text
-Research Task -> Retrieval Router -> WebRetriever
-              -> Tavily Search -> candidate URLs
-              -> existing URL Loader -> Document -> ResearchState.web_results
-```
-
-Tavily is used only to discover candidate pages. The provider explicitly does
-not request Tavily answers, images, or raw page content; selected URLs are
-fetched and cleaned by the existing Chapter 3 URL Loader. Search context is
-added under `search_query`, `search_rank`, `search_title`, `search_snippet`, and
-optional `search_score` without replacing loader metadata such as `title`,
-`final_url`, or `content_type`.
-
-Web Search is optional. Configure it in `.env` to let the runtime advertise
-`web` to the Retrieval Router:
-
-```text
-TAVILY_API_KEY=tvly-...
-WEB_SEARCH_TIMEOUT=30
-WEB_SEARCH_LIMIT=5
-WEB_FETCH_LIMIT=3
-```
-
-Without `TAVILY_API_KEY`, local routing remains available but WEB is omitted
-from `available_sources`. Search-provider failure is an
-explicit error; failure to fetch one candidate page is retained in
-`WebRetrievalResult.failures` while later candidates continue. Results are raw
-retrieval material, not Evidence, Citations, confidence, or a final report.
-
-Chapter 9 does not add query rewriting, multi-query or iterative search,
-Tavily answer/extract/crawl/research APIs, browser automation, source authority
-scoring, Evidence/Citation generation, report generation, or Vision Retrieval.
-
-## What Chapter 10 adds
-
-Chapter 10 turns the existing `vision_entry` into task-conditioned visual
-retrieval:
-
-```text
-Research Task -> Hybrid Retrieval (source_type=image)
-              -> deduplicate original image paths
-              -> reload accessible originals
-              -> task-conditioned VLM analysis
-              -> ResearchState.vision_results[task_id]
-```
-
-The existing image-ingestion path is unchanged: `describe_image(path)` still
-creates the general-purpose description stored in the text index. Vision
-Retrieval searches those descriptions, restores `RetrievalResult.source`, and
-uses a separate prompt containing the plan objective, current task, and user
-constraints. Image text is treated as untrusted data and never as instructions.
-
-`HybridRetriever.retrieve()` now accepts an optional keyword-only
-`source_types` set. Dense retrieval converts it to a Qdrant payload filter, and
-BM25 restricts eligible snapshot chunks before ranking and top-k truncation.
-Omitting the argument preserves the original local-retrieval behavior.
-
-Vision is advertised to the Retrieval Router only when all existing
-`VISION_API_KEY`, `VISION_BASE_URL`, and `VISION_MODEL` settings are present and
-a one-time startup probe finds an indexed image with a readable supported
-original file. The local knowledge tool and Vision Retriever then share the
-same Hybrid Retriever. No per-route knowledge-base scan is performed.
-
-Each task stores a `VisionRetrievalResult` with successful analyses, structured
-per-image failures, and a separate no-candidate state. One missing image or VLM
-failure does not discard successful analyses from other candidates. These
-results are retrieval material, not Evidence or Citations.
-
-A small end-to-end fixture is available at
-[`examples/vision_workflow.png`](examples/vision_workflow.png) (with the
-editable SVG beside it). A representative task is: “Determine whether the
-Local, Web, and Vision paths all converge on the same Advance Task node.”
-
-Chapter 10 does not add CLIP, a second vector store, OCR, crops, bounding boxes,
-a multi-turn Vision Agent, Evidence grading, citations, or report generation.
-
-## What Chapter 16 adds
-
-Chapter 16 wraps the existing checkpointed Research Workflow in a separate,
-single-process runtime:
-
-```text
-POST /v1/research/runs -> Redis Run Registry -> queued
-                       -> asyncio Semaphore -> running
-                       -> existing ResearchCoordinator / SQLite Checkpoint
-                       -> Redis Stream events -> SSE
-```
-
-The runtime keeps `request_id`, `run_id`, and LangGraph `thread_id` separate.
-Redis stores only runtime records and client-facing events; plans, evidence,
-reports, and the canonical `ResearchState` remain in the Chapter 15 SQLite
-checkpointer. A timed-out or interrupted run can be resumed explicitly with its
-original `run_id -> thread_id -> checkpoint` chain. Startup marks stale
-`running` records as `interrupted` but never resumes them automatically.
-
-The current HTTP entrypoint resolves `AppConfig` and calls the shared
-`build_application` once during FastAPI lifespan startup. All requests use that
-application's `ResearchCoordinator`; request handlers do not rebuild the core
-dependencies. The lifespan owns Redis and the Runtime service alongside the
-core application and closes them on shutdown or startup failure.
-
-Start a local Redis, configure the existing model/retrieval settings, then run:
-
-```bash
-conda run --no-capture-output -n insight-agent \
-  uvicorn insight_agent.runtime.app:app
-```
-
-For a disposable development Redis, only Redis needs a container; the
-application and Qdrant Local Mode continue to run in the Conda environment:
-
-```bash
-docker run --rm -p 6379:6379 redis:7-alpine
-```
-
-### Material preparation and operational checks
-
-The controlled upload entry point accepts Markdown, TXT, and PDF. PNG, JPEG,
-and WEBP are accepted only when all `VISION_*` settings are present. The server
-streams the file into `MATERIAL_UPLOAD_DIR`, enforces `MATERIAL_MAX_BYTES`,
-generates the stored name from SHA-256, then runs ingestion, chunking,
-embedding, Qdrant upsert, and BM25 refresh.
-
-```bash
-curl -F 'file=@./notes.md' http://127.0.0.1:8000/v1/materials
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/ready
-```
-
-`material_id` is a content/import tracking identifier, not a retrieval scope;
-local queries still search the shared collection. No URL ingestion endpoint is
-exposed. Qdrant remains in Local Mode and the process owns one client for
-`QDRANT_PATH`, avoiding competing embedded-store locks.
-
-`/health` checks HTTP liveness only. `/ready` checks the existing Redis,
-Qdrant, SQLite checkpoint, and validated configuration. Optional Web/Vision
-configuration is reported separately without model calls or network searches.
-
-This backend still has no authentication, authorization, tenant isolation, or
-rate limiting. Because it accepts files, do not expose it directly to an
-untrusted public network; use a trusted interface or an authenticated,
-upload-limiting gateway.
-
-Create and observe a run:
-
-```bash
-curl -X POST http://127.0.0.1:8000/v1/research/runs \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"Compare the main Agent Memory designs"}'
-
-curl http://127.0.0.1:8000/v1/research/runs/<run_id>
-curl -N http://127.0.0.1:8000/v1/research/runs/<run_id>/events
-curl -X POST http://127.0.0.1:8000/v1/research/runs/<run_id>/resume
-```
-
-`AppConfig.runtime` contains the Redis connection and execution policy;
-`AppConfig.checkpoint` contains the research checkpoint path:
-
-| Setting | Default | Purpose |
-|---|---|---|
-| `CHECKPOINT_PATH` | `.insight_agent/checkpoints.sqlite` | LangGraph research checkpoint database |
-| `RUNTIME_REDIS_URL` | `redis://localhost:6379/0` | Runtime records and event streams |
-| `RUNTIME_MAX_CONCURRENCY` | `2` | Concurrent research runs in this process |
-| `RUNTIME_RUN_TIMEOUT_SECONDS` | `900` | Run execution timeout in seconds |
-| `RUNTIME_EVENT_TTL_SECONDS` | `86400` | Event stream retention in seconds |
-| `RUNTIME_INFRA_RETRY_ATTEMPTS` | `3` | Maximum infrastructure operation attempts |
-| `RUNTIME_INFRA_RETRY_BACKOFF_SECONDS` | `0.2` | Infrastructure retry backoff in seconds |
-| `MATERIAL_UPLOAD_DIR` | `.data/materials` | Controlled server-side material storage |
-| `MATERIAL_MAX_BYTES` | `20971520` | Maximum bytes accepted per upload |
-
-This chapter intentionally does not add
-authentication, distributed workers, automatic resume, WebSockets, or
-exactly-once execution.
-
-## What Chapter 17 adds
-
-Chapter 17 keeps Evaluation outside the production Research Workflow. The
-runner loads a fixed JSONL Dataset, calls the Retriever directly for Cases
-tagged `retrieval`, and calls an injected Workflow Runner directly for Cases
-tagged `research`; it does not use FastAPI, SSE, or Redis. The production
-adapter invokes the existing Planner and `ResearchRoutingWorkflow` without a
-checkpoint configuration, while the checked-in smoke run uses an explicitly
-labelled fake workflow.
-
-Run the fully network-blocked Offline Mock Test with recorded search hits,
-recorded page bodies, and the existing repository-local Vision image:
-
-```bash
-conda run --no-capture-output -n insight-agent \
-  python -m evals \
-  --dataset eval_data/research_eval_smoke_v1.jsonl \
-  --fixture evals/fixtures/smoke_v1.json \
-  --mode offline \
-  --output eval_results/runs
-```
-
-Use `--case <case-id>` to select one or more Cases. The CLI also accepts
-`--dataset-version`, `--model`, `--prompt-version`, `--index-version`,
-`--top-k`, and `--run-id`. Every run records the Git commit, Dataset version
-and SHA-256, model, Prompt version, Index version, Retriever configuration,
-mode, Evaluation type, and a canonical configuration fingerprint.
-
-Generated artifacts have this shape:
-
-```text
-eval_results/runs/<eval-run-id>/
-├── run.json
-├── bad_cases.json
-└── cases/<safe-case-id>/
-    ├── result.json
-    └── artifacts.json
-```
-
-`result.json` retains each Judge execution status and reason, structural
-errors, layer results, runtime metrics, and Case-level execution errors.
-`artifacts.json` retains the necessary raw workflow material. A failed Case
-does not discard later Cases. Aggregate quality denominators include only
-computed metrics and completed Judge labels; `not_computable`, `timeout`,
-invalid output, backend errors, and runtime failures remain separately
-counted. Token or call usage that cannot be observed is stored as `null`, not
-estimated.
-
-The smoke Dataset contains only traceable labels. Its Gold retrieval ID names
-an entry in `smoke-index-v1`, its Web required point cites the fixed recorded
-page, and the unlabeled Vision dimension is deliberately skipped. Offline
-mode installs a socket/DNS guard around each Case, so Web Search, page fetches,
-external LLM Judges, VLMs, Embeddings, and other network model clients cannot
-silently escape the fixture boundary.
-
-These outputs are **Mock Test** results and do not establish InsightAgent's
-real research quality. Live Tests require separately assembled real Retriever,
-Workflow, Judge, VLM, and Embedding components and must be labelled
-`live_test`; the fixture CLI intentionally refuses `--mode live` rather than
-misrepresenting recorded outputs as real-model results.
-
-### Bad Cases, Baselines, and Regression
-
-Each completed Evaluation Run writes a versioned `bad_cases.json`. Confirmed
-semantic or deterministic failures are classified as `retrieval_miss`,
-`rerank_drop`, `evidence_noise`, `evidence_gap`, `unsupported_claim`,
-`citation_error`, or `constraint_violation`; Case execution failures use the
-separate `runtime_failure` category. Judge timeout/backend/invalid-output
-states and missing Gold Labels are reported as Evaluation anomalies, not
-silently converted into Agent quality failures.
-
-Baseline creation is a separate, explicit operation and never occurs during a
-normal run:
+The supported entry point is the top-level `evals` package. This recorded
+fixture needs no Redis, FastAPI, or external API:
 
 ```bash
 conda run --no-capture-output -n insight-agent python -m evals \
-  --register-baseline eval_results/runs/<eval-run-id> \
-  --baseline-output eval_results/baselines/research-smoke-v1.json \
+  --dataset eval_data/research_eval_smoke_v1.jsonl \
+  --fixture evals/fixtures/smoke_v1.json \
+  --mode offline \
+  --output /tmp/insight-agent-eval/runs \
+  --run-id chapter18-candidate
+```
+
+The CLI labels the result `MOCK TEST`; it does not measure real-model quality.
+Baseline registration is explicit:
+
+```bash
+conda run --no-capture-output -n insight-agent python -m evals \
+  --register-baseline /tmp/insight-agent-eval/runs/chapter18-candidate \
+  --baseline-output /tmp/insight-agent-eval/baseline.json \
   --baseline-kind mock_only \
   --confirm-baseline
 ```
 
-`mock_test` Runs can only become `mock_only` Baselines. They are useful for
-verifying the harness and recorded-fixture behavior, but cannot be registered
-as real-quality Baselines. Existing Baselines are not overwritten unless
-`--overwrite-baseline` is supplied explicitly.
-
-Compare an already-persisted Candidate without rerunning the workflow or any
-Judge:
+Compare the candidate:
 
 ```bash
 conda run --no-capture-output -n insight-agent python -m evals \
-  --baseline eval_results/baselines/research-smoke-v1.json \
-  --candidate eval_results/runs/<candidate-run-id> \
+  --baseline /tmp/insight-agent-eval/baseline.json \
+  --candidate /tmp/insight-agent-eval/runs/chapter18-candidate \
   --policy evals/policies/default_v1.json \
-  --report-output eval_results/reports/<candidate-run-id>
+  --report-output /tmp/insight-agent-eval/reports
 ```
 
-The comparator requires matching Dataset version/content, Case IDs, Gold IDs,
-fixture identity, Evaluation mode/type, and the Index version used by Gold
-retrieval labels. Model, Prompt, Git commit, and Reranker changes remain
-comparable because they are the system changes Regression is intended to
-measure. Missing metrics stay missing rather than becoming zero. Policy
-actions decide whether missing metrics and Evaluation infrastructure errors
-are ignored, regressions, or inconclusive.
+Comparison exits with 0 pass, 1 regression, 2 incompatible, or 3 inconclusive.
 
-The command writes stable `regression.json` and `regression.md` reports. Exit
-codes are `0` for pass, `1` for regression, `2` for incompatible/configuration
-errors, and `3` for inconclusive comparisons.
+## Tests
 
-At this point the Chapter 17 Evaluation infrastructure is implemented: fixed
-Datasets and fixtures, layered evaluators, structured artifacts, Bad Cases,
-explicit Baselines, policy-driven comparison, and reports. Real-model quality
-is **not** validated by the checked-in Mock Test; that requires a separately
-assembled and reviewed `live_test` Run with real components and human-audited
-labels/Judge outcomes.
+```bash
+conda run --no-capture-output -n insight-agent python -m pytest -q
+```
+
+Tests use fake LLM/provider components, in-memory runtime stores, temporary
+files, and temporary SQLite checkpoints. External provider Smoke Tests remain
+manual and are not reported as successful when credentials or models are
+unavailable.
+
+## Final HTTP API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | HTTP liveness |
+| `GET` | `/ready` | Required and optional dependency readiness |
+| `POST` | `/v1/materials` | Multipart material import and indexing |
+| `POST` | `/v1/query` | Unified Direct / Analyze / Research entry |
+| `POST` | `/v1/research/runs` | Explicit asynchronous Research creation |
+| `GET` | `/v1/research/runs/{run_id}` | Run status and final report |
+| `GET` | `/v1/research/runs/{run_id}/events` | SSE progress/replay |
+| `POST` | `/v1/research/runs/{run_id}/resume` | Resume interrupted/timed-out work |
+
+Every HTTP response includes `X-Request-ID`.
+
+## Engineering limits
+
+- The Research Runtime is single-process; Redis persists public state, but this
+  release has no distributed worker queue.
+- SQLite checkpoint storage is local. Multiple replicas need a shared
+  checkpoint strategy before horizontal scaling.
+- The knowledge index is shared; `/v1/query` has no per-material filter.
+- Material preparation is synchronous to the client, although blocking
+  ingestion/indexing is moved off the event loop.
+- Authentication, authorization, rate limiting, and production TLS termination
+  are deployment responsibilities outside this repository.
