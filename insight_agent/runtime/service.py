@@ -58,8 +58,8 @@ class ResearchRuntimeService:
         self._semaphore = asyncio.Semaphore(policy.max_concurrency)
         self._resume_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[None]] = set()
-        self._execution_owners: dict[str, str] = {}
-        self._thread_owners: dict[str, str] = {}
+        self._execution_owners: dict[str, tuple[str, object]] = {}
+        self._thread_owners: dict[str, tuple[str, object]] = {}
         self._accepting = True
 
     async def create_run(
@@ -192,7 +192,8 @@ class ResearchRuntimeService:
                     safe_data = {"stage": stage, **data}
                     await self._append(running, "workflow.progress", safe_data)
 
-                self._claim_execution(record)
+                execution_owner = object()
+                self._claim_execution(record, execution_owner)
                 try:
                     execution_task = asyncio.create_task(
                         self.runner.run(
@@ -202,6 +203,11 @@ class ResearchRuntimeService:
                             on_progress=on_progress,
                         ),
                         name=f"research-workflow:{record.run_id}",
+                    )
+                    execution_task.add_done_callback(
+                        lambda _task: self._release_execution(
+                            record, execution_owner
+                        )
                     )
                     try:
                         async with asyncio.timeout(
@@ -242,7 +248,7 @@ class ResearchRuntimeService:
                             await self._drain_execution(execution_task, record)
                         raise
                 finally:
-                    self._release_execution(record)
+                    self._release_execution(record, execution_owner)
 
                 completed = await self._update(
                     record.run_id,
@@ -310,18 +316,21 @@ class ResearchRuntimeService:
                 )
                 return
 
-    def _claim_execution(self, record: RunRecord) -> None:
+    def _claim_execution(self, record: RunRecord, owner: object) -> None:
         if self._has_local_execution(record):
             raise InvalidRunState(
                 f"run {record.run_id} is still executing locally"
             )
-        self._execution_owners[record.run_id] = record.thread_id
-        self._thread_owners[record.thread_id] = record.run_id
+        self._execution_owners[record.run_id] = (record.thread_id, owner)
+        self._thread_owners[record.thread_id] = (record.run_id, owner)
 
-    def _release_execution(self, record: RunRecord) -> None:
-        if self._execution_owners.get(record.run_id) == record.thread_id:
+    def _release_execution(self, record: RunRecord, owner: object) -> None:
+        if self._execution_owners.get(record.run_id) == (
+            record.thread_id,
+            owner,
+        ):
             self._execution_owners.pop(record.run_id, None)
-        if self._thread_owners.get(record.thread_id) == record.run_id:
+        if self._thread_owners.get(record.thread_id) == (record.run_id, owner):
             self._thread_owners.pop(record.thread_id, None)
 
     def _has_local_execution(self, record: RunRecord) -> bool:

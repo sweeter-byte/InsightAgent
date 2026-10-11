@@ -334,6 +334,21 @@ async def test_resume_is_rejected_while_timed_out_sync_workflow_is_alive() -> No
         await service.close()
 
 
+def test_stale_execution_cleanup_preserves_new_owner() -> None:
+    runner = ControlledRunner()
+    service, _, _ = _service(runner)
+    record = RunRecord.new(run_id="run-a", thread_id="thread-a")
+    first_owner = object()
+    second_owner = object()
+
+    service._claim_execution(record, first_owner)
+    service._release_execution(record, first_owner)
+    service._claim_execution(record, second_owner)
+    service._release_execution(record, first_owner)
+
+    assert service._has_local_execution(record)
+
+
 @pytest.mark.asyncio
 async def test_semaphore_limits_actual_concurrent_runner_calls() -> None:
     runner = ControlledRunner()
