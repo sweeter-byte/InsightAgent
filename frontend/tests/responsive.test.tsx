@@ -22,7 +22,7 @@ describe("responsive workspace structure", () => {
     render(<InsightWorkbench />);
 
     await user.click(screen.getByRole("button", { name: "打开资料区" }));
-    expect(screen.getByText("2 条会话内 Mock 资料 · 当前为共享知识库"))
+    expect(screen.getByText("会话资料仅在本页保留 · 当前为共享知识库"))
       .toBeInTheDocument();
   });
 });

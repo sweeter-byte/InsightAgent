@@ -6,7 +6,7 @@ import { InsightWorkbench } from "@/components/workbench/insight-workbench";
 
 describe("run state presentation", () => {
   it("shows only observed coarse events while running", () => {
-    render(<InsightWorkbench initialScenario="running" />);
+    render(<InsightWorkbench demoScenario="running" />);
 
     expect(screen.getAllByText("执行中").length).toBeGreaterThan(0);
     expect(screen.getByText("run.queued")).toBeInTheDocument();
@@ -17,7 +17,7 @@ describe("run state presentation", () => {
 
   it("reveals the Markdown report and sources when completed", async () => {
     const user = userEvent.setup();
-    render(<InsightWorkbench initialScenario="running" />);
+    render(<InsightWorkbench demoScenario="running" />);
 
     await user.click(screen.getByRole("button", { name: "完成" }));
     expect(screen.getAllByText("已完成").length).toBeGreaterThan(0);
@@ -26,7 +26,7 @@ describe("run state presentation", () => {
   });
 
   it("shows error details without enabling resume for failed runs", () => {
-    render(<InsightWorkbench initialScenario="failed" />);
+    render(<InsightWorkbench demoScenario="failed" />);
 
     expect(screen.getAllByText("失败").length).toBeGreaterThan(0);
     expect(screen.getAllByText("ResearchExecutionError").length).toBeGreaterThan(0);
@@ -34,7 +34,7 @@ describe("run state presentation", () => {
   });
 
   it("enables the static resume affordance only for recoverable states", () => {
-    render(<InsightWorkbench initialScenario="interrupted" />);
+    render(<InsightWorkbench demoScenario="interrupted" />);
 
     expect(screen.getAllByText("可恢复").length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "恢复运行" })).toBeEnabled();

@@ -10,6 +10,14 @@ export const queryRequestSchema = z
   })
   .strict();
 
+export const createResearchRunRequestSchema = queryRequestSchema;
+
+export const apiErrorSchema = z
+  .object({
+    detail: z.string(),
+  })
+  .strict();
+
 export const queryResponseSchema = z
   .object({
     request_id: identifierSchema,

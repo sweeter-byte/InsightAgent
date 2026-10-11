@@ -14,6 +14,14 @@ export const directQueryResponseFixture = {
   run_id: null,
 } as const;
 
+export const analyzeQueryResponseFixture = {
+  request_id: "request-analyze-1",
+  intent: "analyze",
+  status: "completed",
+  answer: "analyze answer",
+  run_id: null,
+} as const;
+
 export const researchQueryResponseFixture = {
   request_id: "request-research-1",
   intent: "research",
@@ -67,6 +75,20 @@ export const readinessResponseFixture = {
   },
   optional: {
     web: { status: "available", detail: null },
+    vision: { status: "unconfigured", detail: null },
+  },
+} as const;
+
+export const notReadyResponseFixture = {
+  status: "not_ready",
+  required: {
+    redis: { status: "unavailable", detail: "redis unavailable" },
+    qdrant: { status: "ready", detail: null },
+    checkpoint: { status: "ready", detail: null },
+    config: { status: "ready", detail: null },
+  },
+  optional: {
+    web: { status: "unconfigured", detail: null },
     vision: { status: "unconfigured", detail: null },
   },
 } as const;

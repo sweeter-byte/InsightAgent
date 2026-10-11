@@ -1,22 +1,49 @@
 import { ArrowUp, BookOpen, Check, CircleDashed, Sparkles } from "lucide-react";
-import type { Dispatch, SetStateAction } from "react";
 
 import type { PreviewScenario, ScenarioView } from "./mock-data";
 import { SectionLabel } from "./section-label";
+import type {
+  AsyncPhase,
+  ConfirmedRun,
+  SynchronousAnswer,
+} from "./workbench-types";
 
-type QueryMode = "smart" | "research";
+export type QueryMode = "smart" | "research";
+
+type ResearchWorkspaceProps = {
+  mode: QueryMode;
+  onModeChange: (mode: QueryMode) => void;
+  scenario?: PreviewScenario;
+  view?: ScenarioView;
+  canSubmit?: boolean;
+  question?: string;
+  onQuestionChange?: (value: string) => void;
+  onSubmit?: () => void;
+  submissionPhase?: AsyncPhase;
+  submissionError?: string | null;
+  answer?: SynchronousAnswer | null;
+  run?: ConfirmedRun | null;
+};
 
 export function ResearchWorkspace({
   mode,
   onModeChange,
   scenario,
   view,
-}: {
-  mode: QueryMode;
-  onModeChange: Dispatch<SetStateAction<QueryMode>>;
-  scenario: PreviewScenario;
-  view: ScenarioView;
-}) {
+  canSubmit = false,
+  question = "",
+  onQuestionChange,
+  onSubmit,
+  submissionPhase = "idle",
+  submissionError,
+  answer,
+  run,
+}: ResearchWorkspaceProps) {
+  const isDemo = view !== undefined && scenario !== undefined;
+  const presentation = isDemo
+    ? view
+    : livePresentation(submissionPhase, submissionError, run);
+
   return (
     <main
       className="research-main"
@@ -28,14 +55,17 @@ export function ResearchWorkspace({
           <p className="eyebrow">INSIGHT / 研究工作台</p>
           <h1>把问题变成可核查的研究</h1>
         </div>
-        <div className="mock-flag"><CircleDashed size={14} /> Mock 协议预览</div>
+        <div className="mock-flag">
+          <CircleDashed size={14} /> {isDemo ? "Demo 协议预览" : "真实 HTTP 接口"}
+        </div>
       </header>
 
-      <section className="composer" aria-labelledby="composer-title">
+      <section className="composer" aria-label="查询输入">
         <div className="mode-switch" role="group" aria-label="查询模式">
           <button
             type="button"
             aria-pressed={mode === "smart"}
+            disabled={submissionPhase === "submitting"}
             onClick={() => onModeChange("smart")}
           >
             <Sparkles size={15} /> 智能提问
@@ -43,6 +73,7 @@ export function ResearchWorkspace({
           <button
             type="button"
             aria-pressed={mode === "research"}
+            disabled={submissionPhase === "submitting"}
             onClick={() => onModeChange("research")}
           >
             <BookOpen size={15} /> 深度研究
@@ -51,63 +82,178 @@ export function ResearchWorkspace({
         <label id="composer-title" htmlFor="research-question">研究问题</label>
         <textarea
           id="research-question"
-          defaultValue="比较 Direct、Analyze 与多步 Research 三种路径，并说明它们各自适用的任务边界。"
+          value={question}
+          onChange={(event) => onQuestionChange?.(event.currentTarget.value)}
           rows={4}
         />
         <div className="composer__footer">
-          <p>{mode === "research" ? "异步 Research Run · HTTP + SSE" : "由后端 Intent Router 决定 Direct / Analyze"}</p>
-          <button className="submit-button" type="button" disabled>
-            下一阶段接入 <ArrowUp size={16} />
+          <p>
+            {mode === "research"
+              ? "显式创建异步 Research Run"
+              : "由后端 Intent Router 决定 Direct / Analyze / Research"}
+          </p>
+          <button
+            className="submit-button"
+            type="button"
+            disabled={!canSubmit || !question.trim()}
+            onClick={onSubmit}
+          >
+            {submissionPhase === "submitting"
+              ? mode === "research"
+                ? "正在提交 Research Run…"
+                : "正在提交智能提问…"
+              : mode === "research"
+                ? "提交深度研究"
+                : "提交智能提问"}
+            <ArrowUp size={16} />
           </button>
         </div>
+        {submissionError && <p className="composer-error" role="alert">{submissionError}</p>}
       </section>
 
-      <section className={`run-banner run-banner--${view.statusTone}`} aria-live="polite">
+      <section className={`run-banner run-banner--${presentation.statusTone}`} aria-live="polite">
         <div className="run-banner__signal" aria-hidden="true"><span /></div>
         <div>
           <p>RESEARCH RUN</p>
-          <strong>{view.statusLabel}</strong>
-          <span>{view.statusDetail}</span>
+          <strong>{presentation.statusLabel}</strong>
+          <span>{presentation.statusDetail}</span>
         </div>
-        <code>{view.runId ?? "NO RUN"}</code>
+        <code>{presentation.runId ?? "NO RUN"}</code>
       </section>
 
       <section className="answer-strip" aria-label="快速回答区域">
         <SectionLabel index="03" title="Direct / Analyze" />
         <div className="answer-strip__body">
           <span className="answer-strip__mark"><Check size={15} /></span>
-          <p><strong>同步回答区域</strong><br />`/v1/query` 的 Direct 或 Analyze 文本将在这里展示。</p>
-          <span>等待接入</span>
+          {answer ? (
+            <p><strong>{answer.text}</strong><br />智能提问已由后端同步完成。</p>
+          ) : (
+            <p><strong>同步回答区域</strong><br />Direct 或 Analyze 的真实回答将在这里展示。</p>
+          )}
+          <span>{answer ? `INTENT · ${answer.intent}` : "等待回答"}</span>
         </div>
       </section>
 
       <section className="research-output" aria-label="研究输出">
         <SectionLabel
           index="04"
-          title={scenario === "completed" ? "Final Report" : "Research Activity"}
-          action={<span className="section-caption">MARKDOWN / UTF-8</span>}
+          title={isDemo && scenario === "completed" ? "Final Report" : "Research Activity"}
+          action={<span className="section-caption">SUBMISSION FACTS</span>}
         />
-        {scenario === "completed" ? <MockReport /> : <ResearchActivity scenario={scenario} view={view} />}
+        {isDemo ? (
+          scenario === "completed"
+            ? <MockReport />
+            : <DemoResearchActivity scenario={scenario} view={view} />
+        ) : (
+          <LiveResearchActivity run={run} />
+        )}
       </section>
     </main>
   );
 }
 
-function ResearchActivity({ scenario, view }: { scenario: PreviewScenario; view: ScenarioView }) {
+function livePresentation(
+  phase: AsyncPhase,
+  error: string | null | undefined,
+  run: ConfirmedRun | null | undefined,
+): ScenarioView {
+  if (phase === "submitting") {
+    return {
+      statusLabel: "正在提交",
+      statusDetail: "等待后端确认请求。",
+      statusTone: "active",
+      runStatus: "submitting",
+      runId: null,
+      threadId: null,
+      error: null,
+      canResume: false,
+      events: [],
+    };
+  }
+  if (phase === "failed") {
+    return {
+      statusLabel: "提交失败",
+      statusDetail: error ?? "请求未能完成。",
+      statusTone: "danger",
+      runStatus: "failed",
+      runId: null,
+      threadId: null,
+      error: error ?? null,
+      canResume: false,
+      events: [],
+    };
+  }
+  if (run) {
+    return {
+      statusLabel: "任务已提交",
+      statusDetail:
+        run.source === "smart"
+          ? "Intent Router 已创建 Research Run；状态观察尚未接入。"
+          : "已显式创建 Research Run；状态观察尚未接入。",
+      statusTone: "success",
+      runStatus: run.status,
+      runId: run.runId,
+      threadId: run.threadId,
+      error: null,
+      canResume: false,
+      events: [],
+    };
+  }
+  return {
+    statusLabel: "尚未提交",
+    statusDetail: "提交后仅展示后端已确认的运行标识。",
+    statusTone: "neutral",
+    runStatus: "—",
+    runId: null,
+    threadId: null,
+    error: null,
+    canResume: false,
+    events: [],
+  };
+}
+
+function LiveResearchActivity({ run }: { run?: ConfirmedRun | null }) {
+  if (!run) {
+    return (
+      <div className="empty-state">
+        <BookOpen size={22} />
+        <h3>尚无研究运行</h3>
+        <p>提交深度研究或由智能提问进入 Research 后显示真实 Run ID。</p>
+      </div>
+    );
+  }
+  return (
+    <div className="activity-sheet">
+      <div className="activity-sheet__header">
+        <span>Research 任务已进入后端</span>
+        <code>{run.status}</code>
+      </div>
+      <p className="honesty-note">状态观察尚未接入。</p>
+      <p className="honesty-note">本阶段不推断 running、completed、事件、Citation 或最终报告。</p>
+    </div>
+  );
+}
+
+function DemoResearchActivity({
+  scenario,
+  view,
+}: {
+  scenario: PreviewScenario;
+  view: ScenarioView;
+}) {
   if (scenario === "idle") {
     return (
       <div className="empty-state">
         <BookOpen size={22} />
         <h3>尚无研究运行</h3>
-        <p>提交深度研究后，真实事件与最终报告会在此出现。</p>
+        <p>这是显式 Demo 场景。</p>
       </div>
     );
   }
-
   return (
     <div className="activity-sheet">
       <div className="activity-sheet__header">
-        <span>当前仅展示可证实的运行事实</span>
+        <span>Demo 中的粗粒度运行事实</span>
         <code>{view.events.length} EVENTS</code>
       </div>
       <p className="honesty-note">后端尚未提供节点级进度，因此不展示百分比、Planner 子任务或 Evidence 节点状态。</p>

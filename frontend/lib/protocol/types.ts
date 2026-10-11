@@ -1,7 +1,9 @@
 import type { z } from "zod";
 
 import type {
+  apiErrorSchema,
   componentReadinessSchema,
+  createResearchRunRequestSchema,
   healthResponseSchema,
   materialImportResultSchema,
   queryRequestSchema,
@@ -13,6 +15,10 @@ import type {
   sseEventSchema,
 } from "./schemas";
 
+export type ApiErrorBody = z.infer<typeof apiErrorSchema>;
+export type CreateResearchRunRequest = z.infer<
+  typeof createResearchRunRequestSchema
+>;
 export type QueryRequest = z.infer<typeof queryRequestSchema>;
 export type QueryResponse = z.infer<typeof queryResponseSchema>;
 export type MaterialImportResult = z.infer<typeof materialImportResultSchema>;

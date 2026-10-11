@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { InsightWorkbench } from "@/components/workbench/insight-workbench";
 
 describe("InsightWorkbench", () => {
-  it("renders the three research regions and the phase-one boundary", () => {
+  it("renders the three research regions with the real HTTP boundary", () => {
     render(<InsightWorkbench />);
 
     expect(screen.getByText("InsightAgent")).toBeInTheDocument();
@@ -13,7 +13,8 @@ describe("InsightWorkbench", () => {
     expect(screen.getByRole("main", { name: "研究工作区" })).toBeInTheDocument();
     expect(screen.getByRole("complementary", { name: "运行检查器" })).toBeInTheDocument();
     expect(screen.getByText("共享知识库")).toBeInTheDocument();
-    expect(screen.getByText("Mock 协议预览")).toBeInTheDocument();
+    expect(screen.getByText("真实 HTTP 接口")).toBeInTheDocument();
+    expect(screen.queryByText("Demo 状态预览")).not.toBeInTheDocument();
   });
 
   it("switches between smart query and deep research modes with buttons", async () => {
@@ -33,6 +34,14 @@ describe("InsightWorkbench", () => {
     render(<InsightWorkbench />);
 
     expect(screen.getByLabelText("选择研究资料"));
-    expect(screen.getByText("仅为会话内 Mock 记录，不代表持久化资料列表。"));
+    expect(screen.getByText("资料记录仅保存在当前浏览器会话，刷新页面后会清空。"));
+    expect(screen.queryByText("chapter18-runtime.md")).not.toBeInTheDocument();
+  });
+
+  it("renders mock scenarios only when demo mode is explicit", () => {
+    render(<InsightWorkbench demoScenario="completed" />);
+
+    expect(screen.getByText("Demo 状态预览")).toBeInTheDocument();
+    expect(screen.getByText("Mock 内容")).toBeInTheDocument();
   });
 });
