@@ -137,6 +137,37 @@ describe("streamResearchEvents", () => {
     );
   });
 
+  it("cancels an acquired stream reader when the request signal aborts", async () => {
+    let resolveStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      resolveStarted = resolve;
+    });
+    const cancel = vi.fn();
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode(": connected\n\n"));
+          resolveStarted();
+        },
+        cancel,
+      }),
+      { headers: { "Content-Type": "text/event-stream" } },
+    );
+    const controller = new AbortController();
+    const streaming = streamResearchEvents({
+      runId: "run-1",
+      signal: controller.signal,
+      onEvent: vi.fn(),
+      fetchImpl: fetchReturning(response),
+    });
+    await started;
+
+    controller.abort();
+
+    await streaming;
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it.each([undefined, ""])(
     "omits Last-Event-ID when its value is %s",
     async (lastEventId) => {

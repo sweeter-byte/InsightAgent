@@ -98,6 +98,13 @@ export async function streamResearchEvents({
   if (!response.body) throw new SseProtocolError();
 
   const reader = response.body.getReader();
+  const cancelReader = () => {
+    void reader.cancel(signal?.reason).catch(() => {
+      // The transport may have already errored the stream for the same abort.
+    });
+  };
+  signal?.addEventListener("abort", cancelReader, { once: true });
+  if (signal?.aborted) cancelReader();
   const decoder = new TextDecoder();
   const parser = createSseParser((frame, metadata) => {
     let event: SseEvent;
@@ -140,6 +147,7 @@ export async function streamResearchEvents({
     }
     throw error;
   } finally {
+    signal?.removeEventListener("abort", cancelReader);
     reader.releaseLock();
   }
 }
