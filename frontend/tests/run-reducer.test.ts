@@ -35,6 +35,16 @@ function event(
 }
 
 describe("runReducer", () => {
+  it("observes a queued event from an unknown initial status", () => {
+    const state = runReducer(selectRun(initialRunState, "run-1"), {
+      type: "event",
+      runId: "run-1",
+      event: event("queued", "run.queued"),
+    });
+
+    expect(state.observedStatus).toBe("queued");
+  });
+
   it("observes queued record, started event, and completed event", () => {
     let state = selectRun(initialRunState, "run-1");
     const queued = record("run-1");
