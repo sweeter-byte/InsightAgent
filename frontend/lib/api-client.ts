@@ -24,7 +24,8 @@ export const apiRoutes = {
   materials: "/v1/materials",
   query: "/v1/query",
   researchRuns: "/v1/research/runs",
-  researchRun: (runId: string) => `/v1/research/runs/${runId}`,
+  researchRun: (runId: string) =>
+    `/v1/research/runs/${encodeURIComponent(runId)}`,
   researchEvents: (runId: string) => `/v1/research/runs/${runId}/events`,
   researchResume: (runId: string) => `/v1/research/runs/${runId}/resume`,
 } as const;
@@ -161,6 +162,14 @@ export const api = {
       path: apiRoutes.researchRuns,
       schema: runRecordSchema,
       init: jsonRequest(body, signal),
+    });
+  },
+
+  getResearchRun(runId: string, signal?: AbortSignal): Promise<RunRecord> {
+    return requestJson({
+      path: apiRoutes.researchRun(runId),
+      schema: runRecordSchema,
+      init: { signal, cache: "no-store" },
     });
   },
 };

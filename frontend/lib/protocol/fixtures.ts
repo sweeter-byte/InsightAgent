@@ -48,11 +48,36 @@ export const queuedRunFixture = {
   final_output: null,
 } as const;
 
+export const runningRunFixture = {
+  ...queuedRunFixture,
+  status: "running",
+  updated_at: "2026-01-18T09:00:05Z",
+} as const;
+
 export const completedRunFixture = {
   ...queuedRunFixture,
   status: "completed",
   updated_at: "2026-01-18T09:03:12Z",
   final_output: "# Research Report\n\nOffline acceptance report.",
+} as const;
+
+export const failedRunFixture = {
+  ...queuedRunFixture,
+  status: "failed",
+  updated_at: "2026-01-18T09:00:42Z",
+  error: "RuntimeError",
+} as const;
+
+export const timedOutRunFixture = {
+  ...queuedRunFixture,
+  status: "timed_out",
+  updated_at: "2026-01-18T09:02:05Z",
+} as const;
+
+export const interruptedRunFixture = {
+  ...queuedRunFixture,
+  status: "interrupted",
+  updated_at: "2026-01-18T09:01:17Z",
 } as const;
 
 export const runtimeEventFixture = {

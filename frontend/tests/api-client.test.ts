@@ -1,7 +1,12 @@
 import { http, HttpResponse } from "msw";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { ApiNetworkError, ApiProtocolError, api } from "@/lib/api-client";
+import {
+  ApiHttpError,
+  ApiNetworkError,
+  ApiProtocolError,
+  api,
+} from "@/lib/api-client";
 import {
   healthResponseFixture,
   materialImportResultFixture,
@@ -106,6 +111,83 @@ describe("API client", () => {
       queuedRunFixture,
     );
     expect(receivedJson).toEqual({ query: "compare systems" });
+  });
+
+  it("gets an authoritative research run without using the browser cache", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    mockServer.use(
+      http.get(`${appBase}/v1/research/runs/demo-run`, () =>
+        HttpResponse.json(queuedRunFixture),
+      ),
+    );
+
+    try {
+      await expect(api.getResearchRun("demo-run")).resolves.toEqual(
+        queuedRunFixture,
+      );
+      expect(fetchSpy).toHaveBeenCalledWith(
+        `${appBase}/v1/research/runs/demo-run`,
+        expect.objectContaining({ cache: "no-store" }),
+      );
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("URL-encodes the research run identifier at the route boundary", async () => {
+    const runId = "run/with spaces?and#symbols";
+    let requestedUrl: string | undefined;
+    mockServer.use(
+      http.get(`${appBase}/v1/research/runs/*`, ({ request }) => {
+        requestedUrl = request.url;
+        return HttpResponse.json(queuedRunFixture);
+      }),
+    );
+
+    await expect(api.getResearchRun(runId)).resolves.toEqual(queuedRunFixture);
+    expect(requestedUrl).toBe(
+      `${appBase}/v1/research/runs/run%2Fwith%20spaces%3Fand%23symbols`,
+    );
+  });
+
+  it("preserves a 404 response as an ApiHttpError", async () => {
+    mockServer.use(
+      http.get(`${appBase}/v1/research/runs/missing-run`, () =>
+        HttpResponse.json({ detail: "run not found" }, { status: 404 }),
+      ),
+    );
+
+    const error = await api.getResearchRun("missing-run").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(ApiHttpError);
+    expect(error).toEqual(
+      expect.objectContaining({
+        name: "ApiHttpError",
+        status: 404,
+        detail: "run not found",
+      }),
+    );
+  });
+
+  it("rejects a malformed successful research run response", async () => {
+    mockServer.use(
+      http.get(`${appBase}/v1/research/runs/malformed-run`, () =>
+        HttpResponse.json({ run_id: "malformed-run" }),
+      ),
+    );
+
+    await expect(api.getResearchRun("malformed-run")).rejects.toBeInstanceOf(
+      ApiProtocolError,
+    );
+  });
+
+  it("preserves AbortError when fetching a research run is cancelled", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      api.getResearchRun("demo-run", controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
   });
 
   it("distinguishes HTTP, network, and protocol failures", async () => {
