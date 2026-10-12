@@ -26,7 +26,8 @@ export const apiRoutes = {
   researchRuns: "/v1/research/runs",
   researchRun: (runId: string) =>
     `/v1/research/runs/${encodeURIComponent(runId)}`,
-  researchEvents: (runId: string) => `/v1/research/runs/${runId}/events`,
+  researchEvents: (runId: string) =>
+    `/v1/research/runs/${encodeURIComponent(runId)}/events`,
   researchResume: (runId: string) => `/v1/research/runs/${runId}/resume`,
 } as const;
 
