@@ -136,6 +136,16 @@ describe("run state presentation", () => {
     expect(screen.queryByText(/Chapter 18/)).not.toBeInTheDocument();
   });
 
+  it("treats an empty completed final_output as an available report", () => {
+    renderLive(liveState("completed", {
+      record: runRecord("completed", { final_output: "" }),
+    }));
+
+    expect(screen.getByText("最终报告可用")).toBeInTheDocument();
+    expect(screen.getByTestId("report-preview")).toBeEmptyDOMElement();
+    expect(screen.getByTestId("report-preview")).toHaveClass("report-preview");
+  });
+
   it("does not mistake a workflow stage named completed for terminal run status", () => {
     const progress = { id: "3-0", event: "workflow.progress", data: { stage: "completed" } };
     renderLive(liveState("running", {

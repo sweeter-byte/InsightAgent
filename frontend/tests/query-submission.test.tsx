@@ -118,7 +118,7 @@ describe("query submission", () => {
       }),
       http.get(eventsEndpoint, () => {
         eventCalls += 1;
-        return new Promise<Response>(() => undefined);
+        return eventStream("id: explicit-complete\nevent: run.completed\ndata: {}\n\n");
       }),
     );
     const { user } = await renderReadyWorkbench();
@@ -126,10 +126,10 @@ describe("query submission", () => {
 
     await user.click(screen.getByRole("button", { name: "提交深度研究" }));
 
-    expect((await screen.findAllByText("任务已排队")).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("demo-run").length).toBeGreaterThan(0);
     expect(screen.getAllByText("demo-thread").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("queued").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("completed").length).toBeGreaterThan(0);
     expect(body).toEqual({ query: "compare systems" });
     expect(queryCalls).toBe(0);
     await waitFor(() => expect(eventCalls).toBe(1));
@@ -207,7 +207,6 @@ describe("query submission", () => {
         await delay(100);
         return HttpResponse.json(queuedRunFixture, { status: 202 });
       }),
-      http.get(eventsEndpoint, () => new Promise<Response>(() => undefined)),
     );
     const { user } = await renderReadyWorkbench();
     await screen.findAllByText("运行不存在");

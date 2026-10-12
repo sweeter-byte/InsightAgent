@@ -1,10 +1,134 @@
 import { useLayoutEffect } from "react";
-import { act, renderHook, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { act, render, renderHook, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { http, HttpResponse } from "msw";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { InsightWorkbench } from "@/components/workbench/insight-workbench";
 import type { ObserveResearchRunOptions } from "@/components/workbench/run-observer";
+import { RESEARCH_RUN_STORAGE_KEY } from "@/components/workbench/run-selection";
 import { useResearchRun } from "@/components/workbench/use-research-run";
+import {
+  completedRunFixture,
+  queuedRunFixture,
+} from "@/lib/protocol/fixtures";
 import type { RunRecord, SseEvent } from "@/lib/protocol/types";
+
+import { mockServer } from "./mocks/server";
+
+const runEndpoint = "http://localhost:3000/v1/research/runs";
+
+function sseFrame(id: string, event: string, data: Record<string, unknown> = {}): string {
+  return `id: ${id}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function finiteEventStream(chunks: string[]): Response {
+  const encoder = new TextEncoder();
+  return new HttpResponse(
+    new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    }),
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+}
+
+function controlledEventStream() {
+  const encoder = new TextEncoder();
+  let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+  let stopped = false;
+  let resolveAborted!: () => void;
+  const aborted = new Promise<void>((resolve) => {
+    resolveAborted = resolve;
+  });
+  const markStopped = () => {
+    if (stopped) return;
+    stopped = true;
+    resolveAborted();
+  };
+  const closeForAbort = () => {
+    if (stopped) return;
+    try {
+      controller?.close();
+    } catch {
+      // The consumer may have canceled the stream in the same turn.
+    }
+    markStopped();
+  };
+  const stream = new ReadableStream<Uint8Array>({
+    start(next) {
+      controller = next;
+    },
+    cancel() {
+      markStopped();
+    },
+  });
+  return {
+    response(signal: AbortSignal): Response {
+      signal.addEventListener("abort", () => {
+        closeForAbort();
+      }, { once: true });
+      controller?.enqueue(encoder.encode(": stream-open\n\n"));
+      return new HttpResponse(stream, {
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    },
+    observeClientSignal(signal: AbortSignal | null | undefined) {
+      signal?.addEventListener("abort", closeForAbort, { once: true });
+    },
+    enqueue(frame: string): boolean {
+      if (stopped || !controller) return false;
+      controller.enqueue(encoder.encode(frame));
+      return true;
+    },
+    close() {
+      if (stopped || !controller) return;
+      stopped = true;
+      controller.close();
+    },
+    aborted,
+    get stopped() {
+      return stopped;
+    },
+  };
+}
+
+function observeEventFetchSignals(
+  onSignal: (url: string, signal: AbortSignal | null | undefined) => void,
+) {
+  const realFetch = globalThis.fetch.bind(globalThis);
+  return vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+    const url = input instanceof Request ? input.url : String(input);
+    if (url.includes("/v1/research/runs/") && url.endsWith("/events")) {
+      onSignal(url, init?.signal);
+      // MSW's Node interceptor asserts internally if an open mock socket is
+      // completed after Undici has already processed the abort. The real
+      // application signal is observed above; a non-aborting transport signal
+      // lets the controlled stream close cleanly in the same abort turn.
+      const transport = new AbortController();
+      init?.signal?.addEventListener("abort", () => {
+        window.setTimeout(() => transport.abort(), 0);
+      }, { once: true });
+      return realFetch(input, { ...init, signal: transport.signal });
+    }
+    return realFetch(input, init);
+  });
+}
+
+async function renderReadyWorkbench() {
+  const user = userEvent.setup();
+  const result = render(<InsightWorkbench />);
+  await screen.findByText("后端已就绪");
+  return { user, ...result };
+}
+
+async function setQuestion(user: ReturnType<typeof userEvent.setup>, value: string) {
+  const input = screen.getByLabelText("研究问题");
+  await user.clear(input);
+  await user.type(input, value);
+}
 
 type Observer = (options: ObserveResearchRunOptions) => Promise<void>;
 
@@ -29,6 +153,9 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+beforeEach(() => sessionStorage.clear());
+afterEach(() => vi.restoreAllMocks());
 
 describe("useResearchRun", () => {
   it("selects and observes a run with one positive generation", async () => {
@@ -378,5 +505,186 @@ describe("useResearchRun", () => {
     act(() => current.onNotFound?.("run-new"));
     expect(onNotFound).toHaveBeenCalledWith("run-new");
     unmount();
+  });
+});
+
+describe("InsightWorkbench live run observation", () => {
+  it("renders the complete explicit Research lifecycle from a real chunked SSE stream", async () => {
+    const streamText = [
+      sseFrame("1-0", "run.queued"),
+      sseFrame("2-0", "run.started", { resume: false }),
+      sseFrame("3-0", "workflow.progress", {
+        stage: "planning",
+        message: "Building the evidence plan",
+      }),
+      sseFrame("4-0", "run.completed", { final_output: "present" }),
+    ].join("");
+    const chunks = [
+      streamText.slice(0, 17),
+      streamText.slice(17, 73),
+      streamText.slice(73, 151),
+      streamText.slice(151),
+    ];
+    let getCalls = 0;
+    mockServer.use(
+      http.post(runEndpoint, () => HttpResponse.json(queuedRunFixture, { status: 202 })),
+      http.get(`${runEndpoint}/demo-run/events`, () => finiteEventStream(chunks)),
+      http.get(`${runEndpoint}/demo-run`, () => {
+        getCalls += 1;
+        return HttpResponse.json(completedRunFixture);
+      }),
+    );
+    const { user } = await renderReadyWorkbench();
+    await setQuestion(user, "Trace the complete lifecycle");
+
+    await user.click(screen.getByRole("button", { name: "提交深度研究" }));
+
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
+    expect(screen.getByText("workflow.progress · planning")).toBeInTheDocument();
+    expect(screen.getAllByText("Building the evidence plan").length).toBeGreaterThan(0);
+    expect(screen.getByText("THREAD ID").nextElementSibling).toHaveTextContent("demo-thread");
+    expect(screen.getAllByText("SSE 已连接").length).toBeGreaterThan(0);
+    const eventList = document.querySelector(".event-list");
+    expect(eventList).not.toBeNull();
+    const items = within(eventList as HTMLElement).getAllByRole("listitem");
+    expect(items).toHaveLength(4);
+    expect(items.map((item) => item.textContent)).toEqual([
+      expect.stringContaining("1-0run.queued"),
+      expect.stringContaining("2-0run.started"),
+      expect.stringContaining("3-0workflow.progress · planning"),
+      expect.stringContaining("4-0run.completed"),
+    ]);
+    const report = screen.getByTestId("report-preview");
+    expect(report).toHaveTextContent("# Research Report");
+    expect(report.tagName).toBe("PRE");
+    expect(screen.queryByRole("heading", { name: "Research Report" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/Chapter 18|\[1\]|\d+%|Planner Task|Evidence Grader|Retriever/)).not.toBeInTheDocument();
+    expect(getCalls).toBe(1);
+  });
+
+  it("restores a genuinely submitted run after unmount and remount", async () => {
+    const firstStream = controlledEventStream();
+    let firstClientSignalSeen = false;
+    const fetchSpy = observeEventFetchSignals((url, signal) => {
+      if (!firstClientSignalSeen && url.includes("restore-run")) {
+        firstClientSignalSeen = true;
+        firstStream.observeClientSignal(signal);
+      }
+    });
+    const restoredRun = {
+      ...queuedRunFixture,
+      run_id: "restore-run",
+      thread_id: "restore-thread",
+    };
+    const completedRestoredRun = {
+      ...completedRunFixture,
+      run_id: "restore-run",
+      thread_id: "restore-thread",
+    };
+    let eventCalls = 0;
+    let getCalls = 0;
+    mockServer.use(
+      http.post(runEndpoint, () => HttpResponse.json(restoredRun, { status: 202 })),
+      http.get(`${runEndpoint}/restore-run/events`, ({ request }) => {
+        eventCalls += 1;
+        if (eventCalls === 1) return firstStream.response(request.signal);
+        return finiteEventStream([
+          sseFrame("restored-start", "run.started"),
+          sseFrame("restored-complete", "run.completed"),
+        ]);
+      }),
+      http.get(`${runEndpoint}/restore-run`, () => {
+        getCalls += 1;
+        return HttpResponse.json(getCalls === 1 ? restoredRun : completedRestoredRun);
+      }),
+    );
+    const first = await renderReadyWorkbench();
+    await setQuestion(first.user, "Persist this exact run");
+    await first.user.click(screen.getByRole("button", { name: "提交深度研究" }));
+    await waitFor(() => expect(eventCalls).toBe(1));
+    await waitFor(() => expect(firstClientSignalSeen).toBe(true));
+    expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBe("restore-run");
+
+    first.unmount();
+    await firstStream.aborted;
+    render(<InsightWorkbench />);
+
+    expect(await screen.findByText("重新挂载后任务文本不可用")).toBeInTheDocument();
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
+    expect(screen.getByText("THREAD ID").nextElementSibling).toHaveTextContent("restore-thread");
+    expect(eventCalls).toBe(2);
+    expect(getCalls).toBe(2);
+    fetchSpy.mockRestore();
+  });
+
+  it("aborts the old live stream when two Research runs are submitted rapidly", async () => {
+    const oldStream = controlledEventStream();
+    let oldClientSignalSeen = false;
+    const fetchSpy = observeEventFetchSignals((url, signal) => {
+      if (url.includes("old-run")) {
+        oldClientSignalSeen = true;
+        oldStream.observeClientSignal(signal);
+      }
+    });
+    const oldRun = { ...queuedRunFixture, run_id: "old-run", thread_id: "old-thread" };
+    const newRun = { ...queuedRunFixture, run_id: "new-run", thread_id: "new-thread" };
+    const completedNewRun = {
+      ...completedRunFixture,
+      run_id: "new-run",
+      thread_id: "new-thread",
+      final_output: "NEW REPORT",
+    };
+    let postCalls = 0;
+    mockServer.use(
+      http.post(runEndpoint, () => {
+        postCalls += 1;
+        return HttpResponse.json(postCalls === 1 ? oldRun : newRun, { status: 202 });
+      }),
+      http.get(`${runEndpoint}/old-run/events`, ({ request }) => oldStream.response(request.signal)),
+      http.get(`${runEndpoint}/new-run/events`, () => finiteEventStream([
+        sseFrame("new-start", "run.started"),
+        sseFrame("new-complete", "run.completed"),
+      ])),
+      http.get(`${runEndpoint}/new-run`, () => HttpResponse.json(completedNewRun)),
+    );
+    const { user } = await renderReadyWorkbench();
+    await setQuestion(user, "Old question");
+    await user.click(screen.getByRole("button", { name: "提交深度研究" }));
+    await screen.findAllByText("old-run");
+    await waitFor(() => expect(oldClientSignalSeen).toBe(true));
+    await setQuestion(user, "New question");
+    await user.click(screen.getByRole("button", { name: "提交深度研究" }));
+
+    await oldStream.aborted;
+    expect(oldStream.enqueue(sseFrame("old-failed", "run.failed", { error: "OLD ERROR" }))).toBe(false);
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("new-run").length).toBeGreaterThan(0);
+    expect(screen.getByTestId("report-preview")).toHaveTextContent("NEW REPORT");
+    expect(screen.queryByText("old-failed")).not.toBeInTheDocument();
+    expect(screen.queryByText("OLD ERROR")).not.toBeInTheDocument();
+    fetchSpy.mockRestore();
+  });
+
+  it("aborts an open real SSE request when the workbench unmounts", async () => {
+    const stream = controlledEventStream();
+    let clientSignalSeen = false;
+    const fetchSpy = observeEventFetchSignals((_url, signal) => {
+      clientSignalSeen = true;
+      stream.observeClientSignal(signal);
+    });
+    mockServer.use(
+      http.post(runEndpoint, () => HttpResponse.json(queuedRunFixture, { status: 202 })),
+      http.get(`${runEndpoint}/demo-run/events`, ({ request }) => stream.response(request.signal)),
+    );
+    const workbench = await renderReadyWorkbench();
+    await workbench.user.click(screen.getByRole("button", { name: "提交深度研究" }));
+    await screen.findAllByText("demo-run");
+    await waitFor(() => expect(clientSignalSeen).toBe(true));
+
+    workbench.unmount();
+
+    await stream.aborted;
+    expect(stream.stopped).toBe(true);
+    fetchSpy.mockRestore();
   });
 });

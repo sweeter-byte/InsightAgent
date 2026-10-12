@@ -258,7 +258,8 @@ function LiveResearchActivity({
   const progress = scopedState?.latestProgress;
   const stage = typeof progress?.stage === "string" ? progress.stage : null;
   const message = typeof progress?.message === "string" ? progress.message : null;
-  const finalOutput = status === "completed" ? scopedState?.record?.final_output : null;
+  const finalOutput = scopedState?.record?.final_output;
+  const hasFinalOutput = status === "completed" && finalOutput !== null && finalOutput !== undefined;
   return (
     <div className="activity-sheet">
       <div className="activity-sheet__header">
@@ -269,10 +270,10 @@ function LiveResearchActivity({
         {connectionLabel(scopedState?.connection ?? "idle")}
       </span>
       {stage && <p className="progress-fact"><strong>{stage}</strong>{message && <span>{message}</span>}</p>}
-      {finalOutput ? (
+      {hasFinalOutput ? (
         <div>
           <p className="honesty-note">最终报告可用</p>
-          <pre className="report-preview">{finalOutput}</pre>
+          <pre className="report-preview" data-testid="report-preview" aria-label="最终报告纯文本">{finalOutput}</pre>
         </div>
       ) : (
         <p className="honesty-note">仅展示后端已返回的运行事实；引用来源尚不可用。</p>
