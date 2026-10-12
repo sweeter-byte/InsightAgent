@@ -86,10 +86,12 @@ export async function streamResearchEvents({
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const parser = createSseParser((frame) => {
+  const parser = createSseParser((frame, metadata) => {
     let event: SseEvent;
     try {
-      if (!frame.id) throw new Error("SSE event is missing an id");
+      if (!metadata.hasExplicitId || !frame.id) {
+        throw new Error("SSE event is missing an id");
+      }
       event = sseEventSchema.parse({
         id: frame.id,
         event: frame.event,

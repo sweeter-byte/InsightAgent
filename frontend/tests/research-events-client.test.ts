@@ -230,6 +230,52 @@ describe("streamResearchEvents", () => {
     expect(onEvent).not.toHaveBeenCalled();
   });
 
+  it("rejects a data frame that only inherits the preceding frame's id", async () => {
+    const onEvent = vi.fn();
+
+    await expect(
+      streamResearchEvents({
+        runId: "run-1",
+        onEvent,
+        fetchImpl: fetchReturning(
+          eventStream([
+            'id: first\nevent: update\ndata: {"sequence":1}\n\n' +
+              'event: update\ndata: {"sequence":2}\n\n',
+          ]),
+        ),
+      }),
+    ).rejects.toBeInstanceOf(SseProtocolError);
+    expect(onEvent).toHaveBeenCalledOnce();
+    expect(onEvent).toHaveBeenCalledWith({
+      id: "first",
+      event: "update",
+      data: { sequence: 1 },
+    });
+  });
+
+  it("dispatches a later frame that explicitly repeats the preceding id", async () => {
+    const onEvent = vi.fn();
+
+    await expect(
+      streamResearchEvents({
+        runId: "run-1",
+        onEvent,
+        fetchImpl: fetchReturning(
+          eventStream([
+            'id: repeated\nevent: update\ndata: {"sequence":1}\n\n' +
+              'id: repeated\nevent: update\ndata: {"sequence":2}\n\n',
+          ]),
+        ),
+      }),
+    ).resolves.toBeUndefined();
+    expect(onEvent).toHaveBeenCalledTimes(2);
+    expect(onEvent).toHaveBeenNthCalledWith(2, {
+      id: "repeated",
+      event: "update",
+      data: { sequence: 2 },
+    });
+  });
+
   it("classifies a fetch rejection as SseNetworkError", async () => {
     const fetchImpl = vi
       .fn<typeof fetch>()

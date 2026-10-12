@@ -102,6 +102,25 @@ describe("createSseParser", () => {
     ]);
   });
 
+  it("does not leak an id-only frame's explicit-id metadata into the next data frame", () => {
+    const received: Array<{
+      event: ParsedSseFrame;
+      metadata: { hasExplicitId: boolean };
+    }> = [];
+    const parser = createSseParser((event, metadata) => {
+      received.push({ event, metadata });
+    });
+
+    parser.feed("id: cursor-only\n\ndata: later\n\n");
+
+    expect(received).toEqual([
+      {
+        event: { id: "cursor-only", event: "message", data: "later" },
+        metadata: { hasExplicitId: false },
+      },
+    ]);
+  });
+
   it("clears the latest event id with an empty id field", () => {
     const { events, parser } = collectEvents();
 

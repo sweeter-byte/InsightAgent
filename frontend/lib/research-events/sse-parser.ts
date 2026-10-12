@@ -4,10 +4,15 @@ export type ParsedSseFrame = {
   data: string;
 };
 
+export type ParsedSseFrameMetadata = {
+  hasExplicitId: boolean;
+};
+
 type FrameState = {
   event: string;
   dataLines: string[];
   hasData: boolean;
+  hasExplicitId: boolean;
 };
 
 function emptyFrame(): FrameState {
@@ -15,11 +20,15 @@ function emptyFrame(): FrameState {
     event: "message",
     dataLines: [],
     hasData: false,
+    hasExplicitId: false,
   };
 }
 
 export function createSseParser(
-  onEvent: (event: ParsedSseFrame) => void,
+  onEvent: (
+    event: ParsedSseFrame,
+    metadata: ParsedSseFrameMetadata,
+  ) => void,
 ): { feed(chunk: string): void; finish(): void } {
   let lineBuffer = "";
   let frame = emptyFrame();
@@ -27,6 +36,7 @@ export function createSseParser(
   let finished = false;
 
   function dispatchFrame() {
+    const metadata = { hasExplicitId: frame.hasExplicitId };
     const eventToDispatch = frame.hasData
       ? {
           id: lastEventId,
@@ -38,7 +48,7 @@ export function createSseParser(
     frame = emptyFrame();
 
     if (eventToDispatch) {
-      onEvent(eventToDispatch);
+      onEvent(eventToDispatch, metadata);
     }
   }
 
@@ -70,6 +80,7 @@ export function createSseParser(
       case "id":
         if (!value.includes("\0")) {
           lastEventId = value;
+          frame.hasExplicitId = true;
         }
         break;
     }
