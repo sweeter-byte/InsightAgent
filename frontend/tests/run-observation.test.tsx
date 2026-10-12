@@ -1,3 +1,4 @@
+import { useLayoutEffect } from "react";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
@@ -316,6 +317,45 @@ describe("useResearchRun", () => {
     act(() => observation.onNotFound?.("run-1"));
     expect(firstCallback).not.toHaveBeenCalled();
     expect(latestCallback).toHaveBeenCalledWith("run-1");
+    unmount();
+  });
+
+  it("updates the not-found callback before later layout effects run", async () => {
+    let observation: ObserveResearchRunOptions | undefined;
+    const observe = vi.fn<Observer>((options) => {
+      observation = options;
+      return new Promise(() => undefined);
+    });
+    const firstCallback = vi.fn();
+    const latestCallback = vi.fn();
+    const callbacks = [firstCallback, latestCallback];
+    const { result, rerender, unmount } = renderHook(
+      ({ callbackIndex, trigger }: { callbackIndex: number; trigger: boolean }) => {
+        const state = useResearchRun(
+          { runId: "run-1" },
+          {
+            observe,
+            onNotFound: (runId) => callbacks[callbackIndex](runId),
+          },
+        );
+        useLayoutEffect(() => {
+          if (trigger) observation?.onNotFound?.("run-1");
+        }, [callbackIndex, trigger]);
+        return state;
+      },
+      { initialProps: { callbackIndex: 0, trigger: false } },
+    );
+    await waitFor(() => expect(observe).toHaveBeenCalledTimes(1));
+    const activeObservation = observe.mock.calls[0][0];
+    const generation = activeObservation.generation;
+
+    rerender({ callbackIndex: 1, trigger: true });
+
+    expect(firstCallback).not.toHaveBeenCalled();
+    expect(latestCallback).toHaveBeenCalledWith("run-1");
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(activeObservation.signal.aborted).toBe(false);
+    expect(result.current.generation).toBe(generation);
     unmount();
   });
 });

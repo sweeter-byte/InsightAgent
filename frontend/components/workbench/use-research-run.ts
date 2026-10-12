@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useReducer, useRef } from "react";
+import { useEffect, useLayoutEffect, useReducer, useRef } from "react";
 
 import {
   observeResearchRun,
@@ -48,7 +48,7 @@ export function useResearchRun(
   const runId = selection?.runId ?? null;
   const initialRecord = selection?.initialRecord;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     onNotFoundRef.current = options.onNotFound;
   }, [options.onNotFound]);
 
