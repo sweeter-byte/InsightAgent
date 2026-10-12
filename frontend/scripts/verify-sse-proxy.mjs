@@ -214,18 +214,12 @@ async function main() {
     abortController.abort();
     await abortReader.cancel(abortController.signal.reason).catch(() => {});
     console.log("PASS headers: text/event-stream and no-cache");
-    try {
-      await withTimeout(
-        backend.firstRequestAborted,
-        1_000,
-        "upstream connection remained open",
-      );
-      console.log("PASS abort: backend observed the proxied connection close");
-    } catch {
-      console.warn(
-        "WARN abort: frontend proxy did not promptly close the upstream socket",
-      );
-    }
+    await withTimeout(
+      backend.firstRequestAborted,
+      1_000,
+      "upstream connection remained open",
+    );
+    console.log("PASS abort: backend observed the proxied connection close");
 
     const startedAt = performance.now();
     const response = await fetch(
