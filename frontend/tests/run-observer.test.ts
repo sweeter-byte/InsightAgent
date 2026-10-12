@@ -276,6 +276,89 @@ describe("observeResearchRun", () => {
     );
   });
 
+  it("reconnects with the last cursor when reconciliation GET fails temporarily", async () => {
+    const h = harness();
+    const getRun = vi
+      .fn()
+      .mockResolvedValueOnce(record("running"))
+      .mockRejectedValueOnce(new ApiNetworkError())
+      .mockResolvedValueOnce(record("completed"));
+    const streamEvents = vi
+      .fn()
+      .mockImplementationOnce(async ({ onEvent }) => {
+        onEvent(event("cursor-1", "run.started"));
+        throw new SseNetworkError();
+      })
+      .mockResolvedValueOnce(undefined);
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+      wait,
+    });
+
+    expect(streamEvents).toHaveBeenCalledTimes(2);
+    expect(streamEvents.mock.calls[1]?.[0].lastEventId).toBe("cursor-1");
+    expect(wait).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledWith(500, expect.any(AbortSignal));
+    expect(h.state().observedStatus).toBe("completed");
+  });
+
+  it("recovers from a temporary initial GET failure before opening the stream", async () => {
+    const h = harness();
+    const getRun = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiHttpError(503, "private detail"))
+      .mockResolvedValueOnce(record("running"))
+      .mockResolvedValueOnce(record("completed"));
+    const streamEvents = vi.fn().mockResolvedValue(undefined);
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+      wait,
+    });
+
+    expect(getRun).toHaveBeenCalledTimes(3);
+    expect(streamEvents).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledOnce();
+    expect(wait).toHaveBeenCalledWith(500, expect.any(AbortSignal));
+    expect(h.state().observedStatus).toBe("completed");
+    expect(h.state().observedStatus).not.toBe("failed");
+  });
+
+  it("bounds retries when every initial GET fails temporarily", async () => {
+    const h = harness();
+    const getRun = vi.fn().mockRejectedValue(new ApiProtocolError());
+    const streamEvents = vi.fn();
+    const wait = vi.fn().mockResolvedValue(undefined);
+
+    await observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+      wait,
+    });
+
+    expect(getRun).toHaveBeenCalledTimes(reconnectDelays.length + 1);
+    expect(wait.mock.calls.map(([ms]) => ms)).toEqual([...reconnectDelays]);
+    expect(streamEvents).not.toHaveBeenCalled();
+    expect(h.state().observedStatus).not.toBe("failed");
+  });
+
   it("stops immediately when reconciliation finds a terminal run", async () => {
     const h = harness();
     const getRun = vi

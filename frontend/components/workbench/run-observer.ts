@@ -41,6 +41,11 @@ type UnscopedRunAction<Action = RunAction> = Action extends RunAction
   ? Omit<Action, "runId" | "generation">
   : never;
 
+type FetchRecordResult =
+  | { kind: "record"; record: RunRecord }
+  | { kind: "not_found" }
+  | { kind: "retryable_failure" };
+
 function abortError(): Error {
   const error = new Error("Aborted");
   error.name = "AbortError";
@@ -144,20 +149,20 @@ export async function observeResearchRun({
     });
   };
 
-  const fetchRecord = async (): Promise<RunRecord | null> => {
+  const fetchRecord = async (): Promise<FetchRecordResult> => {
     try {
       const current = await getRun(runId, signal);
       if (signal.aborted) throw abortError();
       send({ type: "record", record: current });
-      return current;
+      return { kind: "record", record: current };
     } catch (error) {
       if (isAbort(error, signal)) throw error;
       if (error instanceof ApiHttpError && error.status === 404) {
         reportNotFound();
-        return null;
+        return { kind: "not_found" };
       }
       reportFailure(error);
-      return null;
+      return { kind: "retryable_failure" };
     }
   };
 
@@ -167,7 +172,21 @@ export async function observeResearchRun({
       current = initialRecord;
       send({ type: "record", record: current });
     } else {
-      current = await fetchRecord();
+      current = null;
+      for (
+        let initialAttempt = 0;
+        initialAttempt <= reconnectDelays.length;
+        initialAttempt += 1
+      ) {
+        const result = await fetchRecord();
+        if (result.kind === "not_found") return;
+        if (result.kind === "record") {
+          current = result.record;
+          break;
+        }
+        if (initialAttempt === reconnectDelays.length) return;
+        await wait(reconnectDelays[initialAttempt]!, signal);
+      }
     }
 
     if (current === null || isTerminalRunStatus(current.status)) return;
@@ -242,8 +261,15 @@ export async function observeResearchRun({
         });
       }
 
-      current = await fetchRecord();
-      if (current === null || isTerminalRunStatus(current.status)) return;
+      const reconciliation = await fetchRecord();
+      if (reconciliation.kind === "not_found") return;
+      if (
+        reconciliation.kind === "record" &&
+        isTerminalRunStatus(reconciliation.record.status)
+      ) {
+        return;
+      }
+      if (reconciliation.kind === "record") current = reconciliation.record;
       if (streamFailure === null && terminalCandidate) {
         send({
           type: "connection",
