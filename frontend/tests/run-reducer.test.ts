@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   initialRunState,
@@ -35,10 +35,52 @@ function event(
 }
 
 describe("runReducer", () => {
+  it("ignores stale actions when the same run ID is selected again", () => {
+    const firstSelection = selectRun(initialRunState, "run-1", 1);
+    const secondSelection = selectRun(firstSelection, "run-1", 2);
+
+    expect(secondSelection.generation).toBe(2);
+    expect(
+      runReducer(secondSelection, {
+        type: "record",
+        runId: "run-1",
+        generation: 1,
+        record: record("run-1", "completed"),
+      }),
+    ).toBe(secondSelection);
+    expect(
+      runReducer(secondSelection, {
+        type: "event",
+        runId: "run-1",
+        generation: 1,
+        event: event("stale-event", "run.completed"),
+      }),
+    ).toBe(secondSelection);
+    expect(
+      runReducer(secondSelection, {
+        type: "connection",
+        runId: "run-1",
+        generation: 1,
+        connection: "disconnected",
+        error: "stale disconnect",
+      }),
+    ).toBe(secondSelection);
+    expect(
+      runReducer(secondSelection, {
+        type: "connection",
+        runId: "run-1",
+        generation: 1,
+        connection: "not_found",
+        error: "stale not found",
+      }),
+    ).toBe(secondSelection);
+  });
+
   it("observes a queued event from an unknown initial status", () => {
-    const state = runReducer(selectRun(initialRunState, "run-1"), {
+    const state = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("queued", "run.queued"),
     });
 
@@ -46,12 +88,13 @@ describe("runReducer", () => {
   });
 
   it("observes queued record, started event, and completed event", () => {
-    let state = selectRun(initialRunState, "run-1");
+    let state = selectRun(initialRunState, "run-1", 1);
     const queued = record("run-1");
 
     state = runReducer(state, {
       type: "record",
       runId: "run-1",
+      generation: 1,
       record: queued,
     });
     expect(state.record).toBe(queued);
@@ -60,6 +103,7 @@ describe("runReducer", () => {
     state = runReducer(state, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("event-1", "run.started"),
     });
     expect(state.observedStatus).toBe("running");
@@ -67,6 +111,7 @@ describe("runReducer", () => {
     state = runReducer(state, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("event-2", "run.completed"),
     });
     expect(state.observedStatus).toBe("completed");
@@ -79,9 +124,10 @@ describe("runReducer", () => {
     ["run.timed_out", "timed_out"],
     ["run.interrupted", "interrupted"],
   ] as const)("maps %s to %s", (eventName, status) => {
-    const state = runReducer(selectRun(initialRunState, "run-1"), {
+    const state = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("terminal", eventName),
     });
 
@@ -90,15 +136,17 @@ describe("runReducer", () => {
 
   it("keeps workflow.progress data verbatim without treating completed stage as terminal", () => {
     const progress = { stage: "completed", detail: { sources: 3 } };
-    const running = runReducer(selectRun(initialRunState, "run-1"), {
+    const running = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "record",
       runId: "run-1",
+      generation: 1,
       record: record("run-1", "running"),
     });
 
     const state = runReducer(running, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("progress-1", "workflow.progress", progress),
     });
 
@@ -108,9 +156,10 @@ describe("runReducer", () => {
   });
 
   it("appends unknown events without changing execution status", () => {
-    const running = runReducer(selectRun(initialRunState, "run-1"), {
+    const running = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "record",
       runId: "run-1",
+      generation: 1,
       record: record("run-1", "running"),
     });
     const unknown = event("unknown-1", "source.found", { url: "/source" });
@@ -118,6 +167,7 @@ describe("runReducer", () => {
     const state = runReducer(running, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: unknown,
     });
 
@@ -127,15 +177,17 @@ describe("runReducer", () => {
 
   it("deduplicates event IDs without updating event-derived state", () => {
     const progress = event("same-id", "workflow.progress", { stage: "search" });
-    const first = runReducer(selectRun(initialRunState, "run-1"), {
+    const first = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: progress,
     });
 
     const duplicate = runReducer(first, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("same-id", "run.completed", { stage: "completed" }),
     });
 
@@ -146,13 +198,43 @@ describe("runReducer", () => {
     expect(duplicate.observedStatus).toBeNull();
   });
 
+  it("clones event collections without mutating the previous state", () => {
+    const previous = selectRun(initialRunState, "run-1", 1);
+    const previousEvents = previous.events;
+    const previousSeenEventIds = previous.seenEventIds;
+
+    const next = runReducer(previous, {
+      type: "event",
+      runId: "run-1",
+      generation: 1,
+      event: event("event-1", "run.started"),
+    });
+
+    expect(previous.events).toBe(previousEvents);
+    expect(previous.events).toEqual([]);
+    expect(previous.seenEventIds).toBe(previousSeenEventIds);
+    expect(previous.seenEventIds.has("event-1")).toBe(false);
+    expect(next.events).not.toBe(previousEvents);
+    expect(next.seenEventIds).not.toBe(previousSeenEventIds);
+  });
+
+  it("exposes event collections as readonly types", () => {
+    expectTypeOf(initialRunState.events).toMatchTypeOf<readonly SseEvent[]>();
+    expectTypeOf(initialRunState.events).not.toMatchTypeOf<SseEvent[]>();
+    expectTypeOf(initialRunState.seenEventIds).toMatchTypeOf<
+      ReadonlySet<string>
+    >();
+    expectTypeOf(initialRunState.seenEventIds).not.toMatchTypeOf<Set<string>>();
+  });
+
   it("ignores every stale-run action by object identity", () => {
-    const state = selectRun(initialRunState, "run-current");
+    const state = selectRun(initialRunState, "run-current", 1);
 
     expect(
       runReducer(state, {
         type: "record",
         runId: "run-old",
+        generation: 1,
         record: record("run-old", "completed"),
       }),
     ).toBe(state);
@@ -160,6 +242,7 @@ describe("runReducer", () => {
       runReducer(state, {
         type: "event",
         runId: "run-old",
+        generation: 1,
         event: event("old-event", "run.completed"),
       }),
     ).toBe(state);
@@ -167,6 +250,7 @@ describe("runReducer", () => {
       runReducer(state, {
         type: "connection",
         runId: "run-old",
+        generation: 1,
         connection: "protocol_error",
         error: "old error",
       }),
@@ -174,26 +258,29 @@ describe("runReducer", () => {
   });
 
   it("defends against a record whose run_id mismatches the action", () => {
-    const state = selectRun(initialRunState, "run-1");
+    const state = selectRun(initialRunState, "run-1", 1);
 
     expect(
       runReducer(state, {
         type: "record",
         runId: "run-1",
+        generation: 1,
         record: record("run-other", "completed"),
       }),
     ).toBe(state);
   });
 
   it("does not regress running or terminal state during queued replay", () => {
-    const running = runReducer(selectRun(initialRunState, "run-1"), {
+    const running = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("started", "run.started"),
     });
     const replayedQueued = runReducer(running, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("queued-late", "run.queued"),
     });
     expect(replayedQueued.observedStatus).toBe("running");
@@ -201,16 +288,19 @@ describe("runReducer", () => {
     const terminal = runReducer(replayedQueued, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("completed", "run.completed"),
     });
     const replayedStarted = runReducer(terminal, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("started-late", "run.started"),
     });
     const queuedAfterTerminal = runReducer(replayedStarted, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("queued-later", "run.queued"),
     });
 
@@ -219,14 +309,16 @@ describe("runReducer", () => {
   });
 
   it("allows terminal events to replace a prior terminal observation", () => {
-    const completed = runReducer(selectRun(initialRunState, "run-1"), {
+    const completed = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("completed", "run.completed"),
     });
     const failed = runReducer(completed, {
       type: "event",
       runId: "run-1",
+      generation: 1,
       event: event("failed", "run.failed"),
     });
     expect(failed.observedStatus).toBe("failed");
@@ -235,6 +327,7 @@ describe("runReducer", () => {
     const refreshed = runReducer(failed, {
       type: "record",
       runId: "run-1",
+      generation: 1,
       record: authoritative,
     });
     expect(refreshed.observedStatus).toBe("completed");
@@ -243,14 +336,16 @@ describe("runReducer", () => {
 
   it("keeps connection state separate from execution state", () => {
     const runningRecord = record("run-1", "running");
-    const running = runReducer(selectRun(initialRunState, "run-1"), {
+    const running = runReducer(selectRun(initialRunState, "run-1", 1), {
       type: "record",
       runId: "run-1",
+      generation: 1,
       record: runningRecord,
     });
     const disconnected = runReducer(running, {
       type: "connection",
       runId: "run-1",
+      generation: 1,
       connection: "disconnected",
       error: "stream ended",
     });
@@ -263,6 +358,7 @@ describe("runReducer", () => {
     const missing = runReducer(disconnected, {
       type: "connection",
       runId: "run-1",
+      generation: 1,
       connection: "not_found",
       error: "run not found",
     });
@@ -274,21 +370,24 @@ describe("runReducer", () => {
   });
 
   it("selecting a new run or null clears all prior-run observations", () => {
-    let state = runReducer(selectRun(initialRunState, "run-old"), {
+    let state = runReducer(selectRun(initialRunState, "run-old", 1), {
       type: "event",
       runId: "run-old",
+      generation: 1,
       event: event("event-old", "workflow.progress", { stage: "search" }),
     });
     state = runReducer(state, {
       type: "connection",
       runId: "run-old",
+      generation: 1,
       connection: "protocol_error",
       error: "bad frame",
     });
 
-    const next = selectRun(state, "run-new");
+    const next = selectRun(state, "run-new", 1);
     expect(next).toEqual({
       runId: "run-new",
+      generation: 1,
       record: null,
       observedStatus: null,
       connection: "idle",
@@ -300,8 +399,8 @@ describe("runReducer", () => {
     });
 
     expect(
-      runReducer(next, { type: "select", runId: null }),
-    ).toEqual(initialRunState);
+      runReducer(next, { type: "select", runId: null, generation: 2 }),
+    ).toEqual({ ...initialRunState, generation: 2 });
   });
 });
 

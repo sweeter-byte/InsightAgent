@@ -11,29 +11,32 @@ export type RunConnectionStatus =
 
 export type ResearchRunState = {
   runId: string | null;
+  generation: number;
   record: RunRecord | null;
   observedStatus: RunStatus | null;
   connection: RunConnectionStatus;
-  events: SseEvent[];
-  seenEventIds: Set<string>;
+  events: readonly SseEvent[];
+  seenEventIds: ReadonlySet<string>;
   lastEventId: string | null;
   latestProgress: SseEvent["data"] | null;
   error: string | null;
 };
 
 export type RunAction =
-  | { type: "select"; runId: string | null }
-  | { type: "record"; runId: string; record: RunRecord }
-  | { type: "event"; runId: string; event: SseEvent }
+  | { type: "select"; runId: string | null; generation: number }
+  | { type: "record"; runId: string; generation: number; record: RunRecord }
+  | { type: "event"; runId: string; generation: number; event: SseEvent }
   | {
       type: "connection";
       runId: string;
+      generation: number;
       connection: RunConnectionStatus;
       error?: string | null;
     };
 
 export const initialRunState: ResearchRunState = {
   runId: null,
+  generation: 0,
   record: null,
   observedStatus: null,
   connection: "idle",
@@ -53,7 +56,7 @@ export const terminalRunStatuses = [
 
 const terminalStatusSet: ReadonlySet<RunStatus> = new Set(terminalRunStatuses);
 
-const eventStatuses: Readonly<Record<string, RunStatus>> = {
+const eventStatuses: Readonly<Partial<Record<string, RunStatus>>> = {
   "run.queued": "queued",
   "run.started": "running",
   "run.completed": "completed",
@@ -74,10 +77,12 @@ export function isTerminalEvent(event: SseEvent): boolean {
 export function selectRun(
   _state: ResearchRunState,
   runId: string | null,
+  generation: number,
 ): ResearchRunState {
   return {
     ...initialRunState,
     runId,
+    generation,
     events: [],
     seenEventIds: new Set(),
   };
@@ -102,8 +107,12 @@ export function runReducer(
   state: ResearchRunState,
   action: RunAction,
 ): ResearchRunState {
-  if (action.type === "select") return selectRun(state, action.runId);
-  if (action.runId !== state.runId) return state;
+  if (action.type === "select") {
+    return selectRun(state, action.runId, action.generation);
+  }
+  if (action.runId !== state.runId || action.generation !== state.generation) {
+    return state;
+  }
 
   switch (action.type) {
     case "record":
