@@ -50,6 +50,14 @@ function isAbort(error: unknown, signal?: AbortSignal): boolean {
   );
 }
 
+async function cancelBody(body: ReadableStream<Uint8Array> | null): Promise<void> {
+  try {
+    await body?.cancel();
+  } catch {
+    // Preserve the HTTP or protocol error that required cancellation.
+  }
+}
+
 export async function streamResearchEvents({
   runId,
   lastEventId,
@@ -76,10 +84,15 @@ export async function streamResearchEvents({
     throw new SseNetworkError();
   }
 
-  if (!response.ok) throw new SseHttpError(response.status);
+  if (!response.ok) {
+    await cancelBody(response.body);
+    throw new SseHttpError(response.status);
+  }
 
   const contentType = response.headers.get("content-type");
-  if (!contentType || !/^text\/event-stream\b/i.test(contentType)) {
+  const mediaType = contentType?.split(";", 1)[0].trim().toLowerCase();
+  if (mediaType !== "text/event-stream") {
+    await cancelBody(response.body);
     throw new SseProtocolError();
   }
   if (!response.body) throw new SseProtocolError();

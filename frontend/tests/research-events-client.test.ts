@@ -71,6 +71,43 @@ describe("streamResearchEvents", () => {
       event: "workflow.progress",
       data: { step: "检索" },
     });
+    expect(stream.locked).toBe(false);
+  });
+
+  it("preserves a UTF-8 code point split across byte chunks", async () => {
+    const prefix = encoder.encode(
+      'id: event-utf8\nevent: workflow.progress\ndata: {"step":"',
+    );
+    const character = encoder.encode("检");
+    const suffix = encoder.encode('"}\n\n');
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(prefix);
+        controller.enqueue(character.slice(0, 1));
+        controller.enqueue(character.slice(1, 2));
+        controller.enqueue(character.slice(2));
+        controller.enqueue(suffix);
+        controller.close();
+      },
+    });
+    const onEvent = vi.fn();
+
+    await streamResearchEvents({
+      runId: "run-1",
+      onEvent,
+      fetchImpl: fetchReturning(
+        new Response(stream, {
+          headers: { "Content-Type": "text/event-stream" },
+        }),
+      ),
+    });
+
+    expect(onEvent).toHaveBeenCalledWith({
+      id: "event-utf8",
+      event: "workflow.progress",
+      data: { step: "检" },
+    });
+    expect(stream.locked).toBe(false);
   });
 
   it("uses an encoded same-origin URL and the complete streaming request contract", async () => {
@@ -170,6 +207,55 @@ describe("streamResearchEvents", () => {
     expect(error).toMatchObject({ name: "SseHttpError", status });
   });
 
+  it.each([
+    ["HTTP error", 500, "text/event-stream", SseHttpError],
+    ["bad content type", 200, "application/json", SseProtocolError],
+  ])(
+    "cancels an open response body before rejecting a %s",
+    async (_name, status, contentType, ErrorType) => {
+      const cancel = vi.fn();
+      const stream = new ReadableStream<Uint8Array>({ cancel });
+      const response = new Response(stream, {
+        status,
+        headers: { "Content-Type": contentType },
+      });
+
+      await expect(
+        streamResearchEvents({
+          runId: "run-1",
+          onEvent: vi.fn(),
+          fetchImpl: fetchReturning(response),
+        }),
+      ).rejects.toBeInstanceOf(ErrorType);
+      expect(cancel).toHaveBeenCalledOnce();
+      expect(stream.locked).toBe(false);
+    },
+  );
+
+  it.each([
+    ["HTTP error", 500, "text/event-stream", SseHttpError],
+    ["bad content type", 200, "application/json", SseProtocolError],
+  ])(
+    "preserves the original %s classification when body cancellation fails",
+    async (_name, status, contentType, ErrorType) => {
+      const cancel = vi.fn().mockRejectedValue(new Error("cancel failed"));
+      const stream = new ReadableStream<Uint8Array>({ cancel });
+      const response = new Response(stream, {
+        status,
+        headers: { "Content-Type": contentType },
+      });
+
+      await expect(
+        streamResearchEvents({
+          runId: "run-1",
+          onEvent: vi.fn(),
+          fetchImpl: fetchReturning(response),
+        }),
+      ).rejects.toBeInstanceOf(ErrorType);
+      expect(cancel).toHaveBeenCalledOnce();
+    },
+  );
+
   it("rejects an unexpected content type regardless of a successful status", async () => {
     await expect(
       streamResearchEvents({
@@ -192,6 +278,20 @@ describe("streamResearchEvents", () => {
         ),
       }),
     ).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "text/event-stream, application/json",
+    "text/event-streaming",
+    "text/event-stream trailing-token",
+  ])("rejects the non-exact event-stream media type %s", async (contentType) => {
+    await expect(
+      streamResearchEvents({
+        runId: "run-1",
+        onEvent: vi.fn(),
+        fetchImpl: fetchReturning(eventStream([], { contentType })),
+      }),
+    ).rejects.toBeInstanceOf(SseProtocolError);
   });
 
   it("rejects a successful response without a body", async () => {
@@ -362,6 +462,7 @@ describe("streamResearchEvents", () => {
       }),
     ).rejects.toBe(consumerError);
     expect(cancel).toHaveBeenCalledOnce();
+    expect(stream.locked).toBe(false);
   });
 
   it("resolves at EOF and discards an unterminated frame", async () => {
