@@ -95,6 +95,55 @@ describe("observeResearchRun", () => {
     expect(h.actions.every((action) => action.runId === RUN_ID)).toBe(true);
   });
 
+  it("aborts the current attempt after a terminal event and immediately reconciles", async () => {
+    const h = harness();
+    const getRun = vi
+      .fn()
+      .mockResolvedValueOnce(record("running"))
+      .mockResolvedValueOnce(
+        record("completed", { final_output: "authoritative report" }),
+      );
+    const streamEvents = vi.fn(
+      ({ signal, onEvent }): Promise<void> =>
+        new Promise((resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+          onEvent(event("terminal", "run.completed"));
+          onEvent(event("after-terminal", "workflow.progress"));
+          if (signal?.aborted) resolve();
+        }),
+    );
+
+    const observation = observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("observer did not abort terminal stream")), 50);
+    });
+
+    await expect(Promise.race([observation, timeout])).resolves.toBeUndefined();
+    expect(getRun).toHaveBeenCalledTimes(2);
+    expect(h.state().record?.final_output).toBe("authoritative report");
+    expect(h.state().events.map(({ id }) => id)).toEqual(["terminal"]);
+    expect(
+      h.actions.filter(
+        (action) =>
+          action.type === "connection" &&
+          ["disconnected", "protocol_error", "not_found"].includes(
+            action.connection,
+          ),
+      ),
+    ).toEqual([]);
+  });
+
   it("uses a matching initial record without GET and skips streams for every terminal status", async () => {
     for (const status of ["completed", "failed", "timed_out", "interrupted"] as const) {
       const h = harness();
@@ -303,6 +352,58 @@ describe("observeResearchRun", () => {
     ]);
     expect(h.state().events.map(({ id }) => id)).toEqual(["10", "11"]);
     expect(h.state().lastEventId).toBe("11");
+  });
+
+  it("uses the sixth and final stream as cursorless fallback after a fifth-stream HTTP failure", async () => {
+    const h = harness();
+    let gets = 0;
+    let streams = 0;
+    const getRun = vi.fn(async () =>
+      record(++gets === 7 ? "completed" : "running"),
+    );
+    const streamEvents = vi.fn(async ({ onEvent }) => {
+      streams += 1;
+      if (streams === 1) onEvent(event("cursor-1", "run.started"));
+      if (streams === 5) throw new SseHttpError(409);
+    });
+
+    await observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+      wait: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(streamEvents).toHaveBeenCalledTimes(6);
+    expect(streamEvents.mock.calls[4]?.[0].lastEventId).toBe("cursor-1");
+    expect(streamEvents.mock.calls[5]?.[0].lastEventId).toBeUndefined();
+  });
+
+  it("does not open a seventh stream when the sixth cursor-bearing stream fails", async () => {
+    const h = harness();
+    const getRun = vi.fn().mockResolvedValue(record("running"));
+    let streams = 0;
+    const streamEvents = vi.fn(async ({ onEvent }) => {
+      streams += 1;
+      if (streams === 1) onEvent(event("cursor-1", "run.started"));
+      if (streams === 6) throw new SseHttpError(409);
+    });
+
+    await observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: new AbortController().signal,
+      dispatch: h.dispatch,
+      getRun,
+      streamEvents,
+      wait: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(streamEvents).toHaveBeenCalledTimes(6);
+    expect(streamEvents.mock.calls[5]?.[0].lastEventId).toBe("cursor-1");
   });
 
   it.each([

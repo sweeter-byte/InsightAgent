@@ -186,12 +186,16 @@ export async function observeResearchRun({
       let streamFailure: unknown = null;
       let terminalCandidate = false;
       let connected = false;
+      const attemptController = new AbortController();
+      const abortAttempt = () => attemptController.abort();
+      signal.addEventListener("abort", abortAttempt, { once: true });
       try {
         await streamEvents({
           runId,
           lastEventId,
-          signal,
+          signal: attemptController.signal,
           onEvent: (incoming) => {
+            if (terminalCandidate) return;
             if (signal.aborted) throw abortError();
             if (!connected) {
               send({ type: "connection", connection: "connected" });
@@ -201,17 +205,28 @@ export async function observeResearchRun({
             send({ type: "event", event: incoming });
             seenEventIds.add(incoming.id);
             cursor = incoming.id;
-            if (isTerminalEvent(incoming)) terminalCandidate = true;
+            if (isTerminalEvent(incoming)) {
+              terminalCandidate = true;
+              attemptController.abort();
+            }
           },
         });
       } catch (error) {
-        if (isAbort(error, signal)) return;
-        if (error instanceof SseHttpError && error.status === 404) {
+        if (signal.aborted) return;
+        if (terminalCandidate && isAbort(error, attemptController.signal)) {
+          // A terminal event closes this attempt so the GET below can establish
+          // the authoritative status, error, and final output.
+        } else if (isAbort(error, signal)) {
+          return;
+        } else if (error instanceof SseHttpError && error.status === 404) {
           reportNotFound();
           return;
+        } else {
+          streamFailure = error;
+          reportFailure(error);
         }
-        streamFailure = error;
-        reportFailure(error);
+      } finally {
+        signal.removeEventListener("abort", abortAttempt);
       }
 
       if (signal.aborted) return;
