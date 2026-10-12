@@ -45,11 +45,13 @@ describe("useResearchRun", () => {
       runId: "run-1",
       generation: options.generation,
     });
-    options.dispatch({
-      type: "connection",
-      runId: "run-1",
-      generation: options.generation,
-      connection: "connected",
+    act(() => {
+      options.dispatch({
+        type: "connection",
+        runId: "run-1",
+        generation: options.generation,
+        connection: "connected",
+      });
     });
     await waitFor(() => expect(result.current.connection).toBe("connected"));
 
@@ -271,5 +273,49 @@ describe("useResearchRun", () => {
       connection: "idle",
       error: null,
     });
+  });
+
+  it("uses the latest inline not-found callback without restarting observation", async () => {
+    const observe = vi.fn<Observer>(() => new Promise(() => undefined));
+    const firstCallback = vi.fn();
+    const latestCallback = vi.fn();
+    const callbacks = [firstCallback, latestCallback];
+    const { result, rerender, unmount } = renderHook(
+      ({ callbackIndex }: { callbackIndex: number }) =>
+        useResearchRun(
+          { runId: "run-1" },
+          {
+            observe,
+            onNotFound: (runId) => callbacks[callbackIndex](runId),
+          },
+        ),
+      { initialProps: { callbackIndex: 0 } },
+    );
+    await waitFor(() => expect(observe).toHaveBeenCalledTimes(1));
+    const observation = observe.mock.calls[0][0];
+    const generation = observation.generation;
+
+    act(() => {
+      observation.dispatch({
+        type: "connection",
+        runId: "run-1",
+        generation,
+        connection: "connected",
+      });
+    });
+    expect(result.current.connection).toBe("connected");
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observation.signal.aborted).toBe(false);
+    expect(result.current.generation).toBe(generation);
+
+    rerender({ callbackIndex: 1 });
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observation.signal.aborted).toBe(false);
+    expect(result.current.generation).toBe(generation);
+
+    act(() => observation.onNotFound?.("run-1"));
+    expect(firstCallback).not.toHaveBeenCalled();
+    expect(latestCallback).toHaveBeenCalledWith("run-1");
+    unmount();
   });
 });

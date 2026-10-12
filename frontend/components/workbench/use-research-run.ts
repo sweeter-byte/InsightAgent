@@ -44,9 +44,13 @@ export function useResearchRun(
   const [state, dispatch] = useReducer(runReducer, initialRunState);
   const generationRef = useRef(0);
   const observe = options.observe ?? observeResearchRun;
-  const onNotFound = options.onNotFound;
+  const onNotFoundRef = useRef(options.onNotFound);
   const runId = selection?.runId ?? null;
   const initialRecord = selection?.initialRecord;
+
+  useEffect(() => {
+    onNotFoundRef.current = options.onNotFound;
+  }, [options.onNotFound]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -55,6 +59,9 @@ export function useResearchRun(
     dispatch({ type: "select", runId, generation });
 
     if (runId !== null) {
+      const onNotFound = (missingRunId: string) => {
+        onNotFoundRef.current?.(missingRunId);
+      };
       const reportUnexpectedFailure = (error: unknown) => {
         if (isAbort(error, controller.signal)) return;
         dispatch({
@@ -81,7 +88,7 @@ export function useResearchRun(
     }
 
     return () => controller.abort();
-  }, [runId, initialRecord, observe, onNotFound]);
+  }, [runId, initialRecord, observe]);
 
   return state;
 }
