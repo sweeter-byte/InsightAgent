@@ -5,7 +5,6 @@ export type ParsedSseFrame = {
 };
 
 type FrameState = {
-  id: string;
   event: string;
   dataLines: string[];
   hasData: boolean;
@@ -13,7 +12,6 @@ type FrameState = {
 
 function emptyFrame(): FrameState {
   return {
-    id: "",
     event: "message",
     dataLines: [],
     hasData: false,
@@ -25,18 +23,23 @@ export function createSseParser(
 ): { feed(chunk: string): void; finish(): void } {
   let lineBuffer = "";
   let frame = emptyFrame();
+  let lastEventId = "";
   let finished = false;
 
   function dispatchFrame() {
-    if (frame.hasData) {
-      onEvent({
-        id: frame.id,
-        event: frame.event || "message",
-        data: frame.dataLines.join("\n"),
-      });
-    }
+    const eventToDispatch = frame.hasData
+      ? {
+          id: lastEventId,
+          event: frame.event || "message",
+          data: frame.dataLines.join("\n"),
+        }
+      : null;
 
     frame = emptyFrame();
+
+    if (eventToDispatch) {
+      onEvent(eventToDispatch);
+    }
   }
 
   function processLine(line: string) {
@@ -66,7 +69,7 @@ export function createSseParser(
         break;
       case "id":
         if (!value.includes("\0")) {
-          frame.id = value;
+          lastEventId = value;
         }
         break;
     }

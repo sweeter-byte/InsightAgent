@@ -81,6 +81,59 @@ describe("createSseParser", () => {
     ]);
   });
 
+  it("keeps the latest event id for later frames without an id field", () => {
+    const { events, parser } = collectEvents();
+
+    parser.feed("id: persistent\ndata: first\n\ndata: second\n\n");
+
+    expect(events).toEqual([
+      { id: "persistent", event: "message", data: "first" },
+      { id: "persistent", event: "message", data: "second" },
+    ]);
+  });
+
+  it("updates the latest event id from a frame without data", () => {
+    const { events, parser } = collectEvents();
+
+    parser.feed("id: id-only\n\ndata: later\n\n");
+
+    expect(events).toEqual([
+      { id: "id-only", event: "message", data: "later" },
+    ]);
+  });
+
+  it("clears the latest event id with an empty id field", () => {
+    const { events, parser } = collectEvents();
+
+    parser.feed("id: old\ndata: before\n\nid:\n\ndata: after\n\n");
+
+    expect(events).toEqual([
+      { id: "old", event: "message", data: "before" },
+      { id: "", event: "message", data: "after" },
+    ]);
+  });
+
+  it("clears frame data before invoking a callback that throws", () => {
+    const events: ParsedSseFrame[] = [];
+    let shouldThrow = true;
+    const parser = createSseParser((event) => {
+      if (shouldThrow) {
+        shouldThrow = false;
+        throw new Error("consumer failed");
+      }
+      events.push(event);
+    });
+
+    expect(() => parser.feed("id: first\ndata: stale\n\n")).toThrow(
+      "consumer failed",
+    );
+    parser.feed("id: second\ndata: fresh\n\n");
+
+    expect(events).toEqual([
+      { id: "second", event: "message", data: "fresh" },
+    ]);
+  });
+
   it("does not dispatch a frame without a data field", () => {
     const { events, parser } = collectEvents();
 
