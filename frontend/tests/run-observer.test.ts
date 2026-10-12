@@ -502,6 +502,52 @@ describe("observeResearchRun", () => {
     }
   });
 
+  it("cannot miss a parent abort triggered synchronously by connecting dispatch", async () => {
+    const h = harness();
+    const controller = new AbortController();
+    const dispatch = (action: RunAction) => {
+      h.dispatch(action);
+      if (action.type === "connection" && action.connection === "connecting") {
+        controller.abort();
+      }
+    };
+    const streamEvents = vi.fn(
+      ({ signal }): Promise<void> =>
+        signal?.aborted
+          ? Promise.reject(new DOMException("Aborted", "AbortError"))
+          : new Promise(() => undefined),
+    );
+    const wait = vi.fn();
+
+    const observation = observeResearchRun({
+      runId: RUN_ID,
+      generation: GENERATION,
+      signal: controller.signal,
+      dispatch,
+      getRun: vi.fn().mockResolvedValue(record("running")),
+      streamEvents,
+      wait,
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("observer missed synchronous abort")), 50);
+    });
+
+    await expect(Promise.race([observation, timeout])).resolves.toBeUndefined();
+    if (streamEvents.mock.calls.length > 0) {
+      expect(streamEvents.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+    }
+    expect(wait).not.toHaveBeenCalled();
+    expect(
+      h.actions.some(
+        (action) =>
+          action.type === "connection" &&
+          ["disconnected", "protocol_error", "not_found"].includes(
+            action.connection,
+          ),
+      ),
+    ).toBe(false);
+  });
+
   it("does nothing when the parent signal is already aborted", async () => {
     const h = harness();
     const controller = new AbortController();

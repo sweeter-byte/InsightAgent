@@ -178,11 +178,6 @@ export async function observeResearchRun({
       const cursorlessAttempt = nextAttemptCursorless;
       nextAttemptCursorless = false;
       const lastEventId = cursorlessAttempt ? undefined : cursor;
-      send({
-        type: "connection",
-        connection: attempt === 0 ? "connecting" : "reconnecting",
-      });
-
       let streamFailure: unknown = null;
       let terminalCandidate = false;
       let connected = false;
@@ -190,40 +185,49 @@ export async function observeResearchRun({
       const abortAttempt = () => attemptController.abort();
       signal.addEventListener("abort", abortAttempt, { once: true });
       try {
-        await streamEvents({
-          runId,
-          lastEventId,
-          signal: attemptController.signal,
-          onEvent: (incoming) => {
-            if (terminalCandidate) return;
-            if (signal.aborted) throw abortError();
-            if (!connected) {
-              send({ type: "connection", connection: "connected" });
-              connected = true;
-            }
-            if (seenEventIds.has(incoming.id)) return;
-            send({ type: "event", event: incoming });
-            seenEventIds.add(incoming.id);
-            cursor = incoming.id;
-            if (isTerminalEvent(incoming)) {
-              terminalCandidate = true;
-              attemptController.abort();
-            }
-          },
-        });
-      } catch (error) {
         if (signal.aborted) return;
-        if (terminalCandidate && isAbort(error, attemptController.signal)) {
-          // A terminal event closes this attempt so the GET below can establish
-          // the authoritative status, error, and final output.
-        } else if (isAbort(error, signal)) {
-          return;
-        } else if (error instanceof SseHttpError && error.status === 404) {
-          reportNotFound();
-          return;
-        } else {
-          streamFailure = error;
-          reportFailure(error);
+        send({
+          type: "connection",
+          connection: attempt === 0 ? "connecting" : "reconnecting",
+        });
+        if (signal.aborted) return;
+
+        try {
+          await streamEvents({
+            runId,
+            lastEventId,
+            signal: attemptController.signal,
+            onEvent: (incoming) => {
+              if (terminalCandidate) return;
+              if (signal.aborted) throw abortError();
+              if (!connected) {
+                send({ type: "connection", connection: "connected" });
+                connected = true;
+              }
+              if (seenEventIds.has(incoming.id)) return;
+              send({ type: "event", event: incoming });
+              seenEventIds.add(incoming.id);
+              cursor = incoming.id;
+              if (isTerminalEvent(incoming)) {
+                terminalCandidate = true;
+                attemptController.abort();
+              }
+            },
+          });
+        } catch (error) {
+          if (signal.aborted) return;
+          if (terminalCandidate && isAbort(error, attemptController.signal)) {
+            // A terminal event closes this attempt so the GET below can establish
+            // the authoritative status, error, and final output.
+          } else if (isAbort(error, signal)) {
+            return;
+          } else if (error instanceof SseHttpError && error.status === 404) {
+            reportNotFound();
+            return;
+          } else {
+            streamFailure = error;
+            reportFailure(error);
+          }
         }
       } finally {
         signal.removeEventListener("abort", abortAttempt);
