@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
+    "test:sse-proxy": "node scripts/verify-sse-proxy.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

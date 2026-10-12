@@ -13,7 +13,7 @@ const nextConfig: NextConfig = {
   reactStrictMode: true,
   agentRules: false,
   async rewrites() {
-    return createBackendRewrites(backendOrigin);
+    return { fallback: createBackendRewrites(backendOrigin) };
   },
   // Next 16.4 defaults to the detached TypeScript CLI path. In this managed
   // environment that child exits before its captured stdout is delivered.
