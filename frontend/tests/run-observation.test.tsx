@@ -534,10 +534,9 @@ describe("InsightWorkbench live run observation", () => {
       expect.stringContaining("3-0workflow.progress · planning"),
       expect.stringContaining("4-0run.completed"),
     ]);
-    const report = screen.getByTestId("report-preview");
-    expect(report).toHaveTextContent("# Research Report");
-    expect(report.tagName).toBe("PRE");
-    expect(screen.queryByRole("heading", { name: "Research Report" })).not.toBeInTheDocument();
+    const report = screen.getByRole("article", { name: "最终研究报告" });
+    expect(report).toHaveTextContent("Research Report");
+    expect(screen.getByRole("heading", { name: "Research Report" })).toBeInTheDocument();
     expect(screen.queryByText(/Chapter 18|\[1\]|\d+%|Planner Task|Evidence Grader|Retriever/)).not.toBeInTheDocument();
     expect(getCalls).toBe(1);
   });
@@ -644,7 +643,9 @@ describe("InsightWorkbench live run observation", () => {
     expect(oldStream.enqueue(sseFrame("old-failed", "run.failed", { error: "OLD ERROR" }))).toBe(false);
     expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("new-run").length).toBeGreaterThan(0);
-    expect(screen.getByTestId("report-preview")).toHaveTextContent("NEW REPORT");
+    expect(screen.getByRole("article", { name: "最终研究报告" })).toHaveTextContent(
+      "NEW REPORT",
+    );
     expect(screen.queryByText("old-failed")).not.toBeInTheDocument();
     expect(screen.queryByText("OLD ERROR")).not.toBeInTheDocument();
     fetchSpy.mockRestore();

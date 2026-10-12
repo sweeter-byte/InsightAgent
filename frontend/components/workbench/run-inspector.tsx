@@ -1,9 +1,11 @@
 import { ExternalLink, RotateCcw, TerminalSquare } from "lucide-react";
 
 import type { ObservedEvent, ScenarioView } from "./mock-data";
+import { extractReportSources } from "./report-sources";
 import { SectionLabel } from "./section-label";
 import type { ResearchRunState } from "./run-state";
 import type { ActiveResearchRun } from "./workbench-types";
+import type { AsyncPhase } from "./workbench-types";
 import type { SseEvent } from "@/lib/protocol/types";
 
 export function RunInspector({
@@ -12,16 +14,26 @@ export function RunInspector({
   runState,
   error,
   selectionError,
+  onResume,
+  resumePhase = "idle",
+  resumeError,
 }: {
   view?: ScenarioView;
   activeRun?: ActiveResearchRun | null;
   runState?: ResearchRunState;
   error?: string | null;
   selectionError?: string | null;
+  onResume?: () => void;
+  resumePhase?: AsyncPhase;
+  resumeError?: string | null;
 }) {
   const scopedRunState = activeRun && runState?.runId === activeRun.runId ? runState : undefined;
   const liveView: ScenarioView = view ?? createLiveView(activeRun, scopedRunState, error, selectionError);
   const connection = view ? null : connectionLabel(scopedRunState?.connection ?? "idle");
+  const sources =
+    !view && scopedRunState?.record?.status === "completed"
+      ? extractReportSources(scopedRunState.record.final_output ?? "")
+      : [];
   return (
     <aside className="rail rail--right" aria-label="运行检查器">
       <section className="rail-section">
@@ -65,24 +77,54 @@ export function RunInspector({
         )}
       </section>
 
-      <section className="rail-section source-panel">
+      <section className="rail-section source-panel" aria-label="引用来源">
         <SectionLabel index="07" title="Citations / Sources" />
         {view && liveView.runStatus === "completed" ? (
-          <a href="#report-source-1">
+          <a href="#report-references">
             <span>[1]</span>
             <div><strong>Chapter 18 运行时说明</strong><small>本地资料 · Mock</small></div>
             <ExternalLink size={14} aria-hidden="true" />
           </a>
+        ) : sources.length > 0 ? (
+          <ol className="source-list">
+            {sources.map((source) => (
+              <li key={source.number}>
+                <a href="#report-references">
+                  <span>[{source.number}]</span>
+                  <div>
+                    <strong>{source.label}</strong>
+                    <small>{source.detail ?? "报告内来源"}</small>
+                  </div>
+                  {source.url && <ExternalLink size={14} aria-hidden="true" />}
+                </a>
+              </li>
+            ))}
+          </ol>
         ) : (
           <p className="inspector-empty">报告完成后展示可引用来源。</p>
         )}
       </section>
 
       <section className="resume-panel">
-        <button type="button" disabled={!liveView.canResume}>
-          <RotateCcw size={15} /> 恢复运行
+        <button
+          type="button"
+          disabled={!liveView.canResume || resumePhase === "submitting"}
+          onClick={onResume}
+        >
+          <RotateCcw size={15} />
+          {resumePhase === "submitting" ? "正在恢复…" : "恢复运行"}
         </button>
-        <p>{liveView.canResume ? "未接入 Resume；本阶段不会发送 Resume 请求。" : "本阶段未接入 Resume 通信。"}</p>
+        {resumeError ? (
+          <p className="resume-panel__error" role="alert">{resumeError}</p>
+        ) : (
+          <p>
+            {view && liveView.canResume
+              ? "Demo 状态不会发送 Resume 请求。"
+              : liveView.canResume
+                ? "使用同一 Run ID 从后端检查点恢复。"
+                : "仅 interrupted、timed_out 状态允许恢复。"}
+          </p>
+        )}
       </section>
     </aside>
   );

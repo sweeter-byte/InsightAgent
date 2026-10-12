@@ -3,7 +3,12 @@
 import { Files, Gauge } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { ApiProtocolError, api, describeApiError } from "@/lib/api-client";
+import {
+  ApiHttpError,
+  ApiProtocolError,
+  api,
+  describeApiError,
+} from "@/lib/api-client";
 import type { ComponentReadiness } from "@/lib/protocol/types";
 
 import { MaterialsWorkspace } from "./materials-workspace";
@@ -66,6 +71,8 @@ export function InsightWorkbench({
   const [answer, setAnswer] = useState<SynchronousAnswer | null>(null);
   const [activeRun, setActiveRun] = useState<ActiveResearchRun | null>(null);
   const [missingRunId, setMissingRunId] = useState<string | null>(null);
+  const [resumePhase, setResumePhase] = useState<AsyncPhase>("idle");
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const connectionController = useRef<AbortController | null>(null);
   const connectionSequence = useRef(0);
   const uploadController = useRef<AbortController | null>(null);
@@ -74,6 +81,9 @@ export function InsightWorkbench({
   const submissionController = useRef<AbortController | null>(null);
   const submissionSequence = useRef(0);
   const submissionInFlight = useRef(false);
+  const resumeController = useRef<AbortController | null>(null);
+  const resumeSequence = useRef(0);
+  const resumeInFlight = useRef(false);
   const view = scenarioViews[scenario];
   const isDemo = initialDemoScenario !== undefined;
   const canMutate = connection.phase === "ready";
@@ -138,6 +148,8 @@ export function InsightWorkbench({
       uploadController.current?.abort();
       submissionSequence.current += 1;
       submissionController.current?.abort();
+      resumeSequence.current += 1;
+      resumeController.current?.abort();
     },
     [],
   );
@@ -184,6 +196,8 @@ export function InsightWorkbench({
     setSubmissionPhase("submitting");
     setSubmissionError(null);
     setMissingRunId(null);
+    setResumePhase("idle");
+    setResumeError(null);
     try {
       if (mode === "smart") {
         const result = await api.query(normalizedQuestion, controller.signal);
@@ -239,6 +253,40 @@ export function InsightWorkbench({
       if (sequence === submissionSequence.current) submissionInFlight.current = false;
     }
   }, [canMutate, mode, question]);
+
+  const resumeRun = useCallback(async () => {
+    if (!activeRun || resumeInFlight.current) return;
+    const scopedState = runState.runId === activeRun.runId ? runState : null;
+    const status = scopedState?.observedStatus ?? scopedState?.record?.status ?? null;
+    if (status !== "interrupted" && status !== "timed_out") return;
+
+    resumeInFlight.current = true;
+    resumeController.current?.abort();
+    const controller = new AbortController();
+    resumeController.current = controller;
+    const sequence = ++resumeSequence.current;
+    const runId = activeRun.runId;
+    setResumePhase("submitting");
+    setResumeError(null);
+    try {
+      const resumed = await api.resumeResearchRun(runId, controller.signal);
+      if (controller.signal.aborted || sequence !== resumeSequence.current) return;
+      if (resumed.run_id !== runId) throw new ApiProtocolError();
+      setActiveRun((current) =>
+        current?.runId === runId ? { ...current, initialRecord: resumed } : current,
+      );
+      setResumePhase("succeeded");
+    } catch (error) {
+      if (controller.signal.aborted || sequence !== resumeSequence.current) return;
+      setResumePhase("failed");
+      setResumeError(describeApiError(error, "resume"));
+      if (error instanceof ApiHttpError && error.status === 404) {
+        handleRunNotFound(runId);
+      }
+    } finally {
+      if (sequence === resumeSequence.current) resumeInFlight.current = false;
+    }
+  }, [activeRun, handleRunNotFound, runState]);
 
   return (
     <div className="workbench-frame">
@@ -328,6 +376,9 @@ export function InsightWorkbench({
           runState={isDemo ? undefined : runState}
           selectionError={isDemo || !missingRunId ? undefined : "运行不存在"}
           error={isDemo ? undefined : submissionError}
+          onResume={isDemo ? undefined : resumeRun}
+          resumePhase={isDemo ? undefined : resumePhase}
+          resumeError={isDemo ? undefined : resumeError}
         />
       </div>
     </div>

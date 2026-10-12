@@ -99,15 +99,15 @@ describe("run state presentation", () => {
     expect(screen.getByRole("button", { name: "恢复运行" })).toBeDisabled();
   });
 
-  it("enables the static resume affordance only for recoverable states", () => {
+  it("shows the Demo Resume affordance only for recoverable states", () => {
     render(<InsightWorkbench demoScenario="interrupted" />);
 
     expect(screen.getAllByText("可恢复").length).toBeGreaterThan(0);
     expect(screen.getByRole("button", { name: "恢复运行" })).toBeEnabled();
-    expect(screen.getByText(/本阶段不会发送 Resume 请求/)).toBeInTheDocument();
+    expect(screen.getByText(/Demo 状态不会发送 Resume 请求/)).toBeInTheDocument();
   });
 
-  it("renders authoritative terminal output as escaped plain text and real events", () => {
+  it("renders authoritative terminal output as Markdown and real events", () => {
     const events: SseEvent[] = [
       { id: "1-0", event: "run.queued", data: {} },
       { id: "2-0", event: "run.started", data: { resume: false } },
@@ -131,19 +131,20 @@ describe("run state presentation", () => {
     expect(screen.getByText("workflow.progress · planning")).toBeInTheDocument();
     expect(screen.getAllByText("Building a search plan").length).toBeGreaterThan(0);
     expect(screen.getByText("最终报告可用")).toBeInTheDocument();
-    expect(screen.getByText(/# Research Report/).tagName).toBe("PRE");
-    expect(screen.queryByRole("heading", { name: "Research Report" })).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "Research Report" })).toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "最终研究报告" })).toHaveTextContent(
+      "Verified result.",
+    );
     expect(screen.queryByText(/Chapter 18/)).not.toBeInTheDocument();
   });
 
-  it("treats an empty completed final_output as an available report", () => {
+  it("presents an empty completed final_output explicitly", () => {
     renderLive(liveState("completed", {
       record: runRecord("completed", { final_output: "" }),
     }));
 
-    expect(screen.getByText("最终报告可用")).toBeInTheDocument();
-    expect(screen.getByTestId("report-preview")).toBeEmptyDOMElement();
-    expect(screen.getByTestId("report-preview")).toHaveClass("report-preview");
+    expect(screen.getByText("报告内容为空")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "最终研究报告" })).not.toBeInTheDocument();
   });
 
   it("does not mistake a workflow stage named completed for terminal run status", () => {
@@ -164,7 +165,7 @@ describe("run state presentation", () => {
     ["failed", "研究失败", false, "Worker exploded"],
     ["timed_out", "研究超时", true, null],
     ["interrupted", "研究已中断", true, null],
-  ] as const)("presents %s honestly without wiring Resume HTTP", async (status, label, enabled, error) => {
+  ] as const)("presents %s honestly when the inspector has no Resume handler", async (status, label, enabled, error) => {
     const user = userEvent.setup();
     const request = vi.spyOn(globalThis, "fetch");
     renderLive(liveState(status, {
@@ -178,7 +179,11 @@ describe("run state presentation", () => {
     expect(button).toHaveProperty("disabled", !enabled);
     if (enabled) await user.click(button);
     expect(request).not.toHaveBeenCalled();
-    expect(screen.getByText(/未接入 Resume/)).toBeInTheDocument();
+    expect(screen.getByText(
+      enabled
+        ? /使用同一 Run ID 从后端检查点恢复/
+        : /仅 interrupted、timed_out 状态允许恢复/,
+    )).toBeInTheDocument();
     request.mockRestore();
   });
 

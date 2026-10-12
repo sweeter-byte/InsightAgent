@@ -1,6 +1,7 @@
 import { ArrowUp, BookOpen, Check, CircleDashed, Sparkles } from "lucide-react";
 
 import type { PreviewScenario, ScenarioView } from "./mock-data";
+import { MarkdownReport } from "./markdown-report";
 import { SectionLabel } from "./section-label";
 import type {
   ActiveResearchRun,
@@ -259,7 +260,11 @@ function LiveResearchActivity({
   const stage = typeof progress?.stage === "string" ? progress.stage : null;
   const message = typeof progress?.message === "string" ? progress.message : null;
   const finalOutput = scopedState?.record?.final_output;
-  const hasFinalOutput = status === "completed" && finalOutput !== null && finalOutput !== undefined;
+  const hasFinalOutput =
+    status === "completed" &&
+    finalOutput !== null &&
+    finalOutput !== undefined &&
+    finalOutput.trim().length > 0;
   return (
     <div className="activity-sheet">
       <div className="activity-sheet__header">
@@ -273,10 +278,16 @@ function LiveResearchActivity({
       {hasFinalOutput ? (
         <div>
           <p className="honesty-note">最终报告可用</p>
-          <pre className="report-preview" data-testid="report-preview" aria-label="最终报告纯文本">{finalOutput}</pre>
+          <MarkdownReport markdown={finalOutput} />
         </div>
       ) : (
-        <p className="honesty-note">仅展示后端已返回的运行事实；引用来源尚不可用。</p>
+        <p className="honesty-note">
+          {status === "completed" && finalOutput === ""
+            ? "报告内容为空"
+            : status === "failed"
+              ? "研究失败，未生成最终报告"
+              : "最终报告尚未生成"}
+        </p>
       )}
     </div>
   );

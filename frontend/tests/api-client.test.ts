@@ -150,6 +150,54 @@ describe("API client", () => {
     );
   });
 
+  it("posts Resume with an encoded run identifier and parses the queued RunRecord", async () => {
+    const runId = "run/with spaces?and#symbols";
+    let requestedUrl: string | undefined;
+    let requestedMethod: string | undefined;
+    mockServer.use(
+      http.post(`${appBase}/v1/research/runs/*/resume`, ({ request }) => {
+        requestedUrl = request.url;
+        requestedMethod = request.method;
+        return HttpResponse.json(queuedRunFixture, { status: 202 });
+      }),
+    );
+
+    await expect(api.resumeResearchRun(runId)).resolves.toEqual(queuedRunFixture);
+    expect(requestedMethod).toBe("POST");
+    expect(requestedUrl).toBe(
+      `${appBase}/v1/research/runs/run%2Fwith%20spaces%3Fand%23symbols/resume`,
+    );
+  });
+
+  it.each([404, 409])("preserves Resume HTTP %s as an ApiHttpError", async (status) => {
+    mockServer.use(
+      http.post(`${appBase}/v1/research/runs/demo-run/resume`, () =>
+        HttpResponse.json({ detail: "resume rejected" }, { status }),
+      ),
+    );
+
+    const error = await api.resumeResearchRun("demo-run").catch((caught) => caught);
+    expect(error).toEqual(
+      expect.objectContaining({
+        name: "ApiHttpError",
+        status,
+        detail: "resume rejected",
+      }),
+    );
+  });
+
+  it("maps a Resume transport failure to ApiNetworkError", async () => {
+    mockServer.use(
+      http.post(`${appBase}/v1/research/runs/demo-run/resume`, () =>
+        HttpResponse.error(),
+      ),
+    );
+
+    await expect(api.resumeResearchRun("demo-run")).rejects.toBeInstanceOf(
+      ApiNetworkError,
+    );
+  });
+
   it("preserves a 404 response as an ApiHttpError", async () => {
     mockServer.use(
       http.get(`${appBase}/v1/research/runs/missing-run`, () =>

@@ -28,7 +28,8 @@ export const apiRoutes = {
     `/v1/research/runs/${encodeURIComponent(runId)}`,
   researchEvents: (runId: string) =>
     `/v1/research/runs/${encodeURIComponent(runId)}/events`,
-  researchResume: (runId: string) => `/v1/research/runs/${runId}/resume`,
+  researchResume: (runId: string) =>
+    `/v1/research/runs/${encodeURIComponent(runId)}/resume`,
 } as const;
 
 export class ApiNetworkError extends Error {
@@ -173,9 +174,17 @@ export const api = {
       init: { signal, cache: "no-store" },
     });
   },
+
+  resumeResearchRun(runId: string, signal?: AbortSignal): Promise<RunRecord> {
+    return requestJson({
+      path: apiRoutes.researchResume(runId),
+      schema: runRecordSchema,
+      init: { method: "POST", signal },
+    });
+  },
 };
 
-export type ApiOperation = "connection" | "upload" | "query";
+export type ApiOperation = "connection" | "upload" | "query" | "resume";
 
 export function describeApiError(error: unknown, operation: ApiOperation): string {
   if (error instanceof ApiNetworkError) {
@@ -195,6 +204,11 @@ export function describeApiError(error: unknown, operation: ApiOperation): strin
     }
     if (operation === "query") {
       if (error.status === 502) return "上游模型未能完成本次请求，请重试。";
+      if (error.status === 503) return "研究运行服务暂不可用，请稍后重试。";
+    }
+    if (operation === "resume") {
+      if (error.status === 404) return "研究运行不存在，已清除本地选择。";
+      if (error.status === 409) return "当前状态已不允许恢复，请重新检查运行状态。";
       if (error.status === 503) return "研究运行服务暂不可用，请稍后重试。";
     }
     return `请求失败（HTTP ${error.status}）。`;
