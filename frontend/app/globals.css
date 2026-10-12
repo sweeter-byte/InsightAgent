@@ -268,6 +268,13 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, a:focus-visib
 .activity-sheet__header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .activity-sheet__header span { font-family: var(--font-display); font-size: 19px; }
 .activity-sheet__header code { color: var(--muted); font: 500 9px/1 var(--font-mono); }
+.connection-chip { width: fit-content; margin-top: 14px; padding: 4px 7px; display: inline-flex; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); background: var(--sheet); font: 600 8px/1 var(--font-mono); letter-spacing: .04em; }
+.connection-chip--connected { color: var(--green); border-color: color-mix(in srgb, var(--green) 42%, var(--line)); }
+.connection-chip--protocol_error, .connection-chip--not_found { color: var(--red); border-color: color-mix(in srgb, var(--red) 42%, var(--line)); }
+.progress-fact { margin: 14px 0 0; padding: 10px 12px; display: grid; gap: 4px; border-left: 2px solid var(--blue); background: var(--sheet); }
+.progress-fact strong { font: 600 10px/1.3 var(--font-mono); }
+.progress-fact span { color: var(--muted); font-size: 10px; line-height: 1.5; }
+.report-preview { margin: 10px 0 0; padding: 14px; max-height: 320px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: var(--radius-sm); color: var(--ink); background: var(--sheet); font: 500 10px/1.65 var(--font-mono); }
 .honesty-note { max-width: 560px; margin: 18px 0 0; padding-left: 14px; color: var(--muted); border-left: 2px solid var(--accent); font-size: 12px; line-height: 1.7; }
 .inline-error { width: fit-content; margin: 22px 0 0; padding: 8px 10px; color: var(--red); background: var(--red-soft); border-radius: 6px; font: 600 10px/1 var(--font-mono); }
 
@@ -296,7 +303,7 @@ button:focus-visible, textarea:focus-visible, input:focus-visible, a:focus-visib
 .status-card dl { margin: 0; padding: 10px 12px; display: grid; gap: 8px; }
 .status-card dl div { display: grid; grid-template-columns: 68px minmax(0, 1fr); gap: 6px; }
 .status-card dt { color: var(--muted); font: 500 8px/1.4 var(--font-mono); }
-.status-card dd { margin: 0; overflow: hidden; font: 500 9px/1.4 var(--font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.status-card dd { margin: 0; overflow-wrap: anywhere; font: 500 9px/1.4 var(--font-mono); }
 
 .event-list { margin: 2px 0 0; padding: 0; list-style: none; }
 .event-list li { position: relative; padding: 0 0 18px 22px; }

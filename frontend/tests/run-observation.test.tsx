@@ -358,4 +358,25 @@ describe("useResearchRun", () => {
     expect(result.current.generation).toBe(generation);
     unmount();
   });
+
+  it("does not forward a late not-found result from an obsolete selection", async () => {
+    const observe = vi.fn<Observer>(() => new Promise(() => undefined));
+    const onNotFound = vi.fn();
+    const { rerender, unmount } = renderHook(
+      ({ runId }) => useResearchRun({ runId }, { observe, onNotFound }),
+      { initialProps: { runId: "run-old" } },
+    );
+    await waitFor(() => expect(observe).toHaveBeenCalledTimes(1));
+    const old = observe.mock.calls[0][0];
+
+    rerender({ runId: "run-new" });
+    await waitFor(() => expect(observe).toHaveBeenCalledTimes(2));
+    const current = observe.mock.calls[1][0];
+    act(() => old.onNotFound?.("run-old"));
+    expect(onNotFound).not.toHaveBeenCalled();
+
+    act(() => current.onNotFound?.("run-new"));
+    expect(onNotFound).toHaveBeenCalledWith("run-new");
+    unmount();
+  });
 });

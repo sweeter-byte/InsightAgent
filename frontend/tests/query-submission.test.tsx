@@ -1,11 +1,13 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { delay, http, HttpResponse } from "msw";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { InsightWorkbench } from "@/components/workbench/insight-workbench";
+import { RESEARCH_RUN_STORAGE_KEY } from "@/components/workbench/run-selection";
 import { api } from "@/lib/api-client";
 import {
+  completedRunFixture,
   analyzeQueryResponseFixture,
   directQueryResponseFixture,
   queuedRunFixture,
@@ -16,6 +18,21 @@ import { mockServer } from "./mocks/server";
 
 const queryEndpoint = "http://localhost:3000/v1/query";
 const runEndpoint = "http://localhost:3000/v1/research/runs";
+const selectedRunEndpoint = `${runEndpoint}/demo-run`;
+const eventsEndpoint = `${selectedRunEndpoint}/events`;
+
+function eventStream(...frames: string[]) {
+  const encoder = new TextEncoder();
+  return new HttpResponse(
+    new ReadableStream({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame));
+        controller.close();
+      },
+    }),
+    { headers: { "Content-Type": "text/event-stream" } },
+  );
+}
 
 async function renderReadyWorkbench() {
   const user = userEvent.setup();
@@ -32,6 +49,8 @@ async function replaceQuestion(user: ReturnType<typeof userEvent.setup>, value: 
 }
 
 describe("query submission", () => {
+  beforeEach(() => sessionStorage.clear());
+
   it.each([
     ["direct", directQueryResponseFixture, "direct answer"],
     ["analyze", analyzeQueryResponseFixture, "analyze answer"],
@@ -55,26 +74,39 @@ describe("query submission", () => {
     expect(screen.queryByText("任务已提交")).not.toBeInTheDocument();
   });
 
-  it("shows only the real run_id when smart query routes to Research", async () => {
+  it("fetches the full run after smart Research returns only a run_id", async () => {
+    let getCalls = 0;
+    let eventCalls = 0;
     mockServer.use(
       http.post(queryEndpoint, () =>
         HttpResponse.json(researchQueryResponseFixture, { status: 202 }),
       ),
+      http.get(selectedRunEndpoint, () => {
+        getCalls += 1;
+        return HttpResponse.json({ ...queuedRunFixture, status: getCalls > 1 ? "completed" : "running" });
+      }),
+      http.get(eventsEndpoint, () => {
+        eventCalls += 1;
+        return eventStream("id: smart-complete\nevent: run.completed\ndata: {}\n\n");
+      }),
     );
     const { user } = await renderReadyWorkbench();
     await user.click(screen.getByRole("button", { name: "智能提问" }));
 
     await user.click(screen.getByRole("button", { name: "提交智能提问" }));
 
-    expect(await screen.findByText("任务已提交")).toBeInTheDocument();
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("demo-run").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("状态观察尚未接入。").length).toBeGreaterThan(0);
-    expect(screen.getByText("THREAD ID").nextElementSibling).toHaveTextContent("—");
+    expect(screen.getByText("THREAD ID").nextElementSibling).toHaveTextContent("demo-thread");
+    expect(getCalls).toBeGreaterThanOrEqual(2);
+    expect(eventCalls).toBe(1);
+    expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBe("demo-run");
   });
 
   it("uses the explicit run endpoint and preserves returned run metadata", async () => {
     let body: unknown;
     let queryCalls = 0;
+    let eventCalls = 0;
     mockServer.use(
       http.post(queryEndpoint, () => {
         queryCalls += 1;
@@ -84,18 +116,139 @@ describe("query submission", () => {
         body = await request.json();
         return HttpResponse.json(queuedRunFixture, { status: 202 });
       }),
+      http.get(eventsEndpoint, () => {
+        eventCalls += 1;
+        return new Promise<Response>(() => undefined);
+      }),
     );
     const { user } = await renderReadyWorkbench();
     await replaceQuestion(user, "compare systems");
 
     await user.click(screen.getByRole("button", { name: "提交深度研究" }));
 
-    expect(await screen.findByText("任务已提交")).toBeInTheDocument();
+    expect((await screen.findAllByText("任务已排队")).length).toBeGreaterThan(0);
     expect(screen.getAllByText("demo-run").length).toBeGreaterThan(0);
     expect(screen.getAllByText("demo-thread").length).toBeGreaterThan(0);
     expect(screen.getAllByText("queued").length).toBeGreaterThan(0);
     expect(body).toEqual({ query: "compare systems" });
     expect(queryCalls).toBe(0);
+    await waitFor(() => expect(eventCalls).toBe(1));
+    expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBe("demo-run");
+  });
+
+  it.each(["direct", "analyze"] as const)(
+    "clears a persisted Research selection after a %s answer",
+    async (intent) => {
+      sessionStorage.setItem(RESEARCH_RUN_STORAGE_KEY, "stale-run");
+      mockServer.use(
+        http.get(`${runEndpoint}/stale-run`, () =>
+          HttpResponse.json({ detail: "missing" }, { status: 404 }),
+        ),
+        http.post(queryEndpoint, () =>
+          HttpResponse.json(
+            intent === "direct" ? directQueryResponseFixture : analyzeQueryResponseFixture,
+          ),
+        ),
+      );
+      const { user } = await renderReadyWorkbench();
+      await user.click(screen.getByRole("button", { name: "智能提问" }));
+      await user.click(screen.getByRole("button", { name: "提交智能提问" }));
+
+      await screen.findByText(`${intent} answer`);
+      expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBeNull();
+    },
+  );
+
+  it("restores one persisted run after mount and resumes GET plus SSE observation", async () => {
+    sessionStorage.setItem(RESEARCH_RUN_STORAGE_KEY, "demo-run");
+    let getCalls = 0;
+    let eventCalls = 0;
+    mockServer.use(
+      http.get(selectedRunEndpoint, () => {
+        getCalls += 1;
+        return HttpResponse.json(getCalls === 1 ? queuedRunFixture : completedRunFixture);
+      }),
+      http.get(eventsEndpoint, () => {
+        eventCalls += 1;
+        return eventStream("id: restored-complete\nevent: run.completed\ndata: {}\n\n");
+      }),
+    );
+
+    render(<InsightWorkbench />);
+
+    expect(await screen.findByText("重新挂载后任务文本不可用")).toBeInTheDocument();
+    expect((await screen.findAllByText("研究已完成")).length).toBeGreaterThan(0);
+    expect(getCalls).toBeGreaterThanOrEqual(2);
+    expect(eventCalls).toBe(1);
+    expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBe("demo-run");
+  });
+
+  it("clears a missing restored run while retaining a visible not-found state", async () => {
+    sessionStorage.setItem(RESEARCH_RUN_STORAGE_KEY, "missing-run");
+    mockServer.use(
+      http.get(`${runEndpoint}/missing-run`, () =>
+        HttpResponse.json({ detail: "missing" }, { status: 404 }),
+      ),
+    );
+
+    render(<InsightWorkbench />);
+
+    expect((await screen.findAllByText("运行不存在")).length).toBeGreaterThan(0);
+    expect(sessionStorage.getItem(RESEARCH_RUN_STORAGE_KEY)).toBeNull();
+  });
+
+  it("clears a stale not-found presentation when a replacement submission starts", async () => {
+    sessionStorage.setItem(RESEARCH_RUN_STORAGE_KEY, "missing-run");
+    mockServer.use(
+      http.get(`${runEndpoint}/missing-run`, () =>
+        HttpResponse.json({ detail: "missing" }, { status: 404 }),
+      ),
+      http.post(runEndpoint, async () => {
+        await delay(100);
+        return HttpResponse.json(queuedRunFixture, { status: 202 });
+      }),
+      http.get(eventsEndpoint, () => new Promise<Response>(() => undefined)),
+    );
+    const { user } = await renderReadyWorkbench();
+    await screen.findAllByText("运行不存在");
+
+    void user.click(screen.getByRole("button", { name: "提交深度研究" }));
+    await screen.findByText("正在提交 Research Run…");
+
+    expect(screen.queryByText("运行不存在")).not.toBeInTheDocument();
+  });
+
+  it("shows a protocol error for malformed SSE without changing the run to failed", async () => {
+    mockServer.use(
+      http.post(runEndpoint, () => HttpResponse.json(queuedRunFixture, { status: 202 })),
+      http.get(eventsEndpoint, () => eventStream("event: run.started\ndata: {}\n\n")),
+      http.get(selectedRunEndpoint, () => HttpResponse.json(completedRunFixture)),
+    );
+    const { user } = await renderReadyWorkbench();
+    await user.click(screen.getByRole("button", { name: "提交深度研究" }));
+
+    expect((await screen.findAllByText("SSE 协议错误")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("研究已完成").length).toBeGreaterThan(0);
+    expect(screen.queryByText("研究失败")).not.toBeInTheDocument();
+  });
+
+  it("calibrates a network-disconnected stream with terminal GET and does not reconnect", async () => {
+    let eventCalls = 0;
+    mockServer.use(
+      http.post(runEndpoint, () => HttpResponse.json(queuedRunFixture, { status: 202 })),
+      http.get(eventsEndpoint, () => {
+        eventCalls += 1;
+        return HttpResponse.error();
+      }),
+      http.get(selectedRunEndpoint, () => HttpResponse.json(completedRunFixture)),
+    );
+    const { user } = await renderReadyWorkbench();
+    await user.click(screen.getByRole("button", { name: "提交深度研究" }));
+
+    expect((await screen.findAllByText("SSE 已断开")).length).toBeGreaterThan(0);
+    expect(screen.getAllByText("研究已完成").length).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 550));
+    expect(eventCalls).toBe(1);
   });
 
   it.each([
@@ -157,7 +310,7 @@ describe("query submission", () => {
     expect(button).toBeDisabled();
     await user.click(button);
     await first;
-    await screen.findByText("任务已提交");
+    await screen.findAllByText("研究已完成");
 
     expect(calls).toBe(1);
   });

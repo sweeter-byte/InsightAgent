@@ -3,10 +3,11 @@ import { ArrowUp, BookOpen, Check, CircleDashed, Sparkles } from "lucide-react";
 import type { PreviewScenario, ScenarioView } from "./mock-data";
 import { SectionLabel } from "./section-label";
 import type {
+  ActiveResearchRun,
   AsyncPhase,
-  ConfirmedRun,
   SynchronousAnswer,
 } from "./workbench-types";
+import type { ResearchRunState } from "./run-state";
 
 export type QueryMode = "smart" | "research";
 
@@ -22,7 +23,9 @@ type ResearchWorkspaceProps = {
   submissionPhase?: AsyncPhase;
   submissionError?: string | null;
   answer?: SynchronousAnswer | null;
-  run?: ConfirmedRun | null;
+  activeRun?: ActiveResearchRun | null;
+  runState?: ResearchRunState;
+  selectionError?: string | null;
 };
 
 export function ResearchWorkspace({
@@ -37,12 +40,14 @@ export function ResearchWorkspace({
   submissionPhase = "idle",
   submissionError,
   answer,
-  run,
+  activeRun,
+  runState,
+  selectionError,
 }: ResearchWorkspaceProps) {
   const isDemo = view !== undefined && scenario !== undefined;
   const presentation = isDemo
     ? view
-    : livePresentation(submissionPhase, submissionError, run);
+    : livePresentation(submissionPhase, submissionError, activeRun, runState, selectionError);
 
   return (
     <main
@@ -145,7 +150,7 @@ export function ResearchWorkspace({
             ? <MockReport />
             : <DemoResearchActivity scenario={scenario} view={view} />
         ) : (
-          <LiveResearchActivity run={run} />
+          <LiveResearchActivity activeRun={activeRun} runState={runState} selectionError={selectionError} />
         )}
       </section>
     </main>
@@ -155,7 +160,9 @@ export function ResearchWorkspace({
 function livePresentation(
   phase: AsyncPhase,
   error: string | null | undefined,
-  run: ConfirmedRun | null | undefined,
+  activeRun: ActiveResearchRun | null | undefined,
+  state: ResearchRunState | undefined,
+  selectionError: string | null | undefined,
 ): ScenarioView {
   if (phase === "submitting") {
     return {
@@ -183,19 +190,32 @@ function livePresentation(
       events: [],
     };
   }
-  if (run) {
+  if (selectionError) {
     return {
-      statusLabel: "任务已提交",
-      statusDetail:
-        run.source === "smart"
-          ? "Intent Router 已创建 Research Run；状态观察尚未接入。"
-          : "已显式创建 Research Run；状态观察尚未接入。",
-      statusTone: "success",
-      runStatus: run.status,
-      runId: run.runId,
-      threadId: run.threadId,
-      error: null,
+      statusLabel: "运行不存在",
+      statusDetail: "保存的运行标识已失效或后端未找到该运行。",
+      statusTone: "danger",
+      runStatus: "not_found",
+      runId: null,
+      threadId: null,
+      error: selectionError,
       canResume: false,
+      events: [],
+    };
+  }
+  if (activeRun) {
+    const scopedState = state?.runId === activeRun.runId ? state : undefined;
+    const status = scopedState?.observedStatus ?? scopedState?.record?.status ?? activeRun.initialRecord?.status ?? null;
+    const statusView = statusPresentation(status);
+    return {
+      statusLabel: statusView.label,
+      statusDetail: connectionLabel(scopedState?.connection ?? "idle"),
+      statusTone: statusView.tone,
+      runStatus: status ?? "—",
+      runId: activeRun.runId,
+      threadId: scopedState?.record?.thread_id ?? activeRun.initialRecord?.thread_id ?? null,
+      error: scopedState?.error ?? scopedState?.record?.error ?? null,
+      canResume: status === "interrupted" || status === "timed_out",
       events: [],
     };
   }
@@ -212,8 +232,19 @@ function livePresentation(
   };
 }
 
-function LiveResearchActivity({ run }: { run?: ConfirmedRun | null }) {
-  if (!run) {
+function LiveResearchActivity({
+  activeRun,
+  runState,
+  selectionError,
+}: {
+  activeRun?: ActiveResearchRun | null;
+  runState?: ResearchRunState;
+  selectionError?: string | null;
+}) {
+  if (selectionError) {
+    return <div className="empty-state"><BookOpen size={22} /><h3>运行不存在</h3><p>已清除失效的本地运行标识。</p></div>;
+  }
+  if (!activeRun) {
     return (
       <div className="empty-state">
         <BookOpen size={22} />
@@ -222,16 +253,57 @@ function LiveResearchActivity({ run }: { run?: ConfirmedRun | null }) {
       </div>
     );
   }
+  const scopedState = runState?.runId === activeRun.runId ? runState : undefined;
+  const status = scopedState?.observedStatus ?? scopedState?.record?.status ?? activeRun.initialRecord?.status ?? null;
+  const progress = scopedState?.latestProgress;
+  const stage = typeof progress?.stage === "string" ? progress.stage : null;
+  const message = typeof progress?.message === "string" ? progress.message : null;
+  const finalOutput = status === "completed" ? scopedState?.record?.final_output : null;
   return (
     <div className="activity-sheet">
       <div className="activity-sheet__header">
-        <span>Research 任务已进入后端</span>
-        <code>{run.status}</code>
+        <span>{activeRun.question ?? "重新挂载后任务文本不可用"}</span>
+        <code>{status ?? "等待状态"}</code>
       </div>
-      <p className="honesty-note">状态观察尚未接入。</p>
-      <p className="honesty-note">本阶段不推断 running、completed、事件、Citation 或最终报告。</p>
+      <span className={`connection-chip connection-chip--${scopedState?.connection ?? "idle"}`}>
+        {connectionLabel(scopedState?.connection ?? "idle")}
+      </span>
+      {stage && <p className="progress-fact"><strong>{stage}</strong>{message && <span>{message}</span>}</p>}
+      {finalOutput ? (
+        <div>
+          <p className="honesty-note">最终报告可用</p>
+          <pre className="report-preview">{finalOutput}</pre>
+        </div>
+      ) : (
+        <p className="honesty-note">仅展示后端已返回的运行事实；引用来源尚不可用。</p>
+      )}
     </div>
   );
+}
+
+function statusPresentation(status: ResearchRunState["observedStatus"]): {
+  label: string;
+  tone: ScenarioView["statusTone"];
+} {
+  if (status === "queued") return { label: "任务已排队", tone: "neutral" };
+  if (status === "running") return { label: "研究运行中", tone: "active" };
+  if (status === "completed") return { label: "研究已完成", tone: "success" };
+  if (status === "failed") return { label: "研究失败", tone: "danger" };
+  if (status === "timed_out") return { label: "研究超时", tone: "warning" };
+  if (status === "interrupted") return { label: "研究已中断", tone: "warning" };
+  return { label: "等待运行状态", tone: "neutral" };
+}
+
+function connectionLabel(connection: ResearchRunState["connection"]): string {
+  return {
+    idle: "SSE 空闲",
+    connecting: "SSE 连接中",
+    connected: "SSE 已连接",
+    reconnecting: "SSE 正在重连",
+    disconnected: "SSE 已断开",
+    protocol_error: "SSE 协议错误",
+    not_found: "运行不存在",
+  }[connection];
 }
 
 function DemoResearchActivity({

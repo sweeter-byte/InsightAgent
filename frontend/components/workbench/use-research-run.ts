@@ -60,6 +60,7 @@ export function useResearchRun(
 
     if (runId !== null) {
       const onNotFound = (missingRunId: string) => {
+        if (controller.signal.aborted || generationRef.current !== generation) return;
         onNotFoundRef.current?.(missingRunId);
       };
       const reportUnexpectedFailure = (error: unknown) => {

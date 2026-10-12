@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 
 import {
   healthResponseFixture,
+  completedRunFixture,
   materialImportResultFixture,
   queuedRunFixture,
   readinessResponseFixture,
@@ -27,5 +28,14 @@ export const handlers = [
   ),
   http.post(`${appBase}/v1/research/runs`, () =>
     HttpResponse.json(queuedRunFixture, { status: 202 }),
+  ),
+  http.get(`${appBase}/v1/research/runs/:runId`, () =>
+    HttpResponse.json(completedRunFixture),
+  ),
+  http.get(`${appBase}/v1/research/runs/:runId/events`, () =>
+    new HttpResponse(
+      "id: default-complete\nevent: run.completed\ndata: {}\n\n",
+      { headers: { "Content-Type": "text/event-stream" } },
+    ),
   ),
 ];

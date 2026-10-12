@@ -1,6 +1,7 @@
 import type {
   MaterialImportResult,
   ReadinessResponse,
+  RunRecord,
 } from "@/lib/protocol/types";
 
 export type AsyncPhase = "idle" | "submitting" | "succeeded" | "failed";
@@ -21,11 +22,11 @@ export type SessionMaterial = MaterialImportResult & {
   fileName: string;
 };
 
-export type ConfirmedRun = {
+export type ActiveResearchRun = {
   runId: string;
-  threadId: string | null;
-  status: string;
-  source: "smart" | "explicit";
+  source: "smart" | "explicit" | "restored";
+  question: string | null;
+  initialRecord?: RunRecord;
 };
 
 export type SynchronousAnswer = {

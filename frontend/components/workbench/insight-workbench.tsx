@@ -14,9 +14,15 @@ import {
 } from "./mock-data";
 import { ResearchWorkspace } from "./research-workspace";
 import { RunInspector } from "./run-inspector";
+import {
+  clearSelectedRunId,
+  readSelectedRunId,
+  storeSelectedRunId,
+} from "./run-selection";
+import { useResearchRun } from "./use-research-run";
 import type {
+  ActiveResearchRun,
   AsyncPhase,
-  ConfirmedRun,
   ConnectionState,
   SessionMaterial,
   SynchronousAnswer,
@@ -28,6 +34,14 @@ const initialConnection: ConnectionState = {
   readiness: null,
   error: null,
 };
+
+function browserSessionStorage(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
 
 export function InsightWorkbench({
   demoScenario,
@@ -50,7 +64,8 @@ export function InsightWorkbench({
   const [submissionPhase, setSubmissionPhase] = useState<AsyncPhase>("idle");
   const [submissionError, setSubmissionError] = useState<string | null>(null);
   const [answer, setAnswer] = useState<SynchronousAnswer | null>(null);
-  const [confirmedRun, setConfirmedRun] = useState<ConfirmedRun | null>(null);
+  const [activeRun, setActiveRun] = useState<ActiveResearchRun | null>(null);
+  const [missingRunId, setMissingRunId] = useState<string | null>(null);
   const connectionController = useRef<AbortController | null>(null);
   const connectionSequence = useRef(0);
   const uploadController = useRef<AbortController | null>(null);
@@ -62,6 +77,18 @@ export function InsightWorkbench({
   const view = scenarioViews[scenario];
   const isDemo = initialDemoScenario !== undefined;
   const canMutate = connection.phase === "ready";
+  const handleRunNotFound = useCallback((runId: string) => {
+    setActiveRun((current) => {
+      if (current?.runId !== runId) return current;
+      const storage = browserSessionStorage();
+      if (storage) clearSelectedRunId(storage);
+      setMissingRunId(runId);
+      return null;
+    });
+  }, []);
+  const runState = useResearchRun(isDemo ? null : activeRun, {
+    onNotFound: handleRunNotFound,
+  });
 
   const checkConnection = useCallback(() => {
     setConnection(initialConnection);
@@ -91,6 +118,18 @@ export function InsightWorkbench({
       connectionSequence.current += 1;
       connectionController.current?.abort();
     };
+  }, [isDemo]);
+
+  useEffect(() => {
+    if (isDemo) return;
+    const storage = browserSessionStorage();
+    if (!storage) return;
+    const runId = readSelectedRunId(storage);
+    if (!runId) return;
+    const restore = window.setTimeout(() => {
+      setActiveRun({ runId, source: "restored", question: null });
+    }, 0);
+    return () => window.clearTimeout(restore);
   }, [isDemo]);
 
   useEffect(
@@ -144,6 +183,7 @@ export function InsightWorkbench({
     const sequence = ++submissionSequence.current;
     setSubmissionPhase("submitting");
     setSubmissionError(null);
+    setMissingRunId(null);
     try {
       if (mode === "smart") {
         const result = await api.query(normalizedQuestion, controller.signal);
@@ -152,19 +192,25 @@ export function InsightWorkbench({
           if (result.status !== "queued" || !result.run_id) {
             throw new ApiProtocolError();
           }
-          setConfirmedRun({
+          const selection: ActiveResearchRun = {
             runId: result.run_id,
-            threadId: null,
-            status: result.status,
             source: "smart",
-          });
+            question: normalizedQuestion,
+          };
+          setMissingRunId(null);
+          setActiveRun(selection);
+          const storage = browserSessionStorage();
+          if (storage) storeSelectedRunId(selection.runId, storage);
           setAnswer(null);
         } else {
           if (result.status !== "completed" || result.answer === null) {
             throw new ApiProtocolError();
           }
           setAnswer({ intent: result.intent, text: result.answer });
-          setConfirmedRun(null);
+          setActiveRun(null);
+          setMissingRunId(null);
+          const storage = browserSessionStorage();
+          if (storage) clearSelectedRunId(storage);
         }
       } else {
         const result = await api.createResearchRun(
@@ -172,12 +218,16 @@ export function InsightWorkbench({
           controller.signal,
         );
         if (controller.signal.aborted || sequence !== submissionSequence.current) return;
-        setConfirmedRun({
+        const selection: ActiveResearchRun = {
           runId: result.run_id,
-          threadId: result.thread_id,
-          status: result.status,
           source: "explicit",
-        });
+          question: normalizedQuestion,
+          initialRecord: result,
+        };
+        setMissingRunId(null);
+        setActiveRun(selection);
+        const storage = browserSessionStorage();
+        if (storage) storeSelectedRunId(selection.runId, storage);
         setAnswer(null);
       }
       setSubmissionPhase("succeeded");
@@ -237,7 +287,13 @@ export function InsightWorkbench({
               ? "会话资料仅在本页保留 · 当前为共享知识库"
               : isDemo
                 ? `${view.statusLabel} · ${view.events.length} 个 Demo 事件`
-                : "尚未提交 Research Run"}
+                : activeRun
+                  ? activeRun.runId === runState.runId
+                    ? `${runState.observedStatus ?? runState.record?.status ?? "等待状态"} · ${runState.events.length} 个事件`
+                    : "等待状态 · 0 个事件"
+                  : missingRunId
+                    ? "运行不存在"
+                    : "尚未提交 Research Run"}
           </div>
         )}
       </div>
@@ -262,11 +318,15 @@ export function InsightWorkbench({
           submissionPhase={submissionPhase}
           submissionError={submissionError}
           answer={answer}
-          run={confirmedRun}
+          activeRun={activeRun}
+          runState={runState}
+          selectionError={missingRunId ? "运行不存在" : null}
         />
         <RunInspector
           view={isDemo ? view : undefined}
-          run={isDemo ? undefined : confirmedRun}
+          activeRun={isDemo ? undefined : activeRun}
+          runState={isDemo ? undefined : runState}
+          selectionError={isDemo || !missingRunId ? undefined : "运行不存在"}
           error={isDemo ? undefined : submissionError}
         />
       </div>
