@@ -188,6 +188,55 @@ The CLI explicitly labels this output `MOCK TEST`. It validates the evaluation p
 
 Baseline registration and candidate comparison are explicit operations; see [`examples/chapter18_demo.sh`](./examples/chapter18_demo.sh) for the complete commands.
 
+### BEIR SciFact retrieval benchmark
+
+The real SciFact adapter is separate from Mock Evaluation. BEIR loads the
+official test split and computes NDCG@10, Recall@5/10, and MRR@10; retrieval is
+performed by InsightAgent's own Dense, BM25, RRF, and Cross-Encoder components.
+Install its optional dependencies without changing the normal installation:
+
+```bash
+pip install -e ".[benchmark]"
+```
+
+BEIR 2.2 supports Python 3.9–3.12 and declares unpinned dependencies on
+`sentence-transformers`, `datasets`, and `pytrec-eval-terrier`. Before installing
+into an existing GPU environment, inspect the resolver plan and ensure it does
+not replace the environment's working PyTorch/CUDA packages. The benchmark
+script never installs, upgrades, or downgrades dependencies.
+
+Run each stage explicitly from any directory:
+
+```bash
+scripts/benchmarks/scifact.sh prepare
+scripts/benchmarks/scifact.sh index
+scripts/benchmarks/scifact.sh smoke
+scripts/benchmarks/scifact.sh full
+scripts/benchmarks/scifact.sh report eval_results/benchmarks/beir_scifact/<run_id>
+```
+
+`full` is never run automatically. `smoke` uses the complete official corpus
+but only a deterministic small query subset and labels all output as non-formal.
+Defaults can be overridden with command-line flags or `SCIFACT_*` environment
+variables; run `scripts/benchmarks/scifact.sh <command> --help` for the exact
+surface. The script uses the active `python` executable, or
+`SCIFACT_PYTHON` when explicitly set.
+
+Data and the isolated Qdrant index live under
+`.data/benchmarks/beir_scifact/`. Runs are written to
+`eval_results/benchmarks/beir_scifact/<run_id>/` with `manifest.json`,
+`metrics.json`, `predictions.jsonl`, `bad_cases.json`, `summary.md`, and
+`benchmark.log`. An incomplete run retains predictions and is marked failed;
+it never publishes partial metrics as a completed result.
+
+SciFact qrels are document-level while InsightAgent retrieves chunks. The
+adapter preserves `metadata["beir_doc_id"]`, collapses duplicate chunks at the
+first occurrence, and evaluates the resulting unique-document Top-10. This is
+therefore a document-level evaluation of InsightAgent's chunk index, not the
+official BEIR model configuration. The report discloses chunking, candidate
+depths, models, index fingerprint, rank-preserving BEIR scores, and stage timing
+semantics.
+
 ## Tests and Project Status
 
 Backend test entry point:

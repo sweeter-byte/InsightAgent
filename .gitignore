@@ -26,6 +26,7 @@ htmlcov/
 
 # Generated Evaluation runs (Datasets and fixtures remain versioned)
 eval_results/runs/
+eval_results/benchmarks/
 
 # Env / secrets
 .env

@@ -188,6 +188,49 @@ CLI 会明确输出 `MOCK TEST`。该结果用于验证评测管线、结果格�
 
 Baseline 注册与候选比较是显式操作，完整命令可参考 [`examples/chapter18_demo.sh`](./examples/chapter18_demo.sh)。
 
+### BEIR SciFact 真实检索评测
+
+真实 SciFact 适配与 Mock Evaluation 完全分离。BEIR 仅负责读取官方 Test
+Split，并计算 NDCG@10、Recall@5/10 和 MRR@10；检索过程仍使用 InsightAgent
+已有的 Dense、BM25、RRF 和 Cross-Encoder 组件。评测依赖采用独立可选组：
+
+```bash
+pip install -e ".[benchmark]"
+```
+
+BEIR 2.2 支持 Python 3.9–3.12，并声明依赖未锁版本的
+`sentence-transformers`、`datasets` 和 `pytrec-eval-terrier`。在已有 GPU
+环境安装前，应先检查 pip 的解析计划，确认不会替换当前可用的 PyTorch/CUDA
+包。Benchmark 脚本自身不会安装、升级或降级依赖。
+
+可从任意目录显式执行各阶段：
+
+```bash
+scripts/benchmarks/scifact.sh prepare
+scripts/benchmarks/scifact.sh index
+scripts/benchmarks/scifact.sh smoke
+scripts/benchmarks/scifact.sh full
+scripts/benchmarks/scifact.sh report eval_results/benchmarks/beir_scifact/<run_id>
+```
+
+脚本绝不会自动运行 `full`。`smoke` 使用完整官方语料，但只检索一组确定性的
+少量 Query，所有产物都会标记为非正式结果。参数可以通过命令行或
+`SCIFACT_*` 环境变量覆盖；使用
+`scripts/benchmarks/scifact.sh <command> --help` 查看完整参数。脚本默认使用
+当前激活环境的 `python`，也允许显式设置 `SCIFACT_PYTHON`。
+
+数据和隔离的 Qdrant 索引默认位于 `.data/benchmarks/beir_scifact/`；每次运行
+写入 `eval_results/benchmarks/beir_scifact/<run_id>/`，包含
+`manifest.json`、`metrics.json`、`predictions.jsonl`、`bad_cases.json`、
+`summary.md` 和 `benchmark.log`。中断或失败会保留已完成的逐 Query 记录，
+Manifest 标记为失败，也不会把部分指标伪装成完整结果。
+
+SciFact Qrels 是文档级标注，而 InsightAgent 返回 Chunk。适配层保留
+`metadata["beir_doc_id"]`，按最高排名 Chunk 将同文档去重，再计算唯一文档
+Top-10 指标。因此本实验是 InsightAgent Chunk 索引在 SciFact 上的文档级
+评测，并非 BEIR 官方模型配置。报告会披露 Chunk 参数、候选深度、模型、索引
+指纹、保持原排名的 BEIR 分数转换方式和各阶段耗时口径。
+
 ## 测试与项目状态
 
 后端测试入口：
