@@ -13,6 +13,7 @@ from openai import APIStatusError, BadRequestError
 from evals.deepresearch_bench.artifacts import RunStore
 from evals.deepresearch_bench.dataset import BenchmarkTask
 from evals.deepresearch_bench.runner import BenchmarkRunner, TaskDeadlineExceeded, task_deadline
+from insight_agent.llm import ContextBudgetExceeded
 from insight_agent.planning.coordinator import UnknownResearchThread
 
 
@@ -151,6 +152,39 @@ def test_runner_does_not_retry_wrapped_http_400_errors(
     assert execution["attempts"] == 1
     assert execution["error_type"] == "RuntimeError"
     assert execution["error_message"] == "research failed"
+
+
+@pytest.mark.parametrize("chain_attribute", [None, "__cause__", "__context__"])
+def test_runner_does_not_retry_context_budget_errors(
+    tmp_path: Path, chain_attribute: str | None
+) -> None:
+    budget_error = ContextBudgetExceeded(
+        context_window_tokens=100,
+        estimated_input_tokens=90,
+        reserved_output_tokens=8,
+        safety_margin_tokens=3,
+    )
+    error: Exception = budget_error
+    if chain_attribute is not None:
+        error = RuntimeError("research failed")
+        setattr(error, chain_attribute, budget_error)
+
+    class OverBudgetCoordinator(FakeCoordinator):
+        def start_research(self, query: str, *, thread_id: str):
+            self.calls.append((query, thread_id))
+            raise error
+
+    coordinator = OverBudgetCoordinator()
+    store = _store(tmp_path)
+
+    BenchmarkRunner(coordinator, store, timeout_seconds=10, max_retries=2).run(
+        [_task(1)]
+    )
+
+    execution = store.read_execution(1)
+    assert len(coordinator.calls) == 1
+    assert execution["status"] == "failed"
+    assert execution["attempts"] == 1
 
 
 def test_runner_retries_other_errors_up_to_max_retries(tmp_path: Path) -> None:

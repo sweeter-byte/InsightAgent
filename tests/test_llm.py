@@ -13,12 +13,21 @@ import sys
 
 import pytest
 
-from insight_agent.llm import LLMClient, LLMConfig, _require_env
+from insight_agent.llm import (
+    ContextBudgetExceeded,
+    LLMClient,
+    LLMConfig,
+    _estimate_chat_input_tokens,
+    _require_env,
+)
 
 _MODEL_ENV_KEYS = (
     "LLM_API_KEY",
     "LLM_BASE_URL",
     "LLM_MODEL",
+    "LLM_CONTEXT_WINDOW_TOKENS",
+    "LLM_RESERVED_OUTPUT_TOKENS",
+    "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
     "VISION_API_KEY",
     "VISION_BASE_URL",
     "VISION_MODEL",
@@ -41,7 +50,14 @@ def _restore_model_env(snapshot: dict[str, str | None]) -> None:
 def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Missing-variable tests must not refill values from a developer's .env.
     monkeypatch.setattr("insight_agent.llm.load_dotenv", lambda: False)
-    for key in ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL"):
+    for key in (
+        "LLM_API_KEY",
+        "LLM_BASE_URL",
+        "LLM_MODEL",
+        "LLM_CONTEXT_WINDOW_TOKENS",
+        "LLM_RESERVED_OUTPUT_TOKENS",
+        "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
+    ):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -171,6 +187,52 @@ def test_llm_config_reads_mapping_without_exposing_secret() -> None:
     assert "super-secret" not in repr(config)
 
 
+def test_llm_config_reads_optional_context_budget() -> None:
+    config = LLMConfig.from_env(
+        {
+            "LLM_API_KEY": "secret",
+            "LLM_BASE_URL": "https://example.invalid/v1",
+            "LLM_MODEL": "model-a",
+            "LLM_CONTEXT_WINDOW_TOKENS": " 128000 ",
+            "LLM_RESERVED_OUTPUT_TOKENS": " 4096 ",
+            "LLM_CONTEXT_SAFETY_MARGIN_TOKENS": " 1024 ",
+        }
+    )
+
+    assert config.context_window_tokens == 128000
+    assert config.reserved_output_tokens == 4096
+    assert config.context_safety_margin_tokens == 1024
+
+
+def test_llm_config_leaves_context_budget_disabled_by_default() -> None:
+    config = LLMConfig("secret", "https://example.invalid/v1", "model-a")
+
+    assert config.context_window_tokens is None
+    assert config.reserved_output_tokens == 0
+    assert config.context_safety_margin_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("context_window_tokens", 0),
+        ("context_window_tokens", True),
+        ("reserved_output_tokens", -1),
+        ("context_safety_margin_tokens", -1),
+    ],
+)
+def test_llm_config_rejects_invalid_context_budget(field: str, value: object) -> None:
+    values: dict[str, object] = {
+        "api_key": "secret",
+        "base_url": "https://example.invalid/v1",
+        "model": "model-a",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=field):
+        LLMConfig(**values)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("field", ["api_key", "base_url", "model"])
 def test_llm_config_rejects_empty_direct_values(field: str) -> None:
     values = {
@@ -271,6 +333,141 @@ def test_chat_forwards_optional_timeout_without_changing_legacy_calls() -> None:
 
     assert "timeout" not in calls[0]
     assert calls[1]["timeout"] == 2.5
+
+
+def test_input_estimate_covers_all_message_roles_and_tool_definitions() -> None:
+    empty_by_role = [
+        {"role": role, "content": ""}
+        for role in ("system", "user", "assistant", "tool")
+    ]
+    full_messages = [
+        {**message, "content": f"private-{message['role']}-content"}
+        for message in empty_by_role
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "private-tool-description",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        }
+    ]
+
+    empty_estimate = _estimate_chat_input_tokens(empty_by_role, None)
+    message_estimate = _estimate_chat_input_tokens(full_messages, None)
+    tools_estimate = _estimate_chat_input_tokens(full_messages, tools)
+
+    assert message_estimate > empty_estimate
+    assert tools_estimate > message_estimate
+
+
+def test_chat_allows_complete_request_within_context_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            calls.append(kwargs)
+            return SimpleNamespace(usage=None)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    messages = [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "tool request"},
+        {"role": "tool", "content": "tool result"},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    reserve = 8
+    margin = 5
+    estimated = _estimate_chat_input_tokens(messages, tools)
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            "secret",
+            "https://example.invalid/v1",
+            "model",
+            context_window_tokens=estimated + reserve + margin,
+            reserved_output_tokens=reserve,
+            context_safety_margin_tokens=margin,
+        )
+    )
+
+    client.chat(messages, tools)
+
+    assert len(calls) == 1
+    assert calls[0]["messages"] == messages
+    assert calls[0]["tools"] == tools
+
+
+def test_chat_rejects_over_budget_request_before_sdk_without_leaking_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            calls.append(kwargs)
+            return SimpleNamespace(usage=None)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    secret = "api-key-that-must-not-leak"
+    private_content = "private prompt and evidence body"
+    messages = [{"role": "user", "content": private_content}]
+    estimated = _estimate_chat_input_tokens(messages, None)
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            secret,
+            "https://example.invalid/v1",
+            "model",
+            context_window_tokens=estimated + 6,
+            reserved_output_tokens=4,
+            context_safety_margin_tokens=3,
+        )
+    )
+
+    with pytest.raises(ContextBudgetExceeded) as excinfo:
+        client.chat(messages)
+
+    assert calls == []
+    assert excinfo.value.context_window_tokens == estimated + 6
+    assert excinfo.value.estimated_input_tokens == estimated
+    assert excinfo.value.reserved_output_tokens == 4
+    assert excinfo.value.safety_margin_tokens == 3
+    assert excinfo.value.input_budget_tokens == estimated - 1
+    assert private_content not in str(excinfo.value)
+    assert secret not in str(excinfo.value)
 
 
 def test_llm_client_records_provider_usage_without_inventing_missing_tokens(

@@ -17,6 +17,7 @@ from evals.deepresearch_bench.artifacts import (
     utc_now,
 )
 from evals.deepresearch_bench.dataset import BenchmarkTask
+from insight_agent.llm import ContextBudgetExceeded
 from insight_agent.planning.coordinator import UnknownResearchThread
 
 
@@ -38,7 +39,7 @@ def _is_retryable_error(error: BaseException) -> bool:
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, BadRequestError):
+        if isinstance(current, (BadRequestError, ContextBudgetExceeded)):
             return False
         if isinstance(current, APIStatusError) and current.status_code == 400:
             return False

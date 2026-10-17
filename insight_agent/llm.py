@@ -11,6 +11,7 @@ No agent loop, no tool execution, no retry / memory / cache logic lives here.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from collections.abc import Mapping
@@ -58,12 +59,28 @@ class LLMConfig:
     api_key: str = field(repr=False)
     base_url: str
     model: str
+    context_window_tokens: int | None = None
+    reserved_output_tokens: int = 0
+    context_safety_margin_tokens: int = 0
 
     def __post_init__(self) -> None:
         for name in ("api_key", "base_url", "model"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"LLM {name} must not be empty")
+        if (
+            self.context_window_tokens is not None
+            and (
+                isinstance(self.context_window_tokens, bool)
+                or not isinstance(self.context_window_tokens, int)
+                or self.context_window_tokens <= 0
+            )
+        ):
+            raise ValueError("LLM context_window_tokens must be a positive integer")
+        for name in ("reserved_output_tokens", "context_safety_margin_tokens"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"LLM {name} must be a non-negative integer")
 
     @classmethod
     def from_env(
@@ -89,6 +106,96 @@ class LLMConfig:
             api_key=resolved["LLM_API_KEY"],
             base_url=resolved["LLM_BASE_URL"],
             model=resolved["LLM_MODEL"],
+            context_window_tokens=_optional_positive_int(
+                values, "LLM_CONTEXT_WINDOW_TOKENS"
+            ),
+            reserved_output_tokens=_nonnegative_int(
+                values, "LLM_RESERVED_OUTPUT_TOKENS"
+            ),
+            context_safety_margin_tokens=_nonnegative_int(
+                values, "LLM_CONTEXT_SAFETY_MARGIN_TOKENS"
+            ),
+        )
+
+
+def _optional_positive_int(
+    values: Mapping[str, str],
+    name: str,
+) -> int | None:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _nonnegative_int(values: Mapping[str, str], name: str) -> int:
+    raw = values.get(name, "").strip()
+    if not raw:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _estimate_chat_input_tokens(
+    messages: Sequence[dict[str, Any]],
+    tools: Sequence[dict[str, Any]] | None,
+) -> int:
+    """Conservatively estimate tokens in the complete JSON request input.
+
+    This intentionally model-agnostic heuristic counts at least one estimated
+    token per Unicode character and at least one per three UTF-8 bytes. It is
+    not an exact tokenizer and may overestimate, especially for plain ASCII.
+    """
+    payload: dict[str, Any] = {"messages": list(messages)}
+    if tools is not None:
+        payload["tools"] = list(tools)
+    serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    utf8_bytes = len(serialized.encode("utf-8"))
+    return max(len(serialized), (utf8_bytes + 2) // 3)
+
+
+class ContextBudgetExceeded(ValueError):
+    """Raised before an SDK call when an estimated request exceeds its budget."""
+
+    def __init__(
+        self,
+        *,
+        context_window_tokens: int,
+        estimated_input_tokens: int,
+        reserved_output_tokens: int,
+        safety_margin_tokens: int,
+    ) -> None:
+        self.context_window_tokens = context_window_tokens
+        self.estimated_input_tokens = estimated_input_tokens
+        self.reserved_output_tokens = reserved_output_tokens
+        self.safety_margin_tokens = safety_margin_tokens
+        self.input_budget_tokens = (
+            context_window_tokens
+            - reserved_output_tokens
+            - safety_margin_tokens
+        )
+        self.estimated_total_tokens = (
+            estimated_input_tokens + reserved_output_tokens + safety_margin_tokens
+        )
+        super().__init__(
+            "LLM context budget exceeded: "
+            f"estimated_input_tokens={estimated_input_tokens}, "
+            f"reserved_output_tokens={reserved_output_tokens}, "
+            f"safety_margin_tokens={safety_margin_tokens}, "
+            f"estimated_total_tokens={self.estimated_total_tokens}, "
+            f"context_window_tokens={context_window_tokens}, "
+            f"input_budget_tokens={self.input_budget_tokens}"
         )
 
 
@@ -103,6 +210,9 @@ class LLMClient:
     def __init__(self, config: LLMConfig | None = None) -> None:
         resolved = config if config is not None else LLMConfig.from_env()
         self.model: str = resolved.model
+        self._context_window_tokens = resolved.context_window_tokens
+        self._reserved_output_tokens = resolved.reserved_output_tokens
+        self._context_safety_margin_tokens = resolved.context_safety_margin_tokens
         self.client: OpenAI = OpenAI(
             api_key=resolved.api_key,
             base_url=resolved.base_url,
@@ -142,14 +252,36 @@ class LLMClient:
             responsible for reading ``.choices[0].message`` etc.
         """
         self._ensure_usage_state()
+        request_messages = list(messages)
         kwargs: dict[str, Any] = {
             "model": self.model,
-            "messages": list(messages),
+            "messages": request_messages,
         }
+        request_tools: list[dict[str, Any]] | None = None
         if tools is not None:
-            kwargs["tools"] = list(tools)
+            request_tools = list(tools)
+            kwargs["tools"] = request_tools
         if timeout is not None:
             kwargs["timeout"] = timeout
+        context_window_tokens = getattr(self, "_context_window_tokens", None)
+        if context_window_tokens is not None:
+            estimated_input_tokens = _estimate_chat_input_tokens(
+                request_messages, request_tools
+            )
+            reserved_output_tokens = self._reserved_output_tokens
+            safety_margin_tokens = self._context_safety_margin_tokens
+            if (
+                estimated_input_tokens
+                + reserved_output_tokens
+                + safety_margin_tokens
+                > context_window_tokens
+            ):
+                raise ContextBudgetExceeded(
+                    context_window_tokens=context_window_tokens,
+                    estimated_input_tokens=estimated_input_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
+                    safety_margin_tokens=safety_margin_tokens,
+                )
         try:
             response = self.client.chat.completions.create(**kwargs)
         except BaseException:

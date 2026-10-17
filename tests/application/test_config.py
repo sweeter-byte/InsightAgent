@@ -24,6 +24,9 @@ def test_from_env_populates_complete_explicit_mapping() -> None:
             "LLM_API_KEY": " llm-secret ",
             "LLM_BASE_URL": " https://llm.example/v1 ",
             "LLM_MODEL": " text-model ",
+            "LLM_CONTEXT_WINDOW_TOKENS": "128000",
+            "LLM_RESERVED_OUTPUT_TOKENS": "4096",
+            "LLM_CONTEXT_SAFETY_MARGIN_TOKENS": "1024",
             "VISION_API_KEY": " vision-secret ",
             "VISION_BASE_URL": " https://vision.example/v1 ",
             "VISION_MODEL": " vision-model ",
@@ -55,6 +58,9 @@ def test_from_env_populates_complete_explicit_mapping() -> None:
     assert config.llm.api_key == "llm-secret"
     assert config.llm.base_url == "https://llm.example/v1"
     assert config.llm.model == "text-model"
+    assert config.llm.context_window_tokens == 128000
+    assert config.llm.reserved_output_tokens == 4096
+    assert config.llm.context_safety_margin_tokens == 1024
     assert config.vision is not None
     assert config.vision.api_key == "vision-secret"
     assert config.vision.base_url == "https://vision.example/v1"
