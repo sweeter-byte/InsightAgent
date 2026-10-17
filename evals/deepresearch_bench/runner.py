@@ -9,6 +9,8 @@ import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Protocol, Sequence
 
+from openai import APIStatusError, BadRequestError
+
 from evals.deepresearch_bench.artifacts import (
     BENCHMARK_CHECKPOINT_RELATIVE_PATH,
     RunStore,
@@ -26,6 +28,25 @@ class Coordinator(Protocol):
 
 class TaskDeadlineExceeded(TimeoutError):
     pass
+
+
+def _is_retryable_error(error: BaseException) -> bool:
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BadRequestError):
+            return False
+        if isinstance(current, APIStatusError) and current.status_code == 400:
+            return False
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return True
 
 
 @contextmanager
@@ -232,7 +253,7 @@ class BenchmarkRunner:
                 raise
             except Exception as exc:
                 last_error = exc
-                if attempt <= self.max_retries:
+                if attempt <= self.max_retries and _is_retryable_error(exc):
                     self.store.log(
                         f"retry task={task.id} attempt={attempt} error={type(exc).__name__}"
                     )

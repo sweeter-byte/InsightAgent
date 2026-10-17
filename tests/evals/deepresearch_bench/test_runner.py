@@ -6,7 +6,9 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import APIStatusError, BadRequestError
 
 from evals.deepresearch_bench.artifacts import RunStore
 from evals.deepresearch_bench.dataset import BenchmarkTask
@@ -32,6 +34,18 @@ class FakeCoordinator:
         output = "" if task_id in self.empty_ids else f"# Report {task_id}\n\nFact [{task_id}](https://example.com/{task_id})."
         state = SimpleNamespace(final_output=output, route_decisions=[object(), object()])
         return SimpleNamespace(completed=True, state=state)
+
+
+def _status_error(
+    status_code: int, error_type: type[APIStatusError] = APIStatusError
+) -> APIStatusError:
+    request = httpx.Request("POST", "https://api.example.com/v1/chat/completions")
+    response = httpx.Response(status_code, request=request)
+    return error_type(
+        "maximum context length exceeded",
+        response=response,
+        body={"error": {"message": "maximum context length exceeded"}},
+    )
 
 
 def _store(tmp_path: Path, *, fingerprint: str = "fp") -> RunStore:
@@ -80,6 +94,78 @@ def test_runner_marks_failures_and_empty_reports_without_fake_success(tmp_path: 
     assert fifty_one["status"] == "failed"
     assert fifty_one["report_generated"] is False
     assert "empty" in fifty_one["error_message"].lower()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_type"),
+    [
+        (_status_error(400, BadRequestError), "BadRequestError"),
+        (_status_error(400), "APIStatusError"),
+    ],
+)
+def test_runner_does_not_retry_http_400_errors(
+    tmp_path: Path, error: APIStatusError, expected_type: str
+) -> None:
+    class BadRequestCoordinator(FakeCoordinator):
+        def start_research(self, query: str, *, thread_id: str):
+            self.calls.append((query, thread_id))
+            raise error
+
+    coordinator = BadRequestCoordinator()
+    store = _store(tmp_path)
+
+    BenchmarkRunner(coordinator, store, timeout_seconds=10, max_retries=2).run(
+        [_task(1)]
+    )
+
+    execution = store.read_execution(1)
+    assert len(coordinator.calls) == 1
+    assert execution["status"] == "failed"
+    assert execution["attempts"] == 1
+    assert execution["error_type"] == expected_type
+    assert execution["error_message"] == "maximum context length exceeded"
+
+
+@pytest.mark.parametrize("chain_attribute", ["__cause__", "__context__"])
+def test_runner_does_not_retry_wrapped_http_400_errors(
+    tmp_path: Path, chain_attribute: str
+) -> None:
+    wrapped = RuntimeError("research failed")
+    setattr(wrapped, chain_attribute, _status_error(400, BadRequestError))
+
+    class WrappedBadRequestCoordinator(FakeCoordinator):
+        def start_research(self, query: str, *, thread_id: str):
+            self.calls.append((query, thread_id))
+            raise wrapped
+
+    coordinator = WrappedBadRequestCoordinator()
+    store = _store(tmp_path)
+
+    BenchmarkRunner(coordinator, store, timeout_seconds=10, max_retries=2).run(
+        [_task(1)]
+    )
+
+    execution = store.read_execution(1)
+    assert len(coordinator.calls) == 1
+    assert execution["status"] == "failed"
+    assert execution["attempts"] == 1
+    assert execution["error_type"] == "RuntimeError"
+    assert execution["error_message"] == "research failed"
+
+
+def test_runner_retries_other_errors_up_to_max_retries(tmp_path: Path) -> None:
+    coordinator = FakeCoordinator(fail_ids={1})
+    store = _store(tmp_path)
+
+    BenchmarkRunner(coordinator, store, timeout_seconds=10, max_retries=2).run(
+        [_task(1)]
+    )
+
+    execution = store.read_execution(1)
+    assert len(coordinator.calls) == 3
+    assert execution["status"] == "failed"
+    assert execution["attempts"] == 3
+    assert execution["error_type"] == "RuntimeError"
 
 
 def test_runner_redacts_api_keys_from_failure_artifacts(
