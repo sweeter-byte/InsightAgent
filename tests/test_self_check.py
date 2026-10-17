@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -143,6 +144,18 @@ def _two_task_research_inputs() -> tuple[
     return plan, report, pool, assessments
 
 
+def _evidence(evidence_id: str, *, content: str | None = None) -> Evidence:
+    return Evidence(
+        id=evidence_id,
+        task_id="T1",
+        retrieval_source=RetrievalSource.LOCAL,
+        origin_id=f"origin-{evidence_id}",
+        content=content if content is not None else f"Content for {evidence_id}",
+        source=f"{evidence_id}.md",
+        metadata={"filename": f"{evidence_id}.md"},
+    )
+
+
 def test_self_check_models_use_finite_vocabulary() -> None:
     issue = SelfCheckIssue(
         code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
@@ -174,8 +187,17 @@ def test_research_state_defaults_self_check_fields() -> None:
     assert state.self_check_rounds == 0
 
 
-def test_checker_parses_pass_and_builds_claim_centered_context() -> None:
+def test_checker_parses_pass_and_builds_deduplicated_evidence_catalog() -> None:
     plan, report, pool, assessments = _research_inputs()
+    report.sections[0].claims.append(
+        Claim(
+            id="T1-C2",
+            task_id="T1",
+            text="The same experiments measured token use.",
+            evidence_ids=["E1"],
+        )
+    )
+    report = assemble_report(plan.objective, report.sections, pool)
     llm = FakeLLM(
         json.dumps(
             {
@@ -210,13 +232,8 @@ def test_checker_parses_pass_and_builds_claim_centered_context() -> None:
                 "text": "Method A reduced tokens in two experiments.",
                 "evidence_ids": ["E1"],
             },
-            "evidence": [
-                {
-                    "evidence_id": "E1",
-                    "content": "Method A reduced tokens in two experiments.",
-                    "retrieval_source": "local",
-                }
-            ],
+            "provided_evidence_ids": ["E1"],
+            "unprovided_evidence_ids": [],
             "latest_assessment": {
                 "sufficient": False,
                 "missing_information": [
@@ -224,7 +241,179 @@ def test_checker_parses_pass_and_builds_claim_centered_context() -> None:
                 ],
                 "reason": "One required comparison remains unavailable.",
             },
+        },
+        {
+            "task": {"id": "T1", "question": "How does method A perform?"},
+            "claim": {
+                "id": "T1-C2",
+                "text": "The same experiments measured token use.",
+                "evidence_ids": ["E1"],
+            },
+            "provided_evidence_ids": ["E1"],
+            "unprovided_evidence_ids": [],
+            "latest_assessment": {
+                "sufficient": False,
+                "missing_information": [
+                    "Long-term maintenance cost is unknown."
+                ],
+                "reason": "One required comparison remains unavailable.",
+            },
+        },
+    ]
+    assert payload["evidence_catalog"] == {
+        "E1": {
+            "evidence_id": "E1",
+            "content": "Method A reduced tokens in two experiments.",
+            "content_is_excerpt": False,
+            "original_content_char_count": 43,
+            "retrieval_source": "local",
+            "origin_id": "origin-E1",
+            "source": "paper.md",
+            "metadata": {"filename": "paper.md"},
         }
+    }
+    serialized = llm.calls[0]["messages"][1]["content"]
+    assert serialized.count(
+        '"content": "Method A reduced tokens in two experiments."'
+    ) == 1
+    assert "Do not infer" in llm.calls[0]["messages"][0]["content"]
+
+
+def test_checker_bounds_catalog_content_without_mutating_evidence() -> None:
+    plan, _, _, assessments = _research_inputs()
+    evidence = [
+        _evidence(
+            f"E{index}",
+            content=(
+                f"HEAD-{index}:"
+                + (str(index) * 7000)
+                + f":TAIL-{index}"
+            ),
+        )
+        for index in range(1, 12)
+    ]
+    original_evidence = deepcopy(evidence)
+    claims = [
+        Claim(
+            id=f"T1-C{index}",
+            task_id="T1",
+            text=f"Claim {index}",
+            evidence_ids=[f"E{index}"],
+        )
+        for index in range(1, 12)
+    ]
+    pool = {"T1": [_evidence("UNREFERENCED"), *evidence]}
+    report = assemble_report(
+        plan.objective,
+        [
+            ReportSection(
+                task_id="T1",
+                title=plan.tasks[0].question,
+                claims=claims,
+                sufficient=False,
+                missing_information=list(
+                    assessments["T1"][-1].missing_information
+                ),
+            )
+        ],
+        pool,
+    )
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "status": "revise",
+                "issues": [
+                    {
+                        "code": "unsupported_claim",
+                        "reason": "E11 was not supplied in the bounded view.",
+                        "task_id": "T1",
+                        "claim_id": "T1-C11",
+                    }
+                ],
+                "summary": "One Claim could not be fully verified.",
+            }
+        )
+    )
+
+    ReportSelfChecker(llm=llm).check(
+        plan=plan,
+        report=report,
+        evidence_pool=pool,
+        assessments=assessments,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    catalog = payload["evidence_catalog"]
+    assert list(catalog) == [f"E{index}" for index in range(1, 11)]
+    assert "UNREFERENCED" not in catalog
+    assert len(catalog) == 10
+    assert all(len(item["content"]) <= 6000 for item in catalog.values())
+    assert sum(len(item["content"]) for item in catalog.values()) <= 40000
+    assert all("CONTENT OMITTED" in item["content"] for item in catalog.values())
+    assert catalog["E1"]["content"].startswith("HEAD-1:")
+    assert catalog["E1"]["content"].endswith(":TAIL-1")
+    assert payload["evidence_view"]["referenced_evidence_count"] == 11
+    assert payload["evidence_view"]["provided_evidence_count"] == 10
+    assert payload["claim_contexts"][-1]["claim"]["evidence_ids"] == ["E11"]
+    assert payload["claim_contexts"][-1]["provided_evidence_ids"] == []
+    assert payload["claim_contexts"][-1]["unprovided_evidence_ids"] == ["E11"]
+    assert evidence == original_evidence
+
+
+def test_checker_cannot_pass_when_claim_evidence_is_not_provided() -> None:
+    plan, _, _, assessments = _research_inputs()
+    evidence = [_evidence(f"E{index}") for index in range(1, 12)]
+    report = assemble_report(
+        plan.objective,
+        [
+            ReportSection(
+                task_id="T1",
+                title=plan.tasks[0].question,
+                claims=[
+                    Claim(
+                        id=f"T1-C{index}",
+                        task_id="T1",
+                        text=f"Claim {index}",
+                        evidence_ids=[f"E{index}"],
+                    )
+                    for index in range(1, 12)
+                ],
+                sufficient=False,
+                missing_information=list(
+                    assessments["T1"][-1].missing_information
+                ),
+            )
+        ],
+        {"T1": evidence},
+    )
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "status": "pass",
+                "issues": [],
+                "summary": "All Claims are supported.",
+            }
+        )
+    )
+
+    result = ReportSelfChecker(llm=llm).check(
+        plan=plan,
+        report=report,
+        evidence_pool={"T1": evidence},
+        assessments=assessments,
+    )
+
+    assert result.status is SelfCheckStatus.REVISE
+    assert result.issues == [
+        SelfCheckIssue(
+            code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+            reason=(
+                "Claim could not be fully verified because referenced Evidence "
+                "was not provided in the bounded self-check view: E11."
+            ),
+            task_id="T1",
+            claim_id="T1-C11",
+        )
     ]
 
 

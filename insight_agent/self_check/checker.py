@@ -19,6 +19,14 @@ from insight_agent.self_check.models import (
 from insight_agent.self_check.prompts import SELF_CHECK_SYSTEM_PROMPT
 
 
+MAX_SELF_CHECK_EVIDENCE_ITEMS = 10
+MAX_SELF_CHECK_EVIDENCE_CONTENT_CHARS = 6000
+MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS = 40000
+SELF_CHECK_CONTENT_OMISSION_MARKER = (
+    "\n\n[... CONTENT OMITTED FROM SELF CHECK VIEW ...]\n\n"
+)
+
+
 class ReportSelfChecker:
     """Judge report fidelity without changing research state or retrieving."""
 
@@ -40,11 +48,45 @@ class ReportSelfChecker:
             for evidence in items
         }
         task_by_id = {task.id: task for task in plan.tasks}
+        referenced_evidence_ids: list[str] = []
+        seen_evidence_ids: set[str] = set()
+        for section in report.sections:
+            for claim in section.claims:
+                for evidence_id in claim.evidence_ids:
+                    if evidence_id not in seen_evidence_ids:
+                        seen_evidence_ids.add(evidence_id)
+                        referenced_evidence_ids.append(evidence_id)
+
+        # First-reference order is deterministic and prioritizes Evidence that the
+        # report actually cites. A future optimization may use claim-aware fair
+        # allocation if reports routinely exceed this bounded single-pass view.
+        selected_evidence_ids = referenced_evidence_ids[
+            :MAX_SELF_CHECK_EVIDENCE_ITEMS
+        ]
+        selected_evidence = [
+            evidence_by_id[evidence_id]
+            for evidence_id in selected_evidence_ids
+        ]
+        content_budgets = self._allocate_content_budgets(selected_evidence)
+        provided_evidence_ids = set(selected_evidence_ids)
         claim_contexts: list[dict[str, Any]] = []
+        unprovided_by_claim: dict[str, list[str]] = {}
         for section in report.sections:
             task = task_by_id[section.task_id]
             assessment = latest[section.task_id]
             for claim in section.claims:
+                provided_ids = [
+                    evidence_id
+                    for evidence_id in claim.evidence_ids
+                    if evidence_id in provided_evidence_ids
+                ]
+                unprovided_ids = [
+                    evidence_id
+                    for evidence_id in claim.evidence_ids
+                    if evidence_id not in provided_evidence_ids
+                ]
+                if unprovided_ids:
+                    unprovided_by_claim[claim.id] = unprovided_ids
                 claim_contexts.append(
                     {
                         "task": {"id": task.id, "question": task.question},
@@ -53,16 +95,8 @@ class ReportSelfChecker:
                             "text": claim.text,
                             "evidence_ids": list(claim.evidence_ids),
                         },
-                        "evidence": [
-                            {
-                                "evidence_id": evidence_by_id[evidence_id].id,
-                                "content": evidence_by_id[evidence_id].content,
-                                "retrieval_source": evidence_by_id[
-                                    evidence_id
-                                ].retrieval_source.value,
-                            }
-                            for evidence_id in claim.evidence_ids
-                        ],
+                        "provided_evidence_ids": provided_ids,
+                        "unprovided_evidence_ids": unprovided_ids,
                         "latest_assessment": self._assessment_payload(assessment),
                     }
                 )
@@ -93,7 +127,42 @@ class ReportSelfChecker:
                 task.id: self._assessment_payload(latest[task.id])
                 for task in plan.tasks
             },
+            "evidence_view": {
+                "bounded": True,
+                "selection_rule": (
+                    "unique Evidence in first Claim-reference order"
+                ),
+                "referenced_evidence_count": len(referenced_evidence_ids),
+                "provided_evidence_count": len(selected_evidence_ids),
+                "max_evidence_items": MAX_SELF_CHECK_EVIDENCE_ITEMS,
+                "max_content_chars_per_evidence": (
+                    MAX_SELF_CHECK_EVIDENCE_CONTENT_CHARS
+                ),
+                "max_total_content_chars": (
+                    MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS
+                ),
+            },
             "claim_contexts": claim_contexts,
+            "evidence_catalog": {
+                evidence.id: {
+                    "evidence_id": evidence.id,
+                    "content": self._excerpt_content(
+                        evidence.content,
+                        content_budget,
+                    ),
+                    "content_is_excerpt": len(evidence.content) > content_budget,
+                    "original_content_char_count": len(evidence.content),
+                    "retrieval_source": evidence.retrieval_source.value,
+                    "origin_id": evidence.origin_id,
+                    "source": evidence.source,
+                    "metadata": evidence.metadata,
+                }
+                for evidence, content_budget in zip(
+                    selected_evidence,
+                    content_budgets,
+                    strict=True,
+                )
+            },
         }
         try:
             serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -117,7 +186,106 @@ class ReportSelfChecker:
             raise SelfCheckError(
                 f"self-check returned invalid JSON: {exc.msg}"
             ) from exc
-        return self._parse_result(result, plan=plan, report=report)
+        parsed = self._parse_result(result, plan=plan, report=report)
+        return self._enforce_bounded_view_result(
+            parsed,
+            report=report,
+            unprovided_by_claim=unprovided_by_claim,
+        )
+
+    @staticmethod
+    def _allocate_content_budgets(evidence: list[Evidence]) -> list[int]:
+        """Allocate the total body budget without truncating short items."""
+        target_sizes = [
+            min(len(item.content), MAX_SELF_CHECK_EVIDENCE_CONTENT_CHARS)
+            for item in evidence
+        ]
+        if sum(target_sizes) <= MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS:
+            return target_sizes
+
+        budgets = [0] * len(target_sizes)
+        remaining_budget = MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS
+        active = set(range(len(target_sizes)))
+        while active:
+            fair_share = remaining_budget // len(active)
+            completed = [
+                index for index in active if target_sizes[index] <= fair_share
+            ]
+            if completed:
+                for index in completed:
+                    budgets[index] = target_sizes[index]
+                    remaining_budget -= budgets[index]
+                    active.remove(index)
+                continue
+
+            ordered_active = sorted(active)
+            for index in ordered_active:
+                budgets[index] = fair_share
+            remainder = remaining_budget - fair_share * len(ordered_active)
+            for index in ordered_active[:remainder]:
+                budgets[index] += 1
+            break
+        return budgets
+
+    @staticmethod
+    def _excerpt_content(content: str, limit: int) -> str:
+        """Return an exact-size head/tail excerpt when content exceeds limit."""
+        if len(content) <= limit:
+            return content
+        marker_size = len(SELF_CHECK_CONTENT_OMISSION_MARKER)
+        if limit <= marker_size:
+            return SELF_CHECK_CONTENT_OMISSION_MARKER[:limit]
+        retained_chars = limit - marker_size
+        head_chars = (retained_chars + 1) // 2
+        tail_chars = retained_chars // 2
+        return (
+            content[:head_chars]
+            + SELF_CHECK_CONTENT_OMISSION_MARKER
+            + content[-tail_chars:]
+        )
+
+    @staticmethod
+    def _enforce_bounded_view_result(
+        result: SelfCheckResult,
+        *,
+        report: StructuredReport,
+        unprovided_by_claim: dict[str, list[str]],
+    ) -> SelfCheckResult:
+        """Prevent omitted Evidence from producing a false complete pass."""
+        if not unprovided_by_claim:
+            return result
+
+        existing_unverified_claims = {
+            issue.claim_id
+            for issue in result.issues
+            if issue.code is SelfCheckIssueCode.UNSUPPORTED_CLAIM
+        }
+        issues = list(result.issues)
+        for section in report.sections:
+            for claim in section.claims:
+                missing_ids = unprovided_by_claim.get(claim.id)
+                if not missing_ids or claim.id in existing_unverified_claims:
+                    continue
+                issues.append(
+                    SelfCheckIssue(
+                        code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+                        reason=(
+                            "Claim could not be fully verified because referenced "
+                            "Evidence was not provided in the bounded self-check "
+                            f"view: {', '.join(missing_ids)}."
+                        ),
+                        task_id=claim.task_id,
+                        claim_id=claim.id,
+                    )
+                )
+
+        summary = result.summary
+        if result.status is SelfCheckStatus.PASS:
+            summary = (
+                f"{summary} Complete verification was not possible because "
+                "some referenced Evidence was outside the bounded self-check view."
+            )
+        return SelfCheckResult(SelfCheckStatus.REVISE, issues, summary)
 
     @staticmethod
     def _validate_inputs(
