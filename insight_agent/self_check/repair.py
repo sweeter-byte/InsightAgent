@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
 from insight_agent.evidence import Evidence, EvidenceAssessment
@@ -10,6 +11,7 @@ from insight_agent.llm import LLMClient
 from insight_agent.planning import ResearchPlan
 from insight_agent.reporting import (
     Claim,
+    ReportGenerationError,
     ReportSection,
     StructuredReport,
     assemble_report,
@@ -25,6 +27,14 @@ from insight_agent.self_check.models import (
     SelfCheckStatus,
 )
 from insight_agent.self_check.prompts import REPAIR_SYSTEM_PROMPT
+
+
+MAX_REPAIR_EVIDENCE_ITEMS = 10
+MAX_REPAIR_EVIDENCE_CONTENT_CHARS = 6000
+MAX_TOTAL_REPAIR_EVIDENCE_CONTENT_CHARS = 40000
+REPAIR_CONTENT_OMISSION_MARKER = (
+    "\n\n[... CONTENT OMITTED FROM REPORT REPAIR VIEW ...]\n\n"
+)
 
 
 class ReportRepairer:
@@ -58,6 +68,21 @@ class ReportRepairer:
             )
             for task in plan.tasks
         }
+        selected_evidence = self._select_evidence(
+            plan=plan,
+            report=report,
+            self_check_result=self_check_result,
+            candidates_by_task=candidates_by_task,
+        )
+        content_budgets = self._allocate_content_budgets(selected_evidence)
+        provided_ids_by_task = {
+            task.id: [
+                evidence.id
+                for evidence in selected_evidence
+                if evidence.task_id == task.id
+            ]
+            for task in plan.tasks
+        }
         payload = {
             "current_report": {
                 "objective": report.objective,
@@ -78,17 +103,50 @@ class ReportRepairer:
                         ),
                         "reason": latest[task.id].reason,
                     },
-                    "allowed_evidence": [
-                        {
-                            "evidence_id": evidence.id,
-                            "content": evidence.content,
-                            "retrieval_source": evidence.retrieval_source.value,
-                        }
-                        for evidence in candidates_by_task[task.id]
-                    ],
+                    "candidate_evidence_count": len(candidates_by_task[task.id]),
+                    "provided_evidence_ids": provided_ids_by_task[task.id],
                 }
                 for task in plan.tasks
             ],
+            "evidence_view": {
+                "bounded": True,
+                "selection_rule": (
+                    "unique issue-Claim references, then other report references, "
+                    "then issue-Task candidates, then remaining candidates"
+                ),
+                "candidate_evidence_count": sum(
+                    len(items) for items in candidates_by_task.values()
+                ),
+                "provided_evidence_count": len(selected_evidence),
+                "max_evidence_items": MAX_REPAIR_EVIDENCE_ITEMS,
+                "max_content_chars_per_evidence": (
+                    MAX_REPAIR_EVIDENCE_CONTENT_CHARS
+                ),
+                "max_total_content_chars": (
+                    MAX_TOTAL_REPAIR_EVIDENCE_CONTENT_CHARS
+                ),
+            },
+            "evidence_catalog": {
+                evidence.id: {
+                    "evidence_id": evidence.id,
+                    "task_id": evidence.task_id,
+                    "content": self._excerpt_content(
+                        evidence.content,
+                        content_budget,
+                    ),
+                    "content_is_excerpt": len(evidence.content) > content_budget,
+                    "original_content_char_count": len(evidence.content),
+                    "retrieval_source": evidence.retrieval_source.value,
+                    "origin_id": evidence.origin_id,
+                    "source": evidence.source,
+                    "metadata": evidence.metadata,
+                }
+                for evidence, content_budget in zip(
+                    selected_evidence,
+                    content_budgets,
+                    strict=True,
+                )
+            },
         }
         try:
             serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -116,6 +174,119 @@ class ReportRepairer:
             evidence_pool=evidence_pool,
             latest=latest,
             candidates_by_task=candidates_by_task,
+            provided_ids_by_task={
+                task_id: set(evidence_ids)
+                for task_id, evidence_ids in provided_ids_by_task.items()
+            },
+            original_report=report,
+        )
+
+    @staticmethod
+    def _select_evidence(
+        *,
+        plan: ResearchPlan,
+        report: StructuredReport,
+        self_check_result: SelfCheckResult,
+        candidates_by_task: dict[str, list[Evidence]],
+    ) -> list[Evidence]:
+        """Select a deterministic, globally deduplicated repair Evidence view."""
+        candidate_by_id = {
+            evidence.id: evidence
+            for task in plan.tasks
+            for evidence in candidates_by_task[task.id]
+        }
+        claim_by_id = {
+            claim.id: claim
+            for section in report.sections
+            for claim in section.claims
+        }
+        selected_ids: list[str] = []
+        seen_ids: set[str] = set()
+
+        def add(evidence_id: str) -> None:
+            if evidence_id in candidate_by_id and evidence_id not in seen_ids:
+                seen_ids.add(evidence_id)
+                selected_ids.append(evidence_id)
+
+        issue_task_ids: list[str] = []
+        seen_issue_task_ids: set[str] = set()
+        for issue in self_check_result.issues:
+            claim = claim_by_id.get(issue.claim_id) if issue.claim_id else None
+            if claim is not None:
+                for evidence_id in claim.evidence_ids:
+                    add(evidence_id)
+            task_id = issue.task_id or (claim.task_id if claim is not None else None)
+            if task_id is not None and task_id not in seen_issue_task_ids:
+                seen_issue_task_ids.add(task_id)
+                issue_task_ids.append(task_id)
+
+        for section in report.sections:
+            for claim in section.claims:
+                for evidence_id in claim.evidence_ids:
+                    add(evidence_id)
+
+        for task_id in issue_task_ids:
+            for evidence in candidates_by_task[task_id]:
+                add(evidence.id)
+
+        for task in plan.tasks:
+            for evidence in candidates_by_task[task.id]:
+                add(evidence.id)
+
+        return [
+            candidate_by_id[evidence_id]
+            for evidence_id in selected_ids[:MAX_REPAIR_EVIDENCE_ITEMS]
+        ]
+
+    @staticmethod
+    def _allocate_content_budgets(evidence: list[Evidence]) -> list[int]:
+        """Allocate the total repair body budget without truncating short items."""
+        target_sizes = [
+            min(len(item.content), MAX_REPAIR_EVIDENCE_CONTENT_CHARS)
+            for item in evidence
+        ]
+        if sum(target_sizes) <= MAX_TOTAL_REPAIR_EVIDENCE_CONTENT_CHARS:
+            return target_sizes
+
+        budgets = [0] * len(target_sizes)
+        remaining_budget = MAX_TOTAL_REPAIR_EVIDENCE_CONTENT_CHARS
+        active = set(range(len(target_sizes)))
+        while active:
+            fair_share = remaining_budget // len(active)
+            completed = [
+                index for index in active if target_sizes[index] <= fair_share
+            ]
+            if completed:
+                for index in completed:
+                    budgets[index] = target_sizes[index]
+                    remaining_budget -= budgets[index]
+                    active.remove(index)
+                continue
+
+            ordered_active = sorted(active)
+            for index in ordered_active:
+                budgets[index] = fair_share
+            remainder = remaining_budget - fair_share * len(ordered_active)
+            for index in ordered_active[:remainder]:
+                budgets[index] += 1
+            break
+        return budgets
+
+    @staticmethod
+    def _excerpt_content(content: str, limit: int) -> str:
+        """Return an exact-size head/tail excerpt when content exceeds limit."""
+        if len(content) <= limit:
+            return content
+        marker_size = len(REPAIR_CONTENT_OMISSION_MARKER)
+        if limit <= marker_size:
+            return REPAIR_CONTENT_OMISSION_MARKER[:limit]
+        retained_chars = limit - marker_size
+        head_chars = (retained_chars + 1) // 2
+        tail_chars = retained_chars // 2
+        return (
+            content[:head_chars]
+            + REPAIR_CONTENT_OMISSION_MARKER
+            + content[-tail_chars:]
         )
 
     @staticmethod
@@ -126,6 +297,8 @@ class ReportRepairer:
         evidence_pool: dict[str, list[Evidence]],
         latest: dict[str, EvidenceAssessment],
         candidates_by_task: dict[str, list[Evidence]],
+        provided_ids_by_task: dict[str, set[str]],
+        original_report: StructuredReport,
     ) -> StructuredReport:
         if not isinstance(candidate, dict) or set(candidate) != {
             "objective",
@@ -141,6 +314,13 @@ class ReportRepairer:
             raise SelfCheckError("repair must preserve every plan-ordered section")
 
         sections: list[ReportSection] = []
+        original_claim_signatures_by_task = {
+            section.task_id: Counter(
+                (claim.text.strip(), tuple(claim.evidence_ids))
+                for claim in section.claims
+            )
+            for section in original_report.sections
+        }
         for section_index, (task, raw_section) in enumerate(
             zip(plan.tasks, raw_sections, strict=True),
             start=1,
@@ -205,6 +385,20 @@ class ReportRepairer:
                     )
                 )
             validate_claims(task, candidates_by_task[task.id], claims)
+            unchanged_signatures = original_claim_signatures_by_task[task.id]
+            for claim in claims:
+                signature = (claim.text, tuple(claim.evidence_ids))
+                if unchanged_signatures[signature] > 0:
+                    unchanged_signatures[signature] -= 1
+                    continue
+                if any(
+                    evidence_id not in provided_ids_by_task[task.id]
+                    for evidence_id in claim.evidence_ids
+                ):
+                    raise ReportGenerationError(
+                        "new or modified Claim references Evidence outside the "
+                        "provided repair Evidence view"
+                    )
             sections.append(
                 ReportSection(
                     task_id=task.id,

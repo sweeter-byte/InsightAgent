@@ -144,10 +144,15 @@ def _two_task_research_inputs() -> tuple[
     return plan, report, pool, assessments
 
 
-def _evidence(evidence_id: str, *, content: str | None = None) -> Evidence:
+def _evidence(
+    evidence_id: str,
+    *,
+    content: str | None = None,
+    task_id: str = "T1",
+) -> Evidence:
     return Evidence(
         id=evidence_id,
-        task_id="T1",
+        task_id=task_id,
         retrieval_source=RetrievalSource.LOCAL,
         origin_id=f"origin-{evidence_id}",
         content=content if content is not None else f"Content for {evidence_id}",
@@ -642,6 +647,221 @@ def test_repairer_rebuilds_a_narrowed_report_from_runtime_state() -> None:
     ]
     assert repaired.citations == report.citations
     assert llm.calls[0]["tools"] is None
+
+
+def test_repairer_sends_a_bounded_deduplicated_issue_first_evidence_view() -> None:
+    plan, _, _, _ = _research_inputs()
+    evidence = [
+        _evidence(
+            f"E{index}",
+            content=f"HEAD-{index}:" + (str(index % 10) * 7000) + f":TAIL-{index}",
+        )
+        for index in range(1, 12)
+    ]
+    original_evidence = deepcopy(evidence)
+    assessment = EvidenceAssessment(
+        task_id="T1",
+        evidence_judgments=[
+            EvidenceJudgment(
+                evidence_id=item.id,
+                relevance=EvidenceRelevance.RELEVANT,
+                quality=EvidenceQuality.STRONG,
+                reason="Usable for repair.",
+            )
+            for item in evidence
+        ],
+        coverage=EvidenceCoverage.PARTIAL,
+        sufficient=False,
+        missing_information=["Long-term maintenance cost is unknown."],
+        reason="One required comparison remains unavailable.",
+    )
+    claims = [
+        Claim(
+            id=f"T1-C{index}",
+            task_id="T1",
+            text=f"Claim {index}",
+            evidence_ids=[f"E{index}"],
+        )
+        for index in range(1, 12)
+    ]
+    claims[1].evidence_ids.append("E1")
+    report = assemble_report(
+        plan.objective,
+        [
+            ReportSection(
+                task_id="T1",
+                title=plan.tasks[0].question,
+                claims=claims,
+                sufficient=False,
+                missing_information=list(assessment.missing_information),
+            )
+        ],
+        {"T1": evidence},
+    )
+    issue = SelfCheckIssue(
+        code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+        reason="The last Claim must be checked first.",
+        task_id="T1",
+        claim_id="T1-C11",
+    )
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "objective": plan.objective,
+                "sections": [
+                    {
+                        "task_id": "T1",
+                        "title": plan.tasks[0].question,
+                        "claims": [
+                            {
+                                "text": claim.text,
+                                "evidence_ids": list(claim.evidence_ids),
+                            }
+                            for claim in claims
+                        ],
+                        "sufficient": False,
+                        "missing_information": list(
+                            assessment.missing_information
+                        ),
+                    }
+                ],
+            }
+        )
+    )
+
+    ReportRepairer(llm=llm).repair(
+        plan=plan,
+        report=report,
+        self_check_result=SelfCheckResult(
+            status=SelfCheckStatus.REVISE,
+            issues=[issue],
+            summary="Repair the last Claim.",
+        ),
+        evidence_pool={"T1": evidence},
+        assessments={"T1": [assessment]},
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    catalog = payload["evidence_catalog"]
+    assert list(catalog) == ["E11", *[f"E{index}" for index in range(1, 10)]]
+    assert len(catalog) == 10
+    assert all(len(item["content"]) <= 6000 for item in catalog.values())
+    assert sum(len(item["content"]) for item in catalog.values()) <= 40000
+    assert all("CONTENT OMITTED" in item["content"] for item in catalog.values())
+    assert catalog["E11"]["content"].startswith("HEAD-11:")
+    assert catalog["E11"]["content"].endswith(":TAIL-11")
+    assert catalog["E11"]["task_id"] == "T1"
+    assert catalog["E11"]["retrieval_source"] == "local"
+    assert catalog["E11"]["origin_id"] == "origin-E11"
+    assert catalog["E11"]["source"] == "E11.md"
+    assert catalog["E11"]["metadata"] == {"filename": "E11.md"}
+    assert payload["task_contexts"][0]["provided_evidence_ids"][0] == "E11"
+    assert payload["evidence_view"]["provided_evidence_count"] == 10
+    serialized = llm.calls[0]["messages"][1]["content"]
+    assert serialized.count('"evidence_id": "E1"') == 1
+    assert "finite evidence view" in llm.calls[0]["messages"][0]["content"]
+    assert evidence == original_evidence
+
+
+def test_repairer_rejects_unprovided_evidence_for_a_modified_claim() -> None:
+    plan, report, _, assessments = _research_inputs()
+    evidence = [_evidence(f"E{index}") for index in range(1, 12)]
+    assessments["T1"][-1].evidence_judgments = [
+        EvidenceJudgment(
+            evidence_id=item.id,
+            relevance=EvidenceRelevance.RELEVANT,
+            quality=EvidenceQuality.STRONG,
+            reason="Usable for repair.",
+        )
+        for item in evidence
+    ]
+    pool = {"T1": evidence}
+    report = assemble_report(plan.objective, report.sections, pool)
+    payload = _repair_payload()
+    payload["sections"][0]["claims"][0] = {
+        "text": "A newly rewritten factual Claim.",
+        "evidence_ids": ["E11"],
+    }
+
+    with pytest.raises(ReportGenerationError, match="provided repair Evidence view"):
+        ReportRepairer(llm=FakeLLM(json.dumps(payload))).repair(
+            plan=plan,
+            report=report,
+            self_check_result=_revise_result(),
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+
+def test_repairer_preserves_unchanged_claims_with_unprovided_legal_references() -> None:
+    plan, _, _, _ = _research_inputs()
+    evidence = [_evidence(f"E{index}") for index in range(1, 12)]
+    assessment = EvidenceAssessment(
+        task_id="T1",
+        evidence_judgments=[
+            EvidenceJudgment(
+                evidence_id=item.id,
+                relevance=EvidenceRelevance.RELEVANT,
+                quality=EvidenceQuality.STRONG,
+                reason="Usable for the report.",
+            )
+            for item in evidence
+        ],
+        coverage=EvidenceCoverage.PARTIAL,
+        sufficient=False,
+        missing_information=["Long-term maintenance cost is unknown."],
+        reason="One required comparison remains unavailable.",
+    )
+    claims = [
+        Claim(
+            id=f"T1-C{index}",
+            task_id="T1",
+            text=f"Claim {index}",
+            evidence_ids=[f"E{index}"],
+        )
+        for index in range(1, 12)
+    ]
+    report = assemble_report(
+        plan.objective,
+        [
+            ReportSection(
+                task_id="T1",
+                title=plan.tasks[0].question,
+                claims=claims,
+                sufficient=False,
+                missing_information=list(assessment.missing_information),
+            )
+        ],
+        {"T1": evidence},
+    )
+    payload = {
+        "objective": plan.objective,
+        "sections": [
+            {
+                "task_id": "T1",
+                "title": plan.tasks[0].question,
+                "claims": [
+                    {
+                        "text": claim.text,
+                        "evidence_ids": list(claim.evidence_ids),
+                    }
+                    for claim in claims
+                ],
+                "sufficient": False,
+                "missing_information": list(assessment.missing_information),
+            }
+        ],
+    }
+
+    repaired = ReportRepairer(llm=FakeLLM(json.dumps(payload))).repair(
+        plan=plan,
+        report=report,
+        self_check_result=_revise_result(claim_id="T1-C1"),
+        evidence_pool={"T1": evidence},
+        assessments={"T1": [assessment]},
+    )
+
+    assert repaired.sections[0].claims[-1].evidence_ids == ["E11"]
 
 
 def _repair_payload() -> dict[str, Any]:
