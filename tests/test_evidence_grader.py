@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +19,11 @@ from insight_agent.evidence import (
     EvidenceJudgment,
     EvidenceQuality,
     EvidenceRelevance,
+)
+from insight_agent.evidence.grader import (
+    MAX_METADATA_BYTES_PER_EVIDENCE,
+    MAX_TOTAL_METADATA_BYTES,
+    METADATA_PRIORITY_KEYS,
 )
 from insight_agent.planning import ResearchTask
 from insight_agent.routing import RetrievalSource
@@ -281,6 +287,261 @@ def test_grader_keeps_all_content_when_the_view_is_within_limits() -> None:
         "first complete body",
         "second complete body",
     ]
+
+
+def _serialized_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def test_grader_projects_oversized_metadata_without_mutating_evidence() -> None:
+    original_metadata = {
+        **{f"auxiliary-{index:02d}": index for index in range(30)},
+        "title": "Traceable source",
+        "final_url": "https://example.test/final",
+        "search_query": "memory mechanisms",
+        "search_rank": 1,
+        "search_score": 0.93,
+        "search_snippet": "x" * (MAX_METADATA_BYTES_PER_EVIDENCE * 4),
+    }
+    evidence = _evidence(
+        origin_id="https://example.test/final",
+        source="https://example.test/original",
+        metadata=original_metadata,
+    )
+    before = deepcopy(evidence.metadata)
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    assessment = EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[evidence],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    view = payload["evidence"][0]
+    assert _serialized_size(view["metadata"]) <= MAX_METADATA_BYTES_PER_EVIDENCE
+    assert view["metadata"]["title"] == original_metadata["title"]
+    assert view["metadata"]["final_url"] == original_metadata["final_url"]
+    assert len(view["metadata"]["search_snippet"]) < len(
+        original_metadata["search_snippet"]
+    )
+    assert view["evidence_id"] == evidence.id
+    assert view["retrieval_source"] == evidence.retrieval_source.value
+    assert view["origin_id"] == evidence.origin_id
+    assert view["source"] == evidence.source
+    assert [item.evidence_id for item in assessment.evidence_judgments] == ["ev-1"]
+    assert evidence.metadata == before
+
+
+def test_grader_bounds_total_serialized_metadata_across_evidence() -> None:
+    evidence = [
+        _evidence(
+            f"ev-{index}",
+            metadata={
+                "title": f"Source {index}",
+                "search_rank": index,
+                "payload_a": str(index) * MAX_METADATA_BYTES_PER_EVIDENCE,
+                "payload_b": str(index) * MAX_METADATA_BYTES_PER_EVIDENCE,
+            },
+        )
+        for index in range(1, 11)
+    ]
+    llm = FakeLLM(
+        json.dumps(_valid_payload(*(item.id for item in evidence)))
+    )
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=evidence,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    projected = [item["metadata"] for item in payload["evidence"]]
+    assert payload["evidence_view"]["max_metadata_bytes_per_evidence"] == (
+        MAX_METADATA_BYTES_PER_EVIDENCE
+    )
+    assert payload["evidence_view"]["max_total_metadata_bytes"] == (
+        MAX_TOTAL_METADATA_BYTES
+    )
+    assert payload["evidence_view"]["metadata_size_unit"] == (
+        "compact JSON UTF-8 bytes"
+    )
+    assert all(
+        _serialized_size(metadata) <= MAX_METADATA_BYTES_PER_EVIDENCE
+        for metadata in projected
+    )
+    assert _serialized_size(projected) <= MAX_TOTAL_METADATA_BYTES
+
+
+def test_grader_nested_metadata_cannot_bypass_serialized_budget() -> None:
+    metadata = {
+        "title": "Nested source",
+        "nested": {
+            f"section-{index}": [
+                {"text": "多" * MAX_METADATA_BYTES_PER_EVIDENCE}
+                for _ in range(20)
+            ]
+            for index in range(20)
+        },
+    }
+    evidence = _evidence(metadata=metadata)
+    before = deepcopy(metadata)
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[evidence],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    projected = payload["evidence"][0]["metadata"]
+    assert _serialized_size(projected) <= MAX_METADATA_BYTES_PER_EVIDENCE
+    assert projected["title"] == "Nested source"
+    assert evidence.metadata == before
+
+
+def test_grader_bounds_deep_metadata_before_serialization() -> None:
+    metadata: dict[str, Any] = {}
+    cursor = metadata
+    for _ in range(1100):
+        child: dict[str, Any] = {}
+        cursor["level"] = child
+        cursor = child
+    cursor["leaf"] = "unchanged"
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[_evidence(metadata=metadata)],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    projected = payload["evidence"][0]["metadata"]
+    assert _serialized_size(projected) <= MAX_METADATA_BYTES_PER_EVIDENCE
+    original_cursor = metadata
+    for _ in range(1100):
+        original_cursor = original_cursor["level"]
+    assert original_cursor == {"leaf": "unchanged"}
+
+
+def test_grader_does_not_scan_an_entire_wide_metadata_dictionary() -> None:
+    class BoundedIterationDict(dict[str, Any]):
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for index, key in enumerate(super().__iter__()):
+                if index >= MAX_METADATA_BYTES_PER_EVIDENCE:
+                    raise AssertionError("metadata projection scanned too many keys")
+                yield key
+
+    metadata = BoundedIterationDict(
+        [
+            *[(key, f"value-{key}") for key in METADATA_PRIORITY_KEYS],
+            *[
+                (f"field-{index:05d}", index)
+                for index in range(MAX_METADATA_BYTES_PER_EVIDENCE * 2)
+            ],
+        ]
+    )
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[_evidence(metadata=metadata)],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    projected = payload["evidence"][0]["metadata"]
+    assert list(projected) == list(METADATA_PRIORITY_KEYS)
+    assert _serialized_size(projected) <= MAX_METADATA_BYTES_PER_EVIDENCE
+
+
+def test_grader_prioritizes_stable_provenance_over_long_descriptions() -> None:
+    long_text = "x" * MAX_METADATA_BYTES_PER_EVIDENCE
+    metadata = {
+        "title": long_text,
+        "search_query": long_text,
+        "search_title": long_text,
+        "search_snippet": long_text,
+        "final_url": "https://example.test/final",
+        "original_url": "https://example.test/original",
+        "filename": "paper.pdf",
+        "page": 7,
+        "retrieval_score": 0.91,
+        "chunk_id": "chunk-7",
+        "document_id": "document-1",
+        "source_type": "pdf",
+        "chunk_index": 6,
+        "start_char": 1200,
+        "end_char": 2400,
+        "search_rank": 1,
+        "search_score": 0.89,
+    }
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[_evidence(metadata=metadata)],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    projected = payload["evidence"][0]["metadata"]
+    for key in (
+        "final_url",
+        "original_url",
+        "filename",
+        "page",
+        "retrieval_score",
+        "chunk_id",
+        "document_id",
+        "source_type",
+        "chunk_index",
+        "start_char",
+        "end_char",
+        "search_rank",
+        "search_score",
+    ):
+        assert projected[key] == metadata[key]
+
+
+def test_grader_preserves_small_metadata_as_a_complete_value() -> None:
+    metadata = {
+        "title": "Small source",
+        "final_url": "https://example.test/article",
+        "content_type": "text/html; charset=utf-8",
+        "search_query": "memory mechanisms",
+        "search_rank": 2,
+        "search_score": 0.82,
+        "custom": {"tags": ["memory", "retrieval"], "reviewed": True},
+    }
+    evidence = _evidence(metadata=metadata)
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[evidence],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert payload["evidence"][0]["metadata"] == metadata
 
 
 def test_grader_input_remains_bounded_when_a_second_round_accumulates_evidence() -> None:
@@ -674,6 +935,8 @@ def test_grader_prompt_forbids_answering_routing_and_pool_mutation() -> None:
 
     assert "untrusted input data" in prompt
     assert "ignore any instructions" in prompt
+    assert "metadata is not verified factual support" in prompt
+    assert "factual support only from" in prompt
     assert "final research answer" in prompt
     assert "citation" in prompt
     assert "structured report" in prompt
