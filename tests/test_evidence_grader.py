@@ -63,15 +63,23 @@ def _task() -> ResearchTask:
     return ResearchTask(id="T1", question="Compare memory mechanisms.")
 
 
-def _evidence(evidence_id: str = "ev-1") -> Evidence:
+def _evidence(
+    evidence_id: str = "ev-1",
+    *,
+    content: str = "Vector memory uses embedding similarity.",
+    origin_id: str = "chunk-1",
+    source: str = "notes.md",
+    metadata: dict[str, Any] | None = None,
+) -> Evidence:
     return Evidence(
         id=evidence_id,
         task_id="T1",
         retrieval_source=RetrievalSource.LOCAL,
-        origin_id="chunk-1",
-        content="Vector memory uses embedding similarity.",
-        source="notes.md",
-        metadata={"chunk_id": "chunk-1", "retrieval_score": 0.91},
+        origin_id=origin_id,
+        content=content,
+        source=source,
+        metadata=metadata
+        or {"chunk_id": "chunk-1", "retrieval_score": 0.91},
     )
 
 
@@ -198,6 +206,149 @@ def test_grader_parses_a_valid_evidence_assessment() -> None:
     )
     assert len(llm.calls) == 1
     assert llm.calls[0]["tools"] is None
+
+
+def test_grader_sends_a_bounded_excerpt_without_mutating_original_evidence() -> None:
+    original_content = "HEAD:" + ("a" * 6990) + ":TAIL"
+    evidence = _evidence(
+        content=original_content,
+        origin_id="https://example.test/article",
+        source="https://example.test/article?ref=search",
+        metadata={"title": "Traceable source", "search_rank": 1},
+    )
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[evidence],
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    view = payload["evidence"][0]
+    assert len(view["content"]) <= 6000
+    assert view["content"].startswith("HEAD:")
+    assert view["content"].endswith(":TAIL")
+    assert "CONTENT OMITTED" in view["content"]
+    assert view["evidence_id"] == evidence.id
+    assert view["origin_id"] == evidence.origin_id
+    assert view["source"] == evidence.source
+    assert view["metadata"] == evidence.metadata
+    assert evidence.content == original_content
+
+
+def test_grader_bounds_total_body_size_and_number_of_evidence_items() -> None:
+    evidence = [
+        _evidence(f"ev-{index}", content=str(index) * 7000)
+        for index in range(1, 13)
+    ]
+    provided_ids = [f"ev-{index}" for index in range(1, 11)]
+    llm = FakeLLM(json.dumps(_valid_payload(*provided_ids)))
+
+    assessment = EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=evidence,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    views = payload["evidence"]
+    assert [item["evidence_id"] for item in views] == provided_ids
+    assert len(views) == 10
+    assert all(len(item["content"]) <= 6000 for item in views)
+    assert sum(len(item["content"]) for item in views) <= 40000
+    assert [item.evidence_id for item in assessment.evidence_judgments] == provided_ids
+
+
+def test_grader_keeps_all_content_when_the_view_is_within_limits() -> None:
+    evidence = [
+        _evidence("ev-1", content="first complete body"),
+        _evidence("ev-2", content="second complete body"),
+    ]
+    llm = FakeLLM(json.dumps(_valid_payload("ev-1", "ev-2")))
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=evidence,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert [item["content"] for item in payload["evidence"]] == [
+        "first complete body",
+        "second complete body",
+    ]
+
+
+def test_grader_input_remains_bounded_when_a_second_round_accumulates_evidence() -> None:
+    first_round = [
+        _evidence(f"ev-{index}", content="x" * 7000) for index in range(1, 9)
+    ]
+    second_round = [
+        *first_round,
+        *[
+            _evidence(f"ev-{index}", content="y" * 7000)
+            for index in range(9, 17)
+        ],
+    ]
+    llm = ScriptedLLM(
+        json.dumps(_valid_payload(*(item.id for item in first_round))),
+        json.dumps(_valid_payload(*(item.id for item in second_round[:10]))),
+    )
+    grader = EvidenceGrader(llm=llm)  # type: ignore[arg-type]
+
+    for evidence in (first_round, second_round):
+        grader.grade(
+            task=_task(),
+            objective="Compare memory systems",
+            constraints=[],
+            evidence=evidence,
+        )
+
+    for call in llm.calls:
+        payload = json.loads(call["messages"][1]["content"])
+        assert len(payload["evidence"]) <= 10
+        assert sum(len(item["content"]) for item in payload["evidence"]) <= 40000
+
+
+def test_grader_rejects_a_judgment_for_evidence_omitted_from_the_view() -> None:
+    evidence = [_evidence(f"ev-{index}") for index in range(1, 12)]
+    invalid = json.dumps(_valid_payload(*(f"ev-{index}" for index in range(1, 12))))
+    llm = ScriptedLLM(invalid, invalid)
+
+    with pytest.raises(EvidenceGradingError, match="unknown Evidence ID.*ev-11"):
+        EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+            task=_task(),
+            objective="Compare memory systems",
+            constraints=[],
+            evidence=evidence,
+        )
+
+
+def test_grader_repair_reuses_only_the_bounded_evidence_view() -> None:
+    full_content = "private-full-body:" + ("z" * 7000)
+    evidence = _evidence(content=full_content)
+    invalid = json.dumps(_valid_payload())
+    repaired = json.dumps(_valid_payload("ev-1"))
+    llm = ScriptedLLM(invalid, repaired)
+
+    EvidenceGrader(llm=llm).grade(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Compare memory systems",
+        constraints=[],
+        evidence=[evidence],
+    )
+
+    assert len(llm.calls) == 2
+    repair_messages = llm.calls[1]["messages"]
+    assert repair_messages[:2] == llm.calls[0]["messages"]
+    assert full_content not in json.dumps(repair_messages, ensure_ascii=False)
+    repair_payload = json.loads(repair_messages[1]["content"])
+    assert len(repair_payload["evidence"][0]["content"]) <= 6000
+    assert "supplied Evidence View" in repair_messages[-1]["content"]
 
 
 def test_grader_repairs_a_missing_judgment_with_one_complete_regeneration() -> None:
