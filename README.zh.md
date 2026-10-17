@@ -231,6 +231,21 @@ Top-10 指标。因此本实验是 InsightAgent Chunk 索引在 SciFact 上的�
 评测，并非 BEIR 官方模型配置。报告会披露 Chunk 参数、候选深度、模型、索引
 指纹、保持原排名的 BEIR 分数转换方式和各阶段耗时口径。
 
+### DeepResearch Bench 端到端研究评测
+
+仓库提供固定版本、可断点续跑的 DeepResearch Bench 100 任务适配。Generation
+直接调用生产 `ResearchCoordinator` 与真实 Tavily 检索，并使用 Run 独立的
+Checkpoint；官方 RACE/FACT 是分离且需要显式付费确认的命令。生成阶段不会读取
+官方 Reference 或 Criteria。数据准备、环境变量、固定 Smoke/Pilot 任务、恢复、
+导出、官方评分、费用和产物核验详见
+[`evals/deepresearch_bench/README.zh.md`](./evals/deepresearch_bench/README.zh.md)。
+
+```bash
+scripts/benchmarks/deepresearch.sh prepare
+scripts/benchmarks/deepresearch.sh doctor
+scripts/benchmarks/deepresearch.sh smoke --run-id drb-smoke-01
+```
+
 ## 测试与项目状态
 
 后端测试入口：

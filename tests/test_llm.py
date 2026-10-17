@@ -271,3 +271,46 @@ def test_chat_forwards_optional_timeout_without_changing_legacy_calls() -> None:
 
     assert "timeout" not in calls[0]
     assert calls[1]["timeout"] == 2.5
+
+
+def test_llm_client_records_provider_usage_without_inventing_missing_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    responses = [
+        SimpleNamespace(usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3)),
+        SimpleNamespace(usage=None),
+    ]
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            return responses.pop(0)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(LLMConfig("secret", "https://example.invalid/v1", "model"))
+
+    client.chat([{"role": "user", "content": "metered"}])
+    first = client.usage_snapshot()
+    client.chat([{"role": "user", "content": "unmetered"}])
+    second = client.usage_snapshot()
+
+    assert first == {
+        "calls": 1,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "unmetered_calls": 0,
+    }
+    assert second == {
+        "calls": 2,
+        "input_tokens": 7,
+        "output_tokens": 3,
+        "unmetered_calls": 1,
+    }

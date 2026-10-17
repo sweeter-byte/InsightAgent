@@ -237,6 +237,23 @@ official BEIR model configuration. The report discloses chunking, candidate
 depths, models, index fingerprint, rank-preserving BEIR scores, and stage timing
 semantics.
 
+### DeepResearch Bench end-to-end research benchmark
+
+The repository now includes a pinned, resumable adapter for the 100-task
+DeepResearch Bench. Generation calls the production `ResearchCoordinator` and
+real Tavily retrieval with run-local checkpoints; official RACE and FACT remain
+separate, explicitly confirmed paid commands. No benchmark reference article or
+criteria is exposed during generation. See the
+[Chinese runbook](./evals/deepresearch_bench/README.zh.md) for preparation,
+environment variables, fixed Smoke/Pilot task sets, resume behavior, export,
+official scoring, costs, and artifact verification.
+
+```bash
+scripts/benchmarks/deepresearch.sh prepare
+scripts/benchmarks/deepresearch.sh doctor
+scripts/benchmarks/deepresearch.sh smoke --run-id drb-smoke-01
+```
+
 ## Tests and Project Status
 
 Backend test entry point:

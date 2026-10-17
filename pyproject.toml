@@ -33,6 +33,12 @@ dev = [
 benchmark = [
     "beir>=2.2,<3",
 ]
+deepresearch = [
+    "numpy>=1.24.0",
+    "pandas>=2.0.0",
+    "requests>=2.28.0",
+    "tqdm>=4.65.0",
+]
 
 [project.scripts]
 insight-agent-eval = "evals.__main__:main"

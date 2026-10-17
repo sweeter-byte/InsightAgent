@@ -12,6 +12,7 @@ No agent loop, no tool execution, no retry / memory / cache logic lives here.
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -107,6 +108,11 @@ class LLMClient:
             base_url=resolved.base_url,
         )
         self._closed = False
+        self._usage_lock = threading.Lock()
+        self._usage_calls = 0
+        self._usage_input_tokens = 0
+        self._usage_output_tokens = 0
+        self._usage_unmetered_calls = 0
 
     def close(self) -> None:
         """Release the SDK connection pool at most once."""
@@ -135,6 +141,7 @@ class LLMClient:
             The ``ChatCompletion`` object produced by the SDK. The caller is
             responsible for reading ``.choices[0].message`` etc.
         """
+        self._ensure_usage_state()
         kwargs: dict[str, Any] = {
             "model": self.model,
             "messages": list(messages),
@@ -143,4 +150,48 @@ class LLMClient:
             kwargs["tools"] = list(tools)
         if timeout is not None:
             kwargs["timeout"] = timeout
-        return self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except BaseException:
+            with self._usage_lock:
+                self._usage_calls += 1
+                self._usage_unmetered_calls += 1
+            raise
+        usage = getattr(response, "usage", None)
+        input_tokens = getattr(usage, "prompt_tokens", None)
+        output_tokens = getattr(usage, "completion_tokens", None)
+        metered = (
+            isinstance(input_tokens, int)
+            and not isinstance(input_tokens, bool)
+            and isinstance(output_tokens, int)
+            and not isinstance(output_tokens, bool)
+        )
+        with self._usage_lock:
+            self._usage_calls += 1
+            if metered:
+                self._usage_input_tokens += input_tokens
+                self._usage_output_tokens += output_tokens
+            else:
+                self._usage_unmetered_calls += 1
+        return response
+
+    def usage_snapshot(self) -> dict[str, int]:
+        """Return cumulative provider usage without guessing missing token data."""
+        self._ensure_usage_state()
+        with self._usage_lock:
+            return {
+                "calls": self._usage_calls,
+                "input_tokens": self._usage_input_tokens,
+                "output_tokens": self._usage_output_tokens,
+                "unmetered_calls": self._usage_unmetered_calls,
+            }
+
+    def _ensure_usage_state(self) -> None:
+        """Support lightweight test doubles constructed without __init__."""
+        if hasattr(self, "_usage_lock"):
+            return
+        self._usage_lock = threading.Lock()
+        self._usage_calls = 0
+        self._usage_input_tokens = 0
+        self._usage_output_tokens = 0
+        self._usage_unmetered_calls = 0
