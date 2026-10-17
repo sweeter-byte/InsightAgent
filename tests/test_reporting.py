@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -57,6 +58,7 @@ def _evidence(
     *,
     task_id: str = "T1",
     source_type: RetrievalSource = RetrievalSource.LOCAL,
+    content: str | None = None,
     source: str = "notes.md",
     metadata: dict[str, Any] | None = None,
 ) -> Evidence:
@@ -65,7 +67,7 @@ def _evidence(
         task_id=task_id,
         retrieval_source=source_type,
         origin_id=f"origin-{evidence_id}",
-        content=f"Content for {evidence_id}",
+        content=content if content is not None else f"Content for {evidence_id}",
         source=source,
         metadata=dict(metadata or {}),
     )
@@ -218,6 +220,118 @@ def test_report_generator_parses_claims_and_assigns_deterministic_runtime_ids() 
     assert "citation_number" not in json.loads(
         llm.calls[0]["messages"][1]["content"]
     )
+
+
+def test_report_generator_sends_bounded_excerpt_without_mutating_evidence() -> None:
+    original_content = "HEAD:" + ("a" * 6990) + ":TAIL"
+    evidence = _evidence(
+        "E1",
+        content=original_content,
+        source="https://example.test/article?ref=search",
+        metadata={"title": "Traceable source", "search_rank": 1},
+    )
+    original_evidence = deepcopy(evidence)
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Objective",
+        constraints=[],
+        evidence=[evidence],
+        assessment=_assessment(_judgment("E1")),
+    )
+
+    messages = llm.calls[0]["messages"]
+    payload = json.loads(messages[1]["content"])
+    view = payload["evidence"][0]
+    assert len(view["content"]) == 6000
+    assert view["content"].startswith("HEAD:")
+    assert view["content"].endswith(":TAIL")
+    assert "CONTENT OMITTED" in view["content"]
+    assert view["content_is_excerpt"] is True
+    assert view["original_content_char_count"] == len(original_content)
+    assert view["evidence_id"] == evidence.id
+    assert view["origin_id"] == evidence.origin_id
+    assert view["source"] == evidence.source
+    assert view["metadata"] == evidence.metadata
+    assert "Do not infer" in messages[0]["content"]
+    assert evidence == original_evidence
+
+
+def test_report_generator_bounds_total_content_and_evidence_count() -> None:
+    evidence = [
+        _evidence(f"E{index}", content=str(index) * 7000)
+        for index in range(1, 13)
+    ]
+    assessment = _assessment(*(_judgment(item.id) for item in evidence))
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Objective",
+        constraints=[],
+        evidence=evidence,
+        assessment=assessment,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    views = payload["evidence"]
+    assert [item["evidence_id"] for item in views] == [
+        f"E{index}" for index in range(1, 11)
+    ]
+    assert len(views) == 10
+    assert all(len(item["content"]) <= 6000 for item in views)
+    assert sum(len(item["content"]) for item in views) <= 40000
+    assert payload["evidence_view"]["candidate_evidence_count"] == 12
+    assert payload["evidence_view"]["provided_evidence_count"] == 10
+
+
+def test_report_generator_rejects_reference_to_evidence_omitted_from_view() -> None:
+    evidence = [_evidence(f"E{index}") for index in range(1, 12)]
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E11"]}]})
+    )
+
+    with pytest.raises(ReportGenerationError, match="allowed candidate set"):
+        ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+            task=_task(),
+            objective="Objective",
+            constraints=[],
+            evidence=evidence,
+            assessment=_assessment(*(_judgment(item.id) for item in evidence)),
+        )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "E11" not in {item["evidence_id"] for item in payload["evidence"]}
+
+
+def test_report_generator_keeps_short_evidence_content_unchanged() -> None:
+    evidence = [
+        _evidence("E1", content="first complete body"),
+        _evidence("E2", content="second complete body"),
+    ]
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Objective",
+        constraints=[],
+        evidence=evidence,
+        assessment=_assessment(_judgment("E1"), _judgment("E2")),
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert [item["content"] for item in payload["evidence"]] == [
+        "first complete body",
+        "second complete body",
+    ]
+    assert all(not item["content_is_excerpt"] for item in payload["evidence"])
 
 
 def test_report_generator_rejects_evidence_excluded_by_assessment_before_llm() -> None:
