@@ -58,8 +58,9 @@ The evidence_catalog is a finite evidence view, not the complete research state.
 Evidence bodies appear only in that catalog, keyed by Evidence ID. Task contexts
 list which catalog IDs belong to each Task. Some bodies may be head/tail excerpts
 marked with CONTENT OMITTED. Use only content actually shown; never infer facts
-from omitted Evidence, omitted portions of an excerpt, metadata, IDs, or outside
-knowledge.
+from omitted Evidence, omitted portions of an excerpt, IDs, or outside knowledge.
+Metadata may only assist with source identity and retrieval context. It is not
+verified factual support and cannot independently support a new or rewritten Claim.
 
 Allowed changes: narrow a Claim, delete an unsupported Claim, delete an unrelated
 Evidence binding, restore recorded missing_information, and resolve an explicit

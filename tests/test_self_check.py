@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import insight_agent.self_check.repair as repair_module
 from insight_agent.evidence import (
     Evidence,
     EvidenceAssessment,
@@ -922,6 +923,138 @@ def test_repairer_sends_a_bounded_deduplicated_issue_first_evidence_view() -> No
     assert serialized.count('"evidence_id": "E1"') == 1
     assert "finite evidence view" in llm.calls[0]["messages"][0]["content"]
     assert evidence == original_evidence
+
+
+def test_repairer_projects_selected_metadata_in_evidence_order_without_mutation(
+) -> None:
+    plan, report, _, _ = _research_inputs()
+    metadata_items = [
+        {"filename": "E1.md", "long": "界" * 2000},
+        {
+            "filename": "E2.md",
+            "deep": {"l1": {"l2": {"l3": {"l4": "hidden"}}}},
+        },
+        {
+            "filename": "E3.md",
+            "wide": {
+                f"key-{index:02d}": index
+                for index in range(MAX_METADATA_COLLECTION_ITEMS + 8)
+            },
+        },
+        {
+            "filename": "E4.md",
+            "title": "Small source",
+            "custom": {"reviewed": True, "tags": ["a", "b"]},
+        },
+        *[
+            {
+                "filename": f"E{index}.md",
+                "title": f"source-{index}-" + ("x" * 3000),
+            }
+            for index in range(5, 11)
+        ],
+    ]
+    evidence = [
+        _evidence(
+            f"E{index}",
+            content=f"Body uniquely belonging to E{index}",
+            metadata=metadata,
+        )
+        for index, metadata in enumerate(metadata_items, start=1)
+    ]
+    original_metadata = deepcopy([item.metadata for item in evidence])
+    assessment = EvidenceAssessment(
+        task_id="T1",
+        evidence_judgments=[
+            EvidenceJudgment(
+                evidence_id=item.id,
+                relevance=EvidenceRelevance.RELEVANT,
+                quality=EvidenceQuality.STRONG,
+                reason="Usable for repair.",
+            )
+            for item in evidence
+        ],
+        coverage=EvidenceCoverage.PARTIAL,
+        sufficient=False,
+        missing_information=["Long-term maintenance cost is unknown."],
+        reason="One required comparison remains unavailable.",
+    )
+    report = assemble_report(plan.objective, report.sections, {"T1": evidence})
+    llm = FakeLLM(json.dumps(_repair_payload()))
+
+    ReportRepairer(llm=llm).repair(
+        plan=plan,
+        report=report,
+        self_check_result=_revise_result(),
+        evidence_pool={"T1": evidence},
+        assessments={"T1": [assessment]},
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    catalog = payload["evidence_catalog"]
+    projected_metadata = [
+        catalog[f"E{index}"]["metadata"] for index in range(1, 11)
+    ]
+    assert _compact_json_size(metadata_items) > MAX_TOTAL_METADATA_BYTES
+    assert all(
+        _compact_json_size(metadata) <= MAX_METADATA_BYTES_PER_EVIDENCE
+        for metadata in projected_metadata
+    )
+    assert _compact_json_size(projected_metadata) <= MAX_TOTAL_METADATA_BYTES
+    assert len(catalog["E1"]["metadata"]["long"]) <= MAX_METADATA_STRING_CHARS
+    assert (
+        catalog["E2"]["metadata"]["deep"]["l1"]["l2"]["l3"]
+        == METADATA_OMISSION_MARKER
+    )
+    assert len(catalog["E3"]["metadata"]["wide"]) == (
+        MAX_METADATA_COLLECTION_ITEMS
+    )
+    assert catalog["E4"]["metadata"] == metadata_items[3]
+    for index in range(1, 11):
+        item = catalog[f"E{index}"]
+        assert item["evidence_id"] == f"E{index}"
+        assert item["task_id"] == "T1"
+        assert item["content"] == f"Body uniquely belonging to E{index}"
+        assert item["metadata"]["filename"] == f"E{index}.md"
+        assert item["origin_id"] == f"origin-E{index}"
+        assert item["source"] == f"E{index}.md"
+        assert item["retrieval_source"] == "local"
+    assert [item.metadata for item in evidence] == original_metadata
+    assert payload["evidence_view"]["max_metadata_bytes_per_evidence"] == 2048
+    assert payload["evidence_view"]["max_total_metadata_bytes"] == 12000
+    assert payload["evidence_view"]["metadata_size_unit"] == (
+        "compact JSON UTF-8 bytes"
+    )
+    prompt = llm.calls[0]["messages"][0]["content"]
+    assert "Metadata may only assist with source identity" in prompt
+    assert "cannot independently support a new or rewritten Claim" in prompt
+
+
+def test_repairer_wraps_metadata_projection_errors_without_calling_llm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, report, pool, assessments = _research_inputs()
+    llm = FakeLLM(json.dumps(_repair_payload()))
+
+    def fail_projection(metadata_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        raise ValueError("projection failed")
+
+    monkeypatch.setattr(
+        repair_module,
+        "project_metadata_collection",
+        fail_projection,
+    )
+
+    with pytest.raises(SelfCheckError, match="JSON-serializable"):
+        ReportRepairer(llm=llm).repair(
+            plan=plan,
+            report=report,
+            self_check_result=_revise_result(),
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+    assert llm.calls == []
 
 
 def test_repairer_rejects_unprovided_evidence_for_a_modified_claim() -> None:
