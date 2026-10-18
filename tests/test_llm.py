@@ -590,8 +590,10 @@ def test_chat_logs_estimated_and_actual_request_metrics(
             "input_budget_tokens": 850,
             "input_token_estimate_method": "model_agnostic_heuristic",
             "model": "model-a",
+            "node_name": None,
             "request_sent": True,
             "status": "success",
+            "task_id": None,
         }
     ]
 
@@ -636,6 +638,8 @@ def test_chat_logs_null_budget_fields_without_configured_context_window(
     assert event["budget_usage_ratio"] is None
     assert event["actual_input_tokens"] is None
     assert event["actual_output_tokens"] is None
+    assert event["node_name"] is None
+    assert event["task_id"] is None
 
 
 def test_chat_logs_context_rejection_without_sending_request(

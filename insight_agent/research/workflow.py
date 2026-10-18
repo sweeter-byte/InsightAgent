@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import wraps
 from typing import Any, Protocol, TypedDict
 
 from langchain_core.runnables import RunnableConfig
@@ -10,6 +12,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import StateSnapshot
 
 from insight_agent.evidence import Evidence, EvidenceAssessment, EvidenceCollector
+from insight_agent.llm import llm_request_context
 from insight_agent.planning.models import ResearchPlan, ResearchState, ResearchTask
 from insight_agent.reporting import (
     Claim,
@@ -40,6 +43,19 @@ from insight_agent.vision_retrieval.models import VisionRetrievalResult
 
 MAX_RETRIEVAL_ROUNDS = 2
 MAX_REPAIR_ROUNDS = 1
+
+_TASK_SCOPED_NODES = frozenset(
+    {
+        "route_task",
+        "local_entry",
+        "web_entry",
+        "vision_entry",
+        "collect_evidence",
+        "grade_evidence",
+        "prepare_retry",
+        "advance_task",
+    }
+)
 
 
 class TaskRouter(Protocol):
@@ -201,20 +217,30 @@ class ResearchRoutingWorkflow:
         checkpointer: BaseCheckpointSaver[Any] | None,
     ) -> Any:
         builder = StateGraph(_GraphState)
-        builder.add_node("select_task", self._select_task_node)
-        builder.add_node("route_task", self._route_task_node)
-        builder.add_node("local_entry", self._local_entry_node)
-        builder.add_node("web_entry", self._web_entry_node)
-        builder.add_node("vision_entry", self._vision_entry_node)
-        builder.add_node("collect_evidence", self._collect_evidence_node)
-        builder.add_node("grade_evidence", self._grade_evidence_node)
-        builder.add_node("prepare_retry", self._prepare_retry_node)
-        builder.add_node("advance_task", self._advance_task_node)
-        builder.add_node("generate_report", self._generate_report_node)
-        builder.add_node("self_check_report", self._self_check_report_node)
-        builder.add_node("repair_report", self._repair_report_node)
-        builder.add_node("finalize_report", self._finalize_report_node)
-        builder.add_node("failed", self._failed_node)
+
+        def add_node(
+            name: str,
+            action: Callable[[_GraphState], dict[str, Any]],
+        ) -> None:
+            builder.add_node(
+                name,
+                self._with_llm_request_context(name, action),
+            )
+
+        add_node("select_task", self._select_task_node)
+        add_node("route_task", self._route_task_node)
+        add_node("local_entry", self._local_entry_node)
+        add_node("web_entry", self._web_entry_node)
+        add_node("vision_entry", self._vision_entry_node)
+        add_node("collect_evidence", self._collect_evidence_node)
+        add_node("grade_evidence", self._grade_evidence_node)
+        add_node("prepare_retry", self._prepare_retry_node)
+        add_node("advance_task", self._advance_task_node)
+        add_node("generate_report", self._generate_report_node)
+        add_node("self_check_report", self._self_check_report_node)
+        add_node("repair_report", self._repair_report_node)
+        add_node("finalize_report", self._finalize_report_node)
+        add_node("failed", self._failed_node)
 
         builder.add_edge(START, "select_task")
         builder.add_edge("select_task", "route_task")
@@ -257,6 +283,27 @@ class ResearchRoutingWorkflow:
         builder.add_edge("repair_report", "self_check_report")
         builder.add_edge("finalize_report", END)
         return builder.compile(checkpointer=checkpointer)
+
+    @staticmethod
+    def _with_llm_request_context(
+        node_name: str,
+        action: Callable[[_GraphState], dict[str, Any]],
+    ) -> Callable[[_GraphState], dict[str, Any]]:
+        """Bind one graph node's identity to LLM metrics during its execution."""
+
+        @wraps(action)
+        def wrapped(state: _GraphState) -> dict[str, Any]:
+            current_task = state.get("current_task")
+            task_id = (
+                current_task.id
+                if node_name in _TASK_SCOPED_NODES
+                and isinstance(current_task, ResearchTask)
+                else None
+            )
+            with llm_request_context(node_name=node_name, task_id=task_id):
+                return action(state)
+
+        return wrapped
 
     def run(
         self,

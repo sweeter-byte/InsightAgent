@@ -15,7 +15,9 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -24,6 +26,11 @@ from openai import OpenAI
 
 
 logger = logging.getLogger(__name__)
+
+_LLM_REQUEST_CONTEXT: ContextVar[tuple[str | None, str | None]] = ContextVar(
+    "llm_request_context",
+    default=(None, None),
+)
 
 # Single, shared registry of required environment variables and their hints.
 # Both the text LLM client and the vision client read from here so the project
@@ -36,6 +43,20 @@ _ENV_VAR_HINTS: dict[str, str] = {
     "VISION_BASE_URL": "Base URL of the OpenAI-compatible vision endpoint, e.g. https://api.openai.com/v1",
     "VISION_MODEL": "Vision-language model name, e.g. gpt-4o-mini.",
 }
+
+
+@contextmanager
+def llm_request_context(
+    *,
+    node_name: str,
+    task_id: str | None,
+) -> Iterator[None]:
+    """Associate LLM metrics with one workflow node for this execution context."""
+    token = _LLM_REQUEST_CONTEXT.set((node_name, task_id))
+    try:
+        yield
+    finally:
+        _LLM_REQUEST_CONTEXT.reset(token)
 
 
 def _require_env(name: str, environ: Mapping[str, str] | None = None) -> str:
@@ -415,9 +436,12 @@ class LLMClient:
         error_type: str | None,
     ) -> None:
         """Emit one content-free JSON event for an LLM request attempt."""
+        node_name, task_id = _LLM_REQUEST_CONTEXT.get()
         event = {
             "event": "llm_request_metrics",
             "model": self.model,
+            "node_name": node_name,
+            "task_id": task_id,
             "estimated_input_tokens": estimated_input_tokens,
             "input_token_estimate_method": "model_agnostic_heuristic",
             "context_window_tokens": context_window_tokens,

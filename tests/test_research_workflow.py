@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -10,6 +13,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from insight_agent.llm import LLMClient
 from insight_agent.evidence import (
     Evidence,
     EvidenceAssessment,
@@ -177,6 +181,103 @@ class AlwaysPassSelfChecker:
 class NeverReportRepairer:
     def repair(self, **kwargs: Any) -> StructuredReport:
         raise AssertionError("Passing workflow fixture must not repair")
+
+
+def _metrics_client() -> LLMClient:
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> Any:
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3)
+            )
+
+    client = object.__new__(LLMClient)
+    client.model = "workflow-metrics-model"
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    )
+    client._context_window_tokens = None
+    client._request_metrics_enabled = True
+    return client
+
+
+def _workflow_metric_events(
+    caplog: pytest.LogCaptureFixture,
+) -> list[dict[str, object]]:
+    return [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "insight_agent.llm"
+        and '"event":"llm_request_metrics"' in record.getMessage()
+    ]
+
+
+class MetricsWorkflowComponent:
+    def __init__(self, llm: LLMClient) -> None:
+        self.llm = llm
+        self.check_calls = 0
+
+    def _chat(self) -> None:
+        self.llm.chat([{"role": "user", "content": "offline fixture"}])
+
+    def grade(self, **kwargs: Any) -> EvidenceAssessment:
+        self._chat()
+        task = kwargs["task"]
+        evidence = kwargs["evidence"]
+        return EvidenceAssessment(
+            task_id=task.id,
+            evidence_judgments=[
+                EvidenceJudgment(
+                    evidence_id=item.id,
+                    relevance=EvidenceRelevance.RELEVANT,
+                    quality=EvidenceQuality.STRONG,
+                    reason="Usable workflow fixture.",
+                )
+                for item in evidence
+            ],
+            coverage=EvidenceCoverage.COMPLETE,
+            sufficient=True,
+            missing_information=[],
+            reason="Enough for this workflow test.",
+        )
+
+    def generate_section(self, **kwargs: Any) -> list[Claim]:
+        self._chat()
+        task = kwargs["task"]
+        evidence = kwargs["evidence"]
+        return [
+            Claim(
+                id=f"{task.id}-C1",
+                task_id=task.id,
+                text="Grounded workflow result.",
+                evidence_ids=[item.id for item in evidence],
+            )
+        ]
+
+    def check(self, **kwargs: Any) -> SelfCheckResult:
+        self._chat()
+        self.check_calls += 1
+        if self.check_calls == 1:
+            return SelfCheckResult(
+                status=SelfCheckStatus.REVISE,
+                issues=[
+                    SelfCheckIssue(
+                        code=SelfCheckIssueCode.UNSUPPORTED_CLAIM,
+                        reason="Exercise the repair node.",
+                        task_id="T1",
+                        claim_id="T1-C1",
+                    )
+                ],
+                summary="Repair required.",
+            )
+        return SelfCheckResult(
+            status=SelfCheckStatus.PASS,
+            issues=[],
+            summary="Offline workflow fixture passes.",
+        )
+
+    def repair(self, **kwargs: Any) -> StructuredReport:
+        self._chat()
+        return kwargs["report"]
 
 
 def _assessment(
@@ -1273,6 +1374,115 @@ def test_custom_retrieval_round_budget_allows_a_third_round() -> None:
     assert len(final_state.route_decisions) == 3
     assert len(final_state.evidence_assessments["T1"]) == 3
     assert final_state.evidence_assessments["T1"][-1].sufficient is True
+
+
+def test_llm_metrics_identify_workflow_nodes_and_only_reliable_task_ids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _metrics_client()
+    component = MetricsWorkflowComponent(client)
+    workflow = BaseResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=component,
+        report_generator=component,
+        self_checker=component,
+        report_repairer=component,
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    workflow.run(_state())
+
+    events = _workflow_metric_events(caplog)
+    assert [
+        (event["node_name"], event["task_id"])
+        for event in events
+    ] == [
+        ("grade_evidence", "T1"),
+        ("generate_report", None),
+        ("self_check_report", None),
+        ("repair_report", None),
+        ("self_check_report", None),
+    ]
+
+    client.chat([{"role": "user", "content": "outside workflow"}])
+
+    outside_event = _workflow_metric_events(caplog)[-1]
+    assert outside_event["node_name"] is None
+    assert outside_event["task_id"] is None
+
+
+def test_llm_metrics_context_is_restored_when_a_node_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _metrics_client()
+
+    class FailingGrader(FakeEvidenceGrader):
+        def grade(self, **kwargs: Any) -> EvidenceAssessment:
+            client.chat([{"role": "user", "content": "before failure"}])
+            raise RuntimeError("grader failed")
+
+    workflow = ResearchRoutingWorkflow(
+        router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
+        local_retriever=FakeLocalRetriever(),
+        grader=FailingGrader(),  # type: ignore[arg-type]
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    with pytest.raises(RuntimeError, match="grader failed"):
+        workflow.run(_state())
+
+    client.chat([{"role": "user", "content": "after failure"}])
+    events = _workflow_metric_events(caplog)
+    assert [
+        (event["node_name"], event["task_id"])
+        for event in events
+    ] == [("grade_evidence", "T1"), (None, None)]
+
+
+def test_concurrent_workflows_do_not_mix_llm_metric_task_ids(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = _metrics_client()
+    barrier = threading.Barrier(2)
+
+    class ConcurrentGrader(FakeEvidenceGrader):
+        def grade(self, **kwargs: Any) -> EvidenceAssessment:
+            barrier.wait(timeout=5)
+            client.chat([{"role": "user", "content": "concurrent grade"}])
+            return super().grade(**kwargs)
+
+    def run(task_id: str) -> None:
+        workflow = ResearchRoutingWorkflow(
+            router=FakeRouter([RetrievalSource.LOCAL]),  # type: ignore[arg-type]
+            local_retriever=FakeLocalRetriever(),
+            grader=ConcurrentGrader(),  # type: ignore[arg-type]
+        )
+        state = ResearchState(
+            query=f"query-{task_id}",
+            plan=ResearchPlan(
+                objective="Concurrent isolation",
+                constraints=[],
+                tasks=[ResearchTask(id=task_id, question=f"question-{task_id}")],
+            ),
+            available_sources={RetrievalSource.LOCAL},
+        )
+        workflow.run(state)
+
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run, task_id) for task_id in ("T-A", "T-B")]
+        for future in futures:
+            future.result(timeout=10)
+
+    grade_contexts = {
+        (event["node_name"], event["task_id"])
+        for event in _workflow_metric_events(caplog)
+    }
+    assert grade_contexts == {
+        ("grade_evidence", "T-A"),
+        ("grade_evidence", "T-B"),
+    }
 
 
 def test_route_history_must_match_completed_assessment_rounds() -> None:
