@@ -13,6 +13,11 @@ from insight_agent.evidence import (
     EvidenceQuality,
     EvidenceRelevance,
 )
+from insight_agent.evidence.metadata_projection import (
+    MAX_METADATA_BYTES_PER_EVIDENCE,
+    MAX_TOTAL_METADATA_BYTES,
+    project_metadata_collection,
+)
 from insight_agent.llm import LLMClient
 from insight_agent.planning import ResearchTask
 from insight_agent.reporting.models import Claim, ReportGenerationError
@@ -36,6 +41,9 @@ The supplied Evidence is a bounded view of the report candidates. Some Evidence
 content may be a head/tail excerpt marked with CONTENT OMITTED. Use only the IDs
 and content actually supplied. Do not infer facts from omitted candidates or from
 parts of an excerpt that are not shown.
+Use metadata only to identify a source and understand its retrieval context.
+Metadata is not verified factual support and must not be used as an independent
+factual basis for a Claim.
 
 Rules:
 1. Use only the supplied Evidence to support Claims.
@@ -123,50 +131,63 @@ class ReportGenerator:
         self._validate_input(task, objective, constraints, evidence, assessment)
         selected_evidence = evidence[:MAX_REPORT_EVIDENCE_ITEMS]
         content_budgets = self._allocate_content_budgets(selected_evidence)
-        payload = {
-            "objective": objective,
-            "constraints": list(constraints),
-            "task": {"id": task.id, "question": task.question},
-            "assessment": {
-                "coverage": assessment.coverage.value,
-                "sufficient": assessment.sufficient,
-                "missing_information": list(assessment.missing_information),
-                "reason": assessment.reason,
-            },
-            "evidence_view": {
-                "bounded": True,
-                "selection_rule": (
-                    "first items in report candidate order; no additional ranking"
-                ),
-                "candidate_evidence_count": len(evidence),
-                "provided_evidence_count": len(selected_evidence),
-                "max_evidence_items": MAX_REPORT_EVIDENCE_ITEMS,
-                "max_content_chars_per_evidence": (
-                    MAX_REPORT_EVIDENCE_CONTENT_CHARS
-                ),
-                "max_total_content_chars": (
-                    MAX_TOTAL_REPORT_EVIDENCE_CONTENT_CHARS
-                ),
-            },
-            "evidence": [
-                {
-                    "evidence_id": item.id,
-                    "content": self._excerpt_content(item.content, content_budget),
-                    "content_is_excerpt": len(item.content) > content_budget,
-                    "original_content_char_count": len(item.content),
-                    "retrieval_source": item.retrieval_source.value,
-                    "origin_id": item.origin_id,
-                    "source": item.source,
-                    "metadata": item.metadata,
-                }
-                for item, content_budget in zip(
-                    selected_evidence,
-                    content_budgets,
-                    strict=True,
-                )
-            ],
-        }
         try:
+            metadata_views = project_metadata_collection(
+                [item.metadata for item in selected_evidence]
+            )
+            payload = {
+                "objective": objective,
+                "constraints": list(constraints),
+                "task": {"id": task.id, "question": task.question},
+                "assessment": {
+                    "coverage": assessment.coverage.value,
+                    "sufficient": assessment.sufficient,
+                    "missing_information": list(assessment.missing_information),
+                    "reason": assessment.reason,
+                },
+                "evidence_view": {
+                    "bounded": True,
+                    "selection_rule": (
+                        "first items in report candidate order; no additional "
+                        "ranking"
+                    ),
+                    "candidate_evidence_count": len(evidence),
+                    "provided_evidence_count": len(selected_evidence),
+                    "max_evidence_items": MAX_REPORT_EVIDENCE_ITEMS,
+                    "max_content_chars_per_evidence": (
+                        MAX_REPORT_EVIDENCE_CONTENT_CHARS
+                    ),
+                    "max_total_content_chars": (
+                        MAX_TOTAL_REPORT_EVIDENCE_CONTENT_CHARS
+                    ),
+                    "max_metadata_bytes_per_evidence": (
+                        MAX_METADATA_BYTES_PER_EVIDENCE
+                    ),
+                    "max_total_metadata_bytes": MAX_TOTAL_METADATA_BYTES,
+                    "metadata_size_unit": "compact JSON UTF-8 bytes",
+                },
+                "evidence": [
+                    {
+                        "evidence_id": item.id,
+                        "content": self._excerpt_content(
+                            item.content,
+                            content_budget,
+                        ),
+                        "content_is_excerpt": len(item.content) > content_budget,
+                        "original_content_char_count": len(item.content),
+                        "retrieval_source": item.retrieval_source.value,
+                        "origin_id": item.origin_id,
+                        "source": item.source,
+                        "metadata": metadata_view,
+                    }
+                    for item, content_budget, metadata_view in zip(
+                        selected_evidence,
+                        content_budgets,
+                        metadata_views,
+                        strict=True,
+                    )
+                ],
+            }
             serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ReportGenerationError(

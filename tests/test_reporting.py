@@ -17,6 +17,14 @@ from insight_agent.evidence import (
     EvidenceQuality,
     EvidenceRelevance,
 )
+from insight_agent.evidence.metadata_projection import (
+    MAX_METADATA_BYTES_PER_EVIDENCE,
+    MAX_METADATA_COLLECTION_ITEMS,
+    MAX_METADATA_DEPTH,
+    MAX_METADATA_STRING_CHARS,
+    MAX_TOTAL_METADATA_BYTES,
+    project_metadata_collection,
+)
 from insight_agent.planning import ResearchTask
 from insight_agent.reporting import (
     REPORT_GENERATOR_SYSTEM_PROMPT,
@@ -105,6 +113,33 @@ def _assessment(
         missing_information=list(missing_information or []),
         reason="Assessment reason.",
     )
+
+
+def _serialized_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def test_shared_metadata_projection_preserves_small_values_and_input() -> None:
+    metadata = {
+        "title": "Small source",
+        "final_url": "https://example.test/article",
+        "custom": {"tags": ["memory", "retrieval"], "reviewed": True},
+    }
+    before = deepcopy(metadata)
+
+    projected = project_metadata_collection([metadata])
+
+    assert projected == [metadata]
+    assert projected[0] is not metadata
+    assert projected[0]["custom"] is not metadata["custom"]
+    assert metadata == before
 
 
 def test_reporting_models_construct_with_minimal_fields() -> None:
@@ -258,6 +293,131 @@ def test_report_generator_sends_bounded_excerpt_without_mutating_evidence() -> N
     assert view["metadata"] == evidence.metadata
     assert "Do not infer" in messages[0]["content"]
     assert evidence == original_evidence
+
+
+def test_report_generator_projects_structurally_bounded_metadata() -> None:
+    deep: dict[str, Any] = {"leaf": "unchanged"}
+    for _ in range(MAX_METADATA_DEPTH + 3):
+        deep = {"level": deep}
+    evidence = [
+        _evidence(
+            "E1",
+            metadata={"long": "多" * (MAX_METADATA_STRING_CHARS * 3)},
+        ),
+        _evidence(
+            "E2",
+            metadata={
+                "wide": {
+                    f"field-{index:02d}": index
+                    for index in range(MAX_METADATA_COLLECTION_ITEMS + 10)
+                }
+            },
+        ),
+        _evidence("E3", metadata={"deep": deep}),
+    ]
+    before = [deepcopy(item.metadata) for item in evidence]
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Objective",
+        constraints=[],
+        evidence=evidence,
+        assessment=_assessment(*(_judgment(item.id) for item in evidence)),
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    metadata_views = [item["metadata"] for item in payload["evidence"]]
+    assert all(
+        _serialized_size(metadata) <= MAX_METADATA_BYTES_PER_EVIDENCE
+        for metadata in metadata_views
+    )
+    assert len(metadata_views[0]["long"]) <= MAX_METADATA_STRING_CHARS
+    assert len(metadata_views[1]["wide"]) == MAX_METADATA_COLLECTION_ITEMS
+    assert metadata_views[2] == {
+        "deep": {"level": {"level": {"level": "[... metadata omitted ...]"}}}
+    }
+    assert "metadata only" in llm.calls[0]["messages"][0]["content"].lower()
+    assert (
+        "not verified factual support"
+        in llm.calls[0]["messages"][0]["content"].lower()
+    )
+    assert [item.metadata for item in evidence] == before
+
+
+def test_report_generator_bounds_total_metadata_and_preserves_trace_fields() -> None:
+    evidence = [
+        _evidence(
+            f"E{index}",
+            source_type=RetrievalSource.WEB,
+            source=f"https://example.test/source/{index}",
+            metadata={
+                "title": f"Source {index}",
+                "final_url": f"https://example.test/final/{index}",
+                "payload_a": str(index) * MAX_METADATA_BYTES_PER_EVIDENCE,
+                "payload_b": str(index) * MAX_METADATA_BYTES_PER_EVIDENCE,
+            },
+        )
+        for index in range(1, 11)
+    ]
+    before = [deepcopy(item.metadata) for item in evidence]
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+        task=_task(),
+        objective="Objective",
+        constraints=[],
+        evidence=evidence,
+        assessment=_assessment(*(_judgment(item.id) for item in evidence)),
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    views = payload["evidence"]
+    projected = [item["metadata"] for item in views]
+    assert all(
+        _serialized_size(metadata) <= MAX_METADATA_BYTES_PER_EVIDENCE
+        for metadata in projected
+    )
+    assert _serialized_size(projected) <= MAX_TOTAL_METADATA_BYTES
+    assert payload["evidence_view"]["max_metadata_bytes_per_evidence"] == 2048
+    assert payload["evidence_view"]["max_total_metadata_bytes"] == 12000
+    assert payload["evidence_view"]["metadata_size_unit"] == (
+        "compact JSON UTF-8 bytes"
+    )
+    assert [item["evidence_id"] for item in views] == [
+        item.id for item in evidence
+    ]
+    assert [item["retrieval_source"] for item in views] == [
+        item.retrieval_source.value for item in evidence
+    ]
+    assert [item["origin_id"] for item in views] == [
+        item.origin_id for item in evidence
+    ]
+    assert [item["source"] for item in views] == [item.source for item in evidence]
+    assert [item.metadata for item in evidence] == before
+
+
+def test_report_generator_wraps_non_json_metadata_before_calling_llm() -> None:
+    evidence = _evidence("E1")
+    evidence.metadata["not_json"] = {"set-item"}
+    llm = FakeLLM(
+        json.dumps({"claims": [{"text": "Fact.", "evidence_ids": ["E1"]}]})
+    )
+
+    with pytest.raises(ReportGenerationError, match="JSON-serializable"):
+        ReportGenerator(llm=llm).generate_section(  # type: ignore[arg-type]
+            task=_task(),
+            objective="Objective",
+            constraints=[],
+            evidence=[evidence],
+            assessment=_assessment(_judgment("E1")),
+        )
+
+    assert llm.calls == []
 
 
 def test_report_generator_bounds_total_content_and_evidence_count() -> None:
