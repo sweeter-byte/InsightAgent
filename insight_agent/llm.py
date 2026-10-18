@@ -12,6 +12,7 @@ No agent loop, no tool execution, no retry / memory / cache logic lives here.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from collections.abc import Mapping
@@ -20,6 +21,9 @@ from typing import Any, Sequence
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+
+logger = logging.getLogger(__name__)
 
 # Single, shared registry of required environment variables and their hints.
 # Both the text LLM client and the vision client read from here so the project
@@ -62,6 +66,7 @@ class LLMConfig:
     context_window_tokens: int | None = None
     reserved_output_tokens: int = 0
     context_safety_margin_tokens: int = 0
+    request_metrics_enabled: bool = False
 
     def __post_init__(self) -> None:
         for name in ("api_key", "base_url", "model"):
@@ -81,6 +86,8 @@ class LLMConfig:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"LLM {name} must be a non-negative integer")
+        if not isinstance(self.request_metrics_enabled, bool):
+            raise ValueError("LLM request_metrics_enabled must be a boolean")
 
     @classmethod
     def from_env(
@@ -115,6 +122,9 @@ class LLMConfig:
             context_safety_margin_tokens=_nonnegative_int(
                 values, "LLM_CONTEXT_SAFETY_MARGIN_TOKENS"
             ),
+            request_metrics_enabled=_boolean(
+                values, "LLM_REQUEST_METRICS_ENABLED", default=False
+            ),
         )
 
 
@@ -145,6 +155,25 @@ def _nonnegative_int(values: Mapping[str, str], name: str) -> int:
     if value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return value
+
+
+def _boolean(
+    values: Mapping[str, str],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    raw = values.get(name, "")
+    if not isinstance(raw, str):
+        raise ValueError(f"{name} must be a boolean")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _estimate_chat_input_tokens(
@@ -213,6 +242,7 @@ class LLMClient:
         self._context_window_tokens = resolved.context_window_tokens
         self._reserved_output_tokens = resolved.reserved_output_tokens
         self._context_safety_margin_tokens = resolved.context_safety_margin_tokens
+        self._request_metrics_enabled = resolved.request_metrics_enabled
         self.client: OpenAI = OpenAI(
             api_key=resolved.api_key,
             base_url=resolved.base_url,
@@ -264,30 +294,70 @@ class LLMClient:
         if timeout is not None:
             kwargs["timeout"] = timeout
         context_window_tokens = getattr(self, "_context_window_tokens", None)
-        if context_window_tokens is not None:
+        request_metrics_enabled = getattr(
+            self, "_request_metrics_enabled", False
+        )
+        estimated_input_tokens: int | None = None
+        if context_window_tokens is not None or request_metrics_enabled:
             estimated_input_tokens = _estimate_chat_input_tokens(
                 request_messages, request_tools
             )
+        input_budget_tokens: int | None = None
+        budget_usage_ratio: float | None = None
+        if context_window_tokens is not None:
             reserved_output_tokens = self._reserved_output_tokens
             safety_margin_tokens = self._context_safety_margin_tokens
+            if request_metrics_enabled:
+                input_budget_tokens = (
+                    context_window_tokens
+                    - reserved_output_tokens
+                    - safety_margin_tokens
+                )
+                if input_budget_tokens > 0:
+                    budget_usage_ratio = estimated_input_tokens / input_budget_tokens
             if (
                 estimated_input_tokens
                 + reserved_output_tokens
                 + safety_margin_tokens
                 > context_window_tokens
             ):
-                raise ContextBudgetExceeded(
+                error = ContextBudgetExceeded(
                     context_window_tokens=context_window_tokens,
                     estimated_input_tokens=estimated_input_tokens,
                     reserved_output_tokens=reserved_output_tokens,
                     safety_margin_tokens=safety_margin_tokens,
                 )
+                if request_metrics_enabled:
+                    self._log_request_metrics(
+                        estimated_input_tokens=estimated_input_tokens,
+                        context_window_tokens=context_window_tokens,
+                        input_budget_tokens=input_budget_tokens,
+                        budget_usage_ratio=budget_usage_ratio,
+                        actual_input_tokens=None,
+                        actual_output_tokens=None,
+                        status="context_rejected",
+                        request_sent=False,
+                        error_type=type(error).__name__,
+                    )
+                raise error
         try:
             response = self.client.chat.completions.create(**kwargs)
-        except BaseException:
+        except BaseException as exc:
             with self._usage_lock:
                 self._usage_calls += 1
                 self._usage_unmetered_calls += 1
+            if request_metrics_enabled:
+                self._log_request_metrics(
+                    estimated_input_tokens=estimated_input_tokens,
+                    context_window_tokens=context_window_tokens,
+                    input_budget_tokens=input_budget_tokens,
+                    budget_usage_ratio=budget_usage_ratio,
+                    actual_input_tokens=None,
+                    actual_output_tokens=None,
+                    status="api_error",
+                    request_sent=True,
+                    error_type=type(exc).__name__,
+                )
             raise
         usage = getattr(response, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", None)
@@ -305,7 +375,63 @@ class LLMClient:
                 self._usage_output_tokens += output_tokens
             else:
                 self._usage_unmetered_calls += 1
+        if request_metrics_enabled:
+            actual_input_tokens = (
+                input_tokens
+                if isinstance(input_tokens, int)
+                and not isinstance(input_tokens, bool)
+                else None
+            )
+            actual_output_tokens = (
+                output_tokens
+                if isinstance(output_tokens, int)
+                and not isinstance(output_tokens, bool)
+                else None
+            )
+            self._log_request_metrics(
+                estimated_input_tokens=estimated_input_tokens,
+                context_window_tokens=context_window_tokens,
+                input_budget_tokens=input_budget_tokens,
+                budget_usage_ratio=budget_usage_ratio,
+                actual_input_tokens=actual_input_tokens,
+                actual_output_tokens=actual_output_tokens,
+                status="success",
+                request_sent=True,
+                error_type=None,
+            )
         return response
+
+    def _log_request_metrics(
+        self,
+        *,
+        estimated_input_tokens: int,
+        context_window_tokens: int | None,
+        input_budget_tokens: int | None,
+        budget_usage_ratio: float | None,
+        actual_input_tokens: int | None,
+        actual_output_tokens: int | None,
+        status: str,
+        request_sent: bool,
+        error_type: str | None,
+    ) -> None:
+        """Emit one content-free JSON event for an LLM request attempt."""
+        event = {
+            "event": "llm_request_metrics",
+            "model": self.model,
+            "estimated_input_tokens": estimated_input_tokens,
+            "input_token_estimate_method": "model_agnostic_heuristic",
+            "context_window_tokens": context_window_tokens,
+            "input_budget_tokens": input_budget_tokens,
+            "budget_usage_ratio": budget_usage_ratio,
+            "actual_input_tokens": actual_input_tokens,
+            "actual_output_tokens": actual_output_tokens,
+            "status": status,
+            "request_sent": request_sent,
+            "error_type": error_type,
+        }
+        logger.info(
+            json.dumps(event, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        )
 
     def usage_snapshot(self) -> dict[str, int]:
         """Return cumulative provider usage without guessing missing token data."""

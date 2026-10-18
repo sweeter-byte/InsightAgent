@@ -6,6 +6,8 @@ README as a manual step.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -28,6 +30,7 @@ _MODEL_ENV_KEYS = (
     "LLM_CONTEXT_WINDOW_TOKENS",
     "LLM_RESERVED_OUTPUT_TOKENS",
     "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
+    "LLM_REQUEST_METRICS_ENABLED",
     "VISION_API_KEY",
     "VISION_BASE_URL",
     "VISION_MODEL",
@@ -57,6 +60,7 @@ def _clear_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "LLM_CONTEXT_WINDOW_TOKENS",
         "LLM_RESERVED_OUTPUT_TOKENS",
         "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
+        "LLM_REQUEST_METRICS_ENABLED",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -210,6 +214,20 @@ def test_llm_config_leaves_context_budget_disabled_by_default() -> None:
     assert config.context_window_tokens is None
     assert config.reserved_output_tokens == 0
     assert config.context_safety_margin_tokens == 0
+    assert config.request_metrics_enabled is False
+
+
+def test_llm_config_reads_request_metrics_switch() -> None:
+    config = LLMConfig.from_env(
+        {
+            "LLM_API_KEY": "secret",
+            "LLM_BASE_URL": "https://example.invalid/v1",
+            "LLM_MODEL": "model-a",
+            "LLM_REQUEST_METRICS_ENABLED": "true",
+        }
+    )
+
+    assert config.request_metrics_enabled is True
 
 
 @pytest.mark.parametrize(
@@ -511,3 +529,237 @@ def test_llm_client_records_provider_usage_without_inventing_missing_tokens(
         "output_tokens": 3,
         "unmetered_calls": 1,
     }
+
+
+def _request_metric_events(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
+    return [
+        json.loads(record.getMessage())
+        for record in caplog.records
+        if record.name == "insight_agent.llm"
+        and record.getMessage().startswith("{")
+        and '"event":"llm_request_metrics"' in record.getMessage()
+    ]
+
+
+def test_chat_logs_estimated_and_actual_request_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from types import SimpleNamespace
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=17, completion_tokens=5)
+            )
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    messages = [{"role": "user", "content": "small request"}]
+    estimated = _estimate_chat_input_tokens(messages, None)
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            "secret",
+            "https://example.invalid/v1",
+            "model-a",
+            context_window_tokens=1000,
+            reserved_output_tokens=100,
+            context_safety_margin_tokens=50,
+            request_metrics_enabled=True,
+        )
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    client.chat(messages)
+
+    assert _request_metric_events(caplog) == [
+        {
+            "actual_input_tokens": 17,
+            "actual_output_tokens": 5,
+            "budget_usage_ratio": estimated / 850,
+            "context_window_tokens": 1000,
+            "error_type": None,
+            "estimated_input_tokens": estimated,
+            "event": "llm_request_metrics",
+            "input_budget_tokens": 850,
+            "input_token_estimate_method": "model_agnostic_heuristic",
+            "model": "model-a",
+            "request_sent": True,
+            "status": "success",
+        }
+    ]
+
+
+def test_chat_logs_null_budget_fields_without_configured_context_window(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from types import SimpleNamespace
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            return SimpleNamespace(usage=None)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    messages = [{"role": "user", "content": "unmetered request"}]
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            "secret",
+            "https://example.invalid/v1",
+            "model-a",
+            request_metrics_enabled=True,
+        )
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    client.chat(messages)
+
+    event = _request_metric_events(caplog)[0]
+    assert event["estimated_input_tokens"] == _estimate_chat_input_tokens(
+        messages, None
+    )
+    assert event["context_window_tokens"] is None
+    assert event["input_budget_tokens"] is None
+    assert event["budget_usage_ratio"] is None
+    assert event["actual_input_tokens"] is None
+    assert event["actual_output_tokens"] is None
+
+
+def test_chat_logs_context_rejection_without_sending_request(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from types import SimpleNamespace
+
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            calls.append(kwargs)
+            return SimpleNamespace(usage=None)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    messages = [{"role": "user", "content": "request too large"}]
+    estimated = _estimate_chat_input_tokens(messages, None)
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            "secret",
+            "https://example.invalid/v1",
+            "model-a",
+            context_window_tokens=estimated,
+            reserved_output_tokens=1,
+            request_metrics_enabled=True,
+        )
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    with pytest.raises(ContextBudgetExceeded):
+        client.chat(messages)
+
+    event = _request_metric_events(caplog)[0]
+    assert event["status"] == "context_rejected"
+    assert event["request_sent"] is False
+    assert event["error_type"] == "ContextBudgetExceeded"
+    assert event["actual_input_tokens"] is None
+    assert event["actual_output_tokens"] is None
+    assert calls == []
+
+
+def test_chat_logs_api_error_without_swallowing_or_leaking_it(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from types import SimpleNamespace
+
+    private_prompt = "private prompt and evidence body"
+    secret = "api-key-that-must-not-leak"
+
+    class ProviderFailure(RuntimeError):
+        pass
+
+    error = ProviderFailure(f"provider rejected {private_prompt} using {secret}")
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            raise error
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    client = LLMClient(
+        LLMConfig(
+            secret,
+            "https://example.invalid/v1",
+            "model-a",
+            request_metrics_enabled=True,
+        )
+    )
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    with pytest.raises(ProviderFailure) as excinfo:
+        client.chat([{"role": "user", "content": private_prompt}])
+
+    assert excinfo.value is error
+    event = _request_metric_events(caplog)[0]
+    assert event["status"] == "api_error"
+    assert event["request_sent"] is True
+    assert event["error_type"] == "ProviderFailure"
+    assert event["actual_input_tokens"] is None
+    assert event["actual_output_tokens"] is None
+    assert private_prompt not in caplog.text
+    assert secret not in caplog.text
+
+
+def test_disabled_request_metrics_do_not_add_token_estimation(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from types import SimpleNamespace
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            return SimpleNamespace(usage=None)
+
+    class FakeSDK:
+        def __init__(self, **kwargs: object) -> None:
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("insight_agent.llm.OpenAI", FakeSDK)
+    monkeypatch.setattr(
+        "insight_agent.llm._estimate_chat_input_tokens",
+        lambda *args: pytest.fail("disabled metrics must not estimate tokens"),
+    )
+    client = LLMClient(LLMConfig("secret", "https://example.invalid/v1", "model-a"))
+    caplog.set_level(logging.INFO, logger="insight_agent.llm")
+
+    client.chat([{"role": "user", "content": "request"}])
+
+    assert _request_metric_events(caplog) == []
