@@ -12,7 +12,9 @@ claim_contexts preserves each Claim's original evidence_ids and separately state
 which IDs are provided or unprovided in this bounded request. Some provided bodies
 may be head/tail excerpts marked with CONTENT OMITTED. Use only catalog IDs and
 content actually supplied. Do not infer anything from an unprovided Evidence ID or
-from omitted parts of an excerpt.
+from omitted parts of an excerpt. Metadata may only assist with source identity and
+retrieval context. It is not verified factual support and cannot independently
+support a Claim.
 
 Check only these issue types:
 1. unsupported_claim: a Claim states more than its bound Evidence supports.

@@ -6,6 +6,11 @@ import json
 from typing import Any
 
 from insight_agent.evidence import Evidence, EvidenceAssessment
+from insight_agent.evidence.metadata_projection import (
+    MAX_METADATA_BYTES_PER_EVIDENCE,
+    MAX_TOTAL_METADATA_BYTES,
+    project_metadata_collection,
+)
 from insight_agent.llm import LLMClient
 from insight_agent.planning import ResearchPlan, validate_research_plan
 from insight_agent.reporting import Claim, StructuredReport, assemble_report
@@ -101,70 +106,83 @@ class ReportSelfChecker:
                     }
                 )
 
-        payload = {
-            "plan": {
-                "objective": plan.objective,
-                "constraints": list(plan.constraints),
-            },
-            "report_sections": [
-                {
-                    "task_id": section.task_id,
-                    "title": section.title,
-                    "claims": [
-                        {
-                            "id": claim.id,
-                            "text": claim.text,
-                            "evidence_ids": list(claim.evidence_ids),
-                        }
-                        for claim in section.claims
-                    ],
-                    "sufficient": section.sufficient,
-                    "missing_information": list(section.missing_information),
-                }
-                for section in report.sections
-            ],
-            "task_assessments": {
-                task.id: self._assessment_payload(latest[task.id])
-                for task in plan.tasks
-            },
-            "evidence_view": {
-                "bounded": True,
-                "selection_rule": (
-                    "unique Evidence in first Claim-reference order"
-                ),
-                "referenced_evidence_count": len(referenced_evidence_ids),
-                "provided_evidence_count": len(selected_evidence_ids),
-                "max_evidence_items": MAX_SELF_CHECK_EVIDENCE_ITEMS,
-                "max_content_chars_per_evidence": (
-                    MAX_SELF_CHECK_EVIDENCE_CONTENT_CHARS
-                ),
-                "max_total_content_chars": (
-                    MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS
-                ),
-            },
-            "claim_contexts": claim_contexts,
-            "evidence_catalog": {
-                evidence.id: {
-                    "evidence_id": evidence.id,
-                    "content": self._excerpt_content(
-                        evidence.content,
-                        content_budget,
-                    ),
-                    "content_is_excerpt": len(evidence.content) > content_budget,
-                    "original_content_char_count": len(evidence.content),
-                    "retrieval_source": evidence.retrieval_source.value,
-                    "origin_id": evidence.origin_id,
-                    "source": evidence.source,
-                    "metadata": evidence.metadata,
-                }
-                for evidence, content_budget in zip(
-                    selected_evidence,
-                    content_budgets,
-                    strict=True,
-                )
-            },
-        }
         try:
+            metadata_views = project_metadata_collection(
+                [evidence.metadata for evidence in selected_evidence]
+            )
+            payload = {
+                "plan": {
+                    "objective": plan.objective,
+                    "constraints": list(plan.constraints),
+                },
+                "report_sections": [
+                    {
+                        "task_id": section.task_id,
+                        "title": section.title,
+                        "claims": [
+                            {
+                                "id": claim.id,
+                                "text": claim.text,
+                                "evidence_ids": list(claim.evidence_ids),
+                            }
+                            for claim in section.claims
+                        ],
+                        "sufficient": section.sufficient,
+                        "missing_information": list(
+                            section.missing_information
+                        ),
+                    }
+                    for section in report.sections
+                ],
+                "task_assessments": {
+                    task.id: self._assessment_payload(latest[task.id])
+                    for task in plan.tasks
+                },
+                "evidence_view": {
+                    "bounded": True,
+                    "selection_rule": (
+                        "unique Evidence in first Claim-reference order"
+                    ),
+                    "referenced_evidence_count": len(referenced_evidence_ids),
+                    "provided_evidence_count": len(selected_evidence_ids),
+                    "max_evidence_items": MAX_SELF_CHECK_EVIDENCE_ITEMS,
+                    "max_content_chars_per_evidence": (
+                        MAX_SELF_CHECK_EVIDENCE_CONTENT_CHARS
+                    ),
+                    "max_total_content_chars": (
+                        MAX_TOTAL_SELF_CHECK_EVIDENCE_CONTENT_CHARS
+                    ),
+                    "max_metadata_bytes_per_evidence": (
+                        MAX_METADATA_BYTES_PER_EVIDENCE
+                    ),
+                    "max_total_metadata_bytes": MAX_TOTAL_METADATA_BYTES,
+                    "metadata_size_unit": "compact JSON UTF-8 bytes",
+                },
+                "claim_contexts": claim_contexts,
+                "evidence_catalog": {
+                    evidence.id: {
+                        "evidence_id": evidence.id,
+                        "content": self._excerpt_content(
+                            evidence.content,
+                            content_budget,
+                        ),
+                        "content_is_excerpt": (
+                            len(evidence.content) > content_budget
+                        ),
+                        "original_content_char_count": len(evidence.content),
+                        "retrieval_source": evidence.retrieval_source.value,
+                        "origin_id": evidence.origin_id,
+                        "source": evidence.source,
+                        "metadata": metadata_view,
+                    }
+                    for evidence, content_budget, metadata_view in zip(
+                        selected_evidence,
+                        content_budgets,
+                        metadata_views,
+                        strict=True,
+                    )
+                },
+            }
             serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise SelfCheckError(

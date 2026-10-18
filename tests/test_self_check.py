@@ -17,6 +17,13 @@ from insight_agent.evidence import (
     EvidenceQuality,
     EvidenceRelevance,
 )
+from insight_agent.evidence.metadata_projection import (
+    MAX_METADATA_BYTES_PER_EVIDENCE,
+    MAX_METADATA_COLLECTION_ITEMS,
+    MAX_METADATA_STRING_CHARS,
+    MAX_TOTAL_METADATA_BYTES,
+    METADATA_OMISSION_MARKER,
+)
 from insight_agent.planning import ResearchPlan, ResearchState, ResearchTask
 from insight_agent.reporting import (
     Claim,
@@ -149,6 +156,7 @@ def _evidence(
     *,
     content: str | None = None,
     task_id: str = "T1",
+    metadata: dict[str, Any] | None = None,
 ) -> Evidence:
     return Evidence(
         id=evidence_id,
@@ -157,7 +165,22 @@ def _evidence(
         origin_id=f"origin-{evidence_id}",
         content=content if content is not None else f"Content for {evidence_id}",
         source=f"{evidence_id}.md",
-        metadata={"filename": f"{evidence_id}.md"},
+        metadata=(
+            metadata
+            if metadata is not None
+            else {"filename": f"{evidence_id}.md"}
+        ),
+    )
+
+
+def _compact_json_size(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
     )
 
 
@@ -282,6 +305,14 @@ def test_checker_parses_pass_and_builds_deduplicated_evidence_catalog() -> None:
         '"content": "Method A reduced tokens in two experiments."'
     ) == 1
     assert "Do not infer" in llm.calls[0]["messages"][0]["content"]
+    assert (
+        "Metadata may only assist with source identity"
+        in llm.calls[0]["messages"][0]["content"]
+    )
+    assert (
+        "cannot independently\nsupport a Claim"
+        in llm.calls[0]["messages"][0]["content"]
+    )
 
 
 def test_checker_bounds_catalog_content_without_mutating_evidence() -> None:
@@ -363,6 +394,136 @@ def test_checker_bounds_catalog_content_without_mutating_evidence() -> None:
     assert payload["claim_contexts"][-1]["provided_evidence_ids"] == []
     assert payload["claim_contexts"][-1]["unprovided_evidence_ids"] == ["E11"]
     assert evidence == original_evidence
+
+
+def test_checker_projects_catalog_metadata_in_evidence_order_without_mutation() -> None:
+    plan, _, _, assessments = _research_inputs()
+    metadata_items = [
+        {"filename": "E1.md", "long": "界" * 2000},
+        {
+            "filename": "E2.md",
+            "deep": {"l1": {"l2": {"l3": {"l4": "hidden"}}}},
+        },
+        {
+            "filename": "E3.md",
+            "wide": {
+                f"key-{index:02d}": index
+                for index in range(MAX_METADATA_COLLECTION_ITEMS + 8)
+            },
+        },
+        {
+            "filename": "E4.md",
+            "title": "Small source",
+            "custom": {"reviewed": True, "tags": ["a", "b"]},
+        },
+        *[
+            {
+                "filename": f"E{index}.md",
+                "title": f"source-{index}-" + ("x" * 3000),
+            }
+            for index in range(5, 11)
+        ],
+    ]
+    evidence = [
+        _evidence(
+            f"E{index}",
+            content=f"Body uniquely belonging to E{index}",
+            metadata=metadata,
+        )
+        for index, metadata in enumerate(metadata_items, start=1)
+    ]
+    original_metadata = deepcopy([item.metadata for item in evidence])
+    report = assemble_report(
+        plan.objective,
+        [
+            ReportSection(
+                task_id="T1",
+                title=plan.tasks[0].question,
+                claims=[
+                    Claim(
+                        id=f"T1-C{index}",
+                        task_id="T1",
+                        text=f"Claim {index}",
+                        evidence_ids=[f"E{index}"],
+                    )
+                    for index in range(1, 11)
+                ],
+                sufficient=False,
+                missing_information=list(
+                    assessments["T1"][-1].missing_information
+                ),
+            )
+        ],
+        {"T1": evidence},
+    )
+    llm = FakeLLM(
+        json.dumps(
+            {
+                "status": "pass",
+                "issues": [],
+                "summary": "All provided Claims are supported.",
+            }
+        )
+    )
+
+    ReportSelfChecker(llm=llm).check(
+        plan=plan,
+        report=report,
+        evidence_pool={"T1": evidence},
+        assessments=assessments,
+    )
+
+    payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    catalog = payload["evidence_catalog"]
+    projected_metadata = [
+        catalog[f"E{index}"]["metadata"] for index in range(1, 11)
+    ]
+    assert _compact_json_size(metadata_items) > MAX_TOTAL_METADATA_BYTES
+    assert all(
+        _compact_json_size(metadata) <= MAX_METADATA_BYTES_PER_EVIDENCE
+        for metadata in projected_metadata
+    )
+    assert _compact_json_size(projected_metadata) <= MAX_TOTAL_METADATA_BYTES
+    assert len(catalog["E1"]["metadata"]["long"]) <= MAX_METADATA_STRING_CHARS
+    assert (
+        catalog["E2"]["metadata"]["deep"]["l1"]["l2"]["l3"]
+        == METADATA_OMISSION_MARKER
+    )
+    assert len(catalog["E3"]["metadata"]["wide"]) == (
+        MAX_METADATA_COLLECTION_ITEMS
+    )
+    assert catalog["E4"]["metadata"] == metadata_items[3]
+    for index in range(1, 11):
+        item = catalog[f"E{index}"]
+        assert item["evidence_id"] == f"E{index}"
+        assert item["content"] == f"Body uniquely belonging to E{index}"
+        assert item["metadata"]["filename"] == f"E{index}.md"
+        assert item["origin_id"] == f"origin-E{index}"
+        assert item["source"] == f"E{index}.md"
+        assert item["retrieval_source"] == "local"
+    assert [item.metadata for item in evidence] == original_metadata
+    assert payload["evidence_view"]["max_metadata_bytes_per_evidence"] == 2048
+    assert payload["evidence_view"]["max_total_metadata_bytes"] == 12000
+    assert payload["evidence_view"]["metadata_size_unit"] == (
+        "compact JSON UTF-8 bytes"
+    )
+
+
+def test_checker_wraps_metadata_projection_errors_without_calling_llm() -> None:
+    plan, report, pool, assessments = _research_inputs()
+    pool["T1"][0].metadata["cycle"] = pool["T1"][0].metadata
+    report = assemble_report(plan.objective, report.sections, pool)
+    llm = FakeLLM()
+
+    with pytest.raises(SelfCheckError, match="JSON-serializable"):
+        ReportSelfChecker(llm=llm).check(
+            plan=plan,
+            report=report,
+            evidence_pool=pool,
+            assessments=assessments,
+        )
+
+    assert llm.calls == []
 
 
 def test_checker_cannot_pass_when_claim_evidence_is_not_provided() -> None:
